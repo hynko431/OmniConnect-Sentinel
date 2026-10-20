@@ -1,5 +1,6 @@
 pub mod tier0_yara;
 pub mod tier1_cdr_client;
+pub mod tier3_sandbox;
 pub mod quarantine;
 
 use serde::{Deserialize, Serialize};

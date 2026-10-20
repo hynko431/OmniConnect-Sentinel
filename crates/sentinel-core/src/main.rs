@@ -1,8 +1,7 @@
 use sentinel_core::config::SentinelConfig;
 use sentinel_core::enterprise::falcon::CrowdStrikeFalconBridge;
 use sentinel_core::enterprise::intune::IntunePolicyManager;
-use sentinel_core::interceptor::windows_umdf::WindowsUmdfInterceptor;
-use sentinel_core::interceptor::DeviceInterceptor;
+use sentinel_core::interceptor::resolve_best_interceptor;
 use sentinel_core::scanner::quarantine::QuarantineVault;
 use sentinel_core::scanner::tier1_cdr_client::Tier1CdrClient;
 use sentinel_core::vfs::resolve_best_vfs_provider;
@@ -43,8 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _quarantine_vault = Arc::new(QuarantineVault::new(config.quarantine_vault_path.clone()));
     let _falcon_bridge = Arc::new(CrowdStrikeFalconBridge::new(config.node_id.clone()));
 
-    // 4. Start Hardware Interceptor (UMDF v2 in Userspace)
-    let interceptor = WindowsUmdfInterceptor::new();
+    // 4. Start Universal Hardware Interceptor (UMDF v2 on Windows / udev on Linux)
+    let interceptor = resolve_best_interceptor();
     let mut event_rx = interceptor.start_monitoring().await?;
 
     info!("Sentinel Agent running. Zero BSOD risk: 100% userspace execution.");

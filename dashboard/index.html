@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OmniConnect Sentinel | Zero-Trust Peripheral Defense Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Top Navigation Bar -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="shield-badge">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            <path d="m9 12 2 2 4-4"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="logo-title">OMNICONNECT <span>SENTINEL</span></h1>
+          <p class="logo-subtitle">Enterprise UMDF Interceptor & Pure-Rust Deep CDR Engine</p>
+        </div>
+      </div>
+
+      <div class="header-status">
+        <div class="status-indicator live">
+          <span class="pulse-dot"></span>
+          <span>UMDF v2 INTERCEPTOR ACTIVE (Ring 3 Userspace)</span>
+        </div>
+        <div class="node-id">NODE: <code>SN-EDGE-WIN11-01</code></div>
+      </div>
+    </header>
+
+    <!-- Main Grid Content -->
+    <main class="dashboard-grid">
+      <!-- Left Column: Interception & Peripheral Control -->
+      <section class="panel control-panel">
+        <div class="panel-header">
+          <h2><span class="icon">⚡</span> Peripheral Interception Sentry</h2>
+          <span class="tag tag-success">Zero BSOD</span>
+        </div>
+
+        <div class="connection-matrix">
+          <div class="matrix-item active">
+            <div class="matrix-info">
+              <span class="matrix-icon">🔌</span>
+              <div>
+                <strong>USB / Thunderbolt / MTP</strong>
+                <small>Hardware descriptor filtering</small>
+              </div>
+            </div>
+            <span class="badge badge-green">LOCKED & FILTERED</span>
+          </div>
+
+          <div class="matrix-item active">
+            <div class="matrix-info">
+              <span class="matrix-icon">📡</span>
+              <div>
+                <strong>Wi-Fi Direct / Local Area Network</strong>
+                <small>eBPF packet boundary sentry</small>
+              </div>
+            </div>
+            <span class="badge badge-green">INSPECTING</span>
+          </div>
+
+          <div class="matrix-item active">
+            <div class="matrix-info">
+              <span class="matrix-icon">📶</span>
+              <div>
+                <strong>Bluetooth OBEX / PAN</strong>
+                <small>Zero-trust file transfer gate</small>
+              </div>
+            </div>
+            <span class="badge badge-green">MONITORED</span>
+          </div>
+        </div>
+
+        <div class="hardware-toggle-box">
+          <div class="toggle-desc">
+            <strong>Hardware Data Pin Severance</strong>
+            <p>Force "Safe Charging Only" by severing USB D+/D- bulk pipes while maintaining VBUS 5V power.</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="safeChargingToggle" />
+            <span class="slider round"></span>
+          </label>
+        </div>
+
+        <div class="vfs-status-card">
+          <div class="vfs-header">
+            <span>Sterile Virtual Filesystem (ProjFS)</span>
+            <span class="vfs-mount">VIRTUAL MOUNT: <code>Z:\</code></span>
+          </div>
+          <p class="vfs-sub">Physical volume <code>E:\</code> is held in raw read-only lock. Windows Explorer only sees disarmed files with <code>FILE_EXECUTE</code> revoked.</p>
+        </div>
+      </section>
+
+      <!-- Center Column: Drive Scanner & CDR Disarm Station -->
+      <section class="panel scan-panel">
+        <div class="panel-header">
+          <h2><span class="icon">🛡️</span> Real-Time Drive Sweep & CDR Studio</h2>
+          <div class="panel-actions">
+            <input type="text" id="targetPath" class="path-input" value="E:\" placeholder="Drive Path (e.g. E:\)" />
+            <button id="btnScan" class="btn btn-primary">
+              <span class="btn-text">Execute Zero-Trust Sweep</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="stats-ribbon">
+          <div class="stat-card">
+            <div class="stat-val" id="statFiles">1,134</div>
+            <div class="stat-label">Files Scanned</div>
+          </div>
+          <div class="stat-card stat-alert">
+            <div class="stat-val" id="statThreats">134</div>
+            <div class="stat-label">Malware Blocked (Ramnit)</div>
+          </div>
+          <div class="stat-card stat-warn">
+            <div class="stat-val" id="statVectors">33</div>
+            <div class="stat-label">LNK Exploits Neutralized</div>
+          </div>
+          <div class="stat-card stat-clean">
+            <div class="stat-val" id="statDisarmed">967</div>
+            <div class="stat-label">Clean Documents Disarmed</div>
+          </div>
+        </div>
+
+        <div class="scan-feed-box">
+          <div class="feed-header">
+            <span>LIVE INTERCEPTION LOG</span>
+            <span class="feed-filter">Showing High-Risk Events</span>
+          </div>
+          <div class="feed-logs" id="logContainer">
+            <div class="log-entry log-crit">
+              <span class="log-time">16:28:10</span>
+              <span class="log-badge">VIRUS CONFIRMED</span>
+              <span class="log-msg">Polymorphic Worm Cluster: 134 identical executables (229,376 bytes) [Trojan:Win32/Ramnit!pz]</span>
+            </div>
+            <div class="log-entry log-warn">
+              <span class="log-time">16:28:11</span>
+              <span class="log-badge">EXPLOIT BLOCKED</span>
+              <span class="log-msg">Exploit:Win32/CplLnk.A: 33 shortcut vectors stripped before shell parsing</span>
+            </div>
+            <div class="log-entry log-success">
+              <span class="log-time">16:28:12</span>
+              <span class="log-badge">CDR DISARMED</span>
+              <span class="log-msg">Corporate_Brief.pdf: Stripped /JavaScript tree & linearized in 4.6 ms</span>
+            </div>
+            <div class="log-entry log-success">
+              <span class="log-time">16:28:13</span>
+              <span class="log-badge">POLYGLOT REMOVED</span>
+              <span class="log-msg">EmployeeBadge.jpg: Truncated 49 bytes of overlay shellcode past EOF (FF D9)</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: OpenSandbox Detonation & Threat Intel -->
+      <section class="panel sandbox-panel">
+        <div class="panel-header">
+          <h2><span class="icon">🔬</span> Tier 2 OpenSandbox Detonator</h2>
+          <span class="tag tag-accent">Air-Gapped MicroVM</span>
+        </div>
+
+        <div class="detonation-box">
+          <div class="detonation-meta">
+            <div>
+              <strong>Target Payload:</strong>
+              <code id="detonateTarget">suspicious_dropper.bin</code>
+            </div>
+            <div>
+              <strong>VM Profile:</strong>
+              <span class="badge badge-purple">win11-whvp-microvm</span>
+            </div>
+          </div>
+          <button id="btnDetonate" class="btn btn-secondary">Run MicroVM Behavioral Detonation</button>
+        </div>
+
+        <div class="sandbox-results" id="sandboxResults">
+          <div class="verdict-banner banner-malicious">
+            <div class="verdict-title">VERDICT: MALICIOUS (Score: 100/100)</div>
+            <div class="verdict-desc">Process injection, persistence run-keys, and sinkholed C2 callouts caught.</div>
+          </div>
+
+          <div class="mitre-section">
+            <h3>MITRE ATT&CK Matrix Mapping</h3>
+            <div class="mitre-badges">
+              <span class="mitre-tag" title="Process Injection: PE Injection">T1055.002 PE Injection (90%)</span>
+              <span class="mitre-tag" title="Registry Run Keys">T1547.001 Registry Persistence (85%)</span>
+              <span class="mitre-tag" title="Web Protocols C2">T1071.001 Web C2 (75%)</span>
+              <span class="mitre-tag" title="Removable Media Replication">T1091 USB Worm Replication (100%)</span>
+              <span class="mitre-tag" title="Sandbox Evasion">T1497.001 Anti-VM Checks (90%)</span>
+            </div>
+          </div>
+
+          <div class="c2-section">
+            <h3>Air-Gapped Network Sinkhole Intercepts</h3>
+            <div class="c2-logs">
+              <div><code>DNS INTERCEPT:</code> c2-telemetry-gateway.darknet-pool.org</div>
+              <div><code>C2 SINKHOLE:</code> http://c2-telemetry-gateway.darknet-pool.org/api/v1/beacon</div>
+              <div><code>ACTION:</code> Redirected to INetSim (Zero Egress to Internet)</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Bottom Panel: AES-256-GCM Quarantine Vault -->
+      <section class="panel vault-panel">
+        <div class="panel-header">
+          <h2><span class="icon">🔒</span> In-Place AES-256-GCM Quarantine Vault</h2>
+          <span class="tag tag-cyan">Hardware Rooted (DPAPI / TPM 2.0)</span>
+        </div>
+
+        <div class="vault-table-container">
+          <table class="vault-table">
+            <thead>
+              <tr>
+                <th>Vault Entry ID</th>
+                <th>Original File Path</th>
+                <th>SHA-256 Hash</th>
+                <th>Threat Score</th>
+                <th>Quarantine Time (UTC)</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>7efc45df-01</code></td>
+                <td>E:\SecurityCheck.exe</td>
+                <td><code class="hash">7efc45df51d52223415b08c77a08...</code></td>
+                <td><span class="badge badge-red">100 / 100</span></td>
+                <td>2026-10-20 16:28:10</td>
+                <td><button class="btn btn-sm btn-danger">Purge</button></td>
+              </tr>
+              <tr>
+                <td><code>3c8b419a-02</code></td>
+                <td>E:\autorun.inf</td>
+                <td><code class="hash">3c8b419a5840d4fef94c03498877...</code></td>
+                <td><span class="badge badge-red">95 / 100</span></td>
+                <td>2026-10-20 16:28:10</td>
+                <td><button class="btn btn-sm btn-danger">Purge</button></td>
+              </tr>
+              <tr>
+                <td><code>e0915f0d-03</code></td>
+                <td>E:\Documents.lnk</td>
+                <td><code class="hash">e0915f0d1109923847aa83b27164...</code></td>
+                <td><span class="badge badge-orange">75 / 100</span></td>
+                <td>2026-10-20 16:28:11</td>
+                <td><button class="btn btn-sm btn-danger">Purge</button></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <!-- Footer Status Bar -->
+    <footer class="footer">
+      <div>Zero-Trust Compliance: <strong>NIST SP 800-207</strong> · <strong>IEC 62443</strong> · <strong>SOC 2 Type II</strong></div>
+      <div class="footer-stats">
+        <span>Total Latency: <strong>4.2ms</strong></span>
+        <span>Memory Overhead: <strong>42 MB</strong></span>
+        <span>Kernel BSOD Risk: <strong>0.000%</strong></span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
