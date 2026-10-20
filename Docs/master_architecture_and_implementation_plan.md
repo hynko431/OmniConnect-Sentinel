@@ -198,13 +198,17 @@ To fulfill the requirement that OmniConnect Sentinel **"can be used anywhere"**,
 - [x] ProjFS virtual filesystem projection prototype.
 - [x] Verified live physical exploit triage on `ANAND (E:)` pendrive (caught 134 Ramnit malware copies).
 
-#### Sprint 2: Asynchronous Detonation & Cross-Platform Interception (CURRENT SPRINT 🚀)
-- [ ] Implement `tier3_sandbox.rs`: Asynchronous OpenSandbox gRPC client for background binary detonation.
-- [ ] Universal Interceptor abstraction in `sentinel-core` supporting Windows UMDF v2 and Linux `udev`.
-- [ ] Complete Tauri / React desktop UI with:
-  - Real-time USB insertion popup.
-  - "Sanitized Files" explorer view.
-  - Quarantine Vault unlock/inspect manager.
+#### Sprint 2: Asynchronous Detonation & Cross-Platform Interception (COMPLETED ✅)
+- [x] Implemented `tier3_sandbox.rs`: Asynchronous OpenSandbox gRPC client for background binary detonation with deterministic fallback emulation.
+- [x] Implemented Universal Interceptor abstraction in `sentinel-core` (`resolve_best_interceptor()`) dynamically selecting Windows UMDF v2 or Linux `udev`.
+- [x] Implemented & verified `sentinel detonate` CLI command with MITRE ATT&CK mapping, process tree tracking, and air-gapped network sinkhole logs.
+- [x] Implemented interactive cyber-defense dashboard in `dashboard/` (HTML5, CSS3 Glassmorphism, Vanilla JS) featuring:
+  - Real-time USB & peripheral interception matrix (USB, Bluetooth, Wi-Fi Direct, LAN).
+  - "Safe Charging Only" hardware toggle (sever D+/D- pins, keep VBUS 5V power).
+  - Live zero-trust drive sweep telemetry ribbon.
+  - OpenSandbox detonation view with MITRE ATT&CK tags and FakeDNS/INetSim sinkhole logs.
+  - In-place AES-256-GCM Quarantine Vault inspector with one-click purge.
+- [x] Added `sentinel ui` CLI command to launch the dashboard in default browser.
 
 #### Sprint 3: Enterprise Integration & Compliance Certification
 - [ ] Microsoft Intune OMA-URI device policy configuration provider.
