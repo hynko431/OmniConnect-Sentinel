@@ -1,0 +1,5 @@
+[build]
+incremental = false
+
+[env]
+CARGO_INCREMENTAL = "0"

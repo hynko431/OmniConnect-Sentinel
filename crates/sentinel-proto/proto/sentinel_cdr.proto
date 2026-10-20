@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package sentinel.cdr.v1;
+
+// Service for streaming Content Disarm and Reconstruction (CDR)
+service ContentDisarmService {
+  // Bi-directional streaming RPC for chunked file sanitization
+  rpc StreamDisarm(stream DisarmRequest) returns (stream DisarmResponse);
+
+  // Synchronous inspection and structural vulnerability assessment
+  rpc InspectArtifact(InspectRequest) returns (InspectResponse);
+
+  // Health and engine telemetry check
+  rpc CheckHealth(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+enum FileFormatType {
+  FORMAT_UNKNOWN = 0;
+  FORMAT_PDF = 1;
+  FORMAT_DOCX = 2;
+  FORMAT_XLSX = 3;
+  FORMAT_PPTX = 4;
+  FORMAT_JPEG = 5;
+  FORMAT_PNG = 6;
+  FORMAT_WEBP = 7;
+}
+
+message DisarmRequest {
+  oneof payload {
+    DisarmMetadata metadata = 1;
+    bytes chunk_data = 2;
+  }
+}
+
+message DisarmMetadata {
+  string session_id = 1;
+  string file_name = 2;
+  FileFormatType declared_format = 3;
+  uint64 total_size_bytes = 4;
+  DisarmPolicy policy = 5;
+}
+
+message DisarmPolicy {
+  bool strip_macros = 1;
+  bool strip_javascript = 2;
+  bool strip_embedded_files = 3;
+  bool strip_external_hyperlinks = 4;
+  bool strip_exif_metadata = 5;
+  bool truncate_overlay_bytes = 6;
+  uint32 max_recursion_depth = 7;
+}
+
+message DisarmResponse {
+  oneof result {
+    bytes sanitized_chunk = 1;
+    SanitizationSummary summary = 2;
+    DisarmError error = 3;
+  }
+}
+
+message SanitizationSummary {
+  string session_id = 1;
+  bytes original_sha256 = 2;
+  bytes sanitized_sha256 = 3;
+  uint64 original_size_bytes = 4;
+  uint64 sanitized_size_bytes = 5;
+  repeated SanitizedElement sanitized_elements = 6;
+  bool was_modified = 7;
+  int64 processing_duration_micros = 8;
+}
+
+message SanitizedElement {
+  string element_type = 1;   // e.g., "VBA_MACRO", "PDF_JS_ACTION", "OVERLAY_BYTES", "DDE_FORMULA"
+  string location_path = 2;  // e.g., "word/vbaProject.bin", "Catalog/Names/JavaScript"
+  string action_taken = 3;   // "REMOVED", "NORMALIZED", "TRUNCATED"
+}
+
+message DisarmError {
+  string code = 1;
+  string message = 2;
+  bool recoverable = 3;
+}
+
+message InspectRequest {
+  bytes header_bytes = 1;
+  string file_name = 2;
+  uint64 file_size_bytes = 3;
+}
+
+message InspectResponse {
+  FileFormatType detected_format = 1;
+  bool is_polyglot = 2;
+  float entropy_score = 3;
+  repeated string detected_risk_tags = 4;
+  bool requires_cdr = 5;
+}
+
+message HealthCheckRequest {
+  string client_id = 1;
+}
+
+message HealthCheckResponse {
+  string status = 1; // "SERVING", "NOT_SERVING"
+  string version = 2;
+  uint64 active_sessions = 3;
+  uint64 total_disarmed_files = 4;
+}

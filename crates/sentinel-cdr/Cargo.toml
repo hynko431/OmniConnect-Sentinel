@@ -1,0 +1,37 @@
+[package]
+name = "sentinel-cdr"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "High-performance, memory-safe Content Disarm and Reconstruction (CDR) engine in pure Rust"
+
+[[bin]]
+name = "sentinel-cdr-daemon"
+path = "src/main.rs"
+
+[dependencies]
+sentinel-proto.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+prost.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror = "1.0"
+
+# Document & Media parsing crates
+lopdf = "0.33"
+zip = { version = "2.1", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+quick-xml = "0.36"
+
+[dev-dependencies]
+tempfile = "3.10"
