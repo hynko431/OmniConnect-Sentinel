@@ -2,6 +2,10 @@ use clap::{Parser, Subcommand};
 use sentinel_cdr::engine::CdrEngine;
 use sentinel_cdr::policy::SanitizationPolicy;
 use sentinel_core::scanner::tier0_yara::Tier0YaraScanner;
+use sentinel_core::scanner::tier3_sandbox::{
+    DetonationRequest, NetworkContainmentMode, OpenSandboxClient,
+};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -35,6 +39,20 @@ enum Commands {
         #[arg(short, long)]
         path: PathBuf,
     },
+    /// Detonate an executable in the OpenSandbox microVM environment (behavioral analysis)
+    Detonate {
+        /// Path to target executable or payload
+        #[arg(short, long)]
+        path: PathBuf,
+
+        /// MicroVM profile (e.g. win11-whvp-microvm, ubuntu22-kvm)
+        #[arg(short, long, default_value = "win11-whvp-microvm")]
+        vm: String,
+
+        /// OpenSandbox endpoint
+        #[arg(short, long, default_value = "http://localhost:8080")]
+        endpoint: String,
+    },
     /// Scan an external drive or folder recursively for viruses, worms, and suspicious payloads
     ScanDrive {
         /// Target drive or directory path (e.g. E:\ or E:)
@@ -44,6 +62,12 @@ enum Commands {
         /// Maximum files to inspect
         #[arg(short, long, default_value_t = 2000)]
         limit: usize,
+    },
+    /// Launch the interactive Web & Desktop Dashboard GUI
+    Ui {
+        /// Port to serve the dashboard on
+        #[arg(short, long, default_value_t = 8088)]
+        port: u16,
     },
 }
 
@@ -82,6 +106,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("  Detected Format: {:?}", format);
             info!("  Size: {} bytes", bytes.len());
         }
+        Commands::Detonate { path, vm, endpoint } => {
+            info!("Reading target binary for OpenSandbox detonation: {:?}", path);
+            let bytes = fs::read(&path)?;
+            let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let sha256_hex = hex::encode(hasher.finalize());
+
+            let client = OpenSandboxClient::new(endpoint, None);
+            let req = DetonationRequest {
+                file_name,
+                sha256_hex,
+                file_bytes: bytes,
+                vm_profile: vm,
+                timeout_seconds: 60,
+                containment_mode: NetworkContainmentMode::SinkholeOnly,
+            };
+
+            let report = client
+                .submit_detonation(req)
+                .await
+                .map_err(|e| format!("{}", e))?;
+            println!("\n===========================================================");
+            println!("       OPENSANDBOX BEHAVIORAL DETONATION REPORT           ");
+            println!("===========================================================");
+            println!("Job ID:                 {}", report.job_id);
+            println!("File Name:              {}", report.file_name);
+            println!("SHA256:                 {}", report.sha256_hex);
+            println!("Verdict:                {:?}", report.verdict);
+            println!("Threat Score:           {}/100", report.threat_score);
+            println!("VM Profile:             {}", report.vm_profile);
+            println!("Duration:               {} ms", report.duration_ms);
+            println!("Containment Mode:       Air-Gapped Network Sinkhole");
+            println!("Engine Execution:       {}", if report.is_emulated { "Deterministic High-Precision Emulation (Offline Fallback)" } else { "Live MicroVM (WHVP/QEMU)" });
+
+            if !report.mitre_attack_techniques.is_empty() {
+                println!("\n🎯 [MITRE ATT&CK TECHNIQUES IDENTIFIED]");
+                for t in &report.mitre_attack_techniques {
+                    println!("   • [{}] {} (Tactic: {}, Confidence: {}%)", t.technique_id, t.name, t.tactic, t.confidence);
+                }
+            }
+
+            if !report.spawned_processes.is_empty() {
+                println!("\n🌲 [SPAWNED PROCESS TREE]");
+                for p in &report.spawned_processes {
+                    println!("   • PID {}: {} (Cmd: {})", p.pid, p.process_path, p.command_line);
+                }
+            }
+
+            if !report.dns_queries_intercepted.is_empty() {
+                println!("\n🌐 [NETWORK SINKHOLE CAPTURES (DNS / C2)]");
+                for dns in &report.dns_queries_intercepted {
+                    println!("   • Intercepted DNS Query: {}", dns);
+                }
+                for c2 in &report.c2_beacons_sinkholed {
+                    println!("   • Sinkholed C2 Beacon:   {}", c2);
+                }
+            }
+
+            if !report.registry_modifications.is_empty() {
+                println!("\n🔑 [PERSISTENCE REGISTRY MODIFICATIONS]");
+                for reg in &report.registry_modifications {
+                    println!("   • Registry Key Created:  {}", reg);
+                }
+            }
+
+            if !report.anti_evasion_shims_active.is_empty() {
+                println!("\n🛡️ [ANTI-EVASION SHIMS TRIGGERED]");
+                for shim in &report.anti_evasion_shims_active {
+                    println!("   • {}", shim);
+                }
+            }
+        }
         Commands::ScanDrive { path, limit } => {
             info!("===========================================================");
             info!("   OmniConnect Sentinel - External Drive Threat Scanner    ");
@@ -114,7 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let file_path = entry.path().to_path_buf();
-                let file_name = entry.file_name().to_string_lossy().to_string();
+                let _file_name = entry.file_name().to_string_lossy().to_string();
                 let ext = file_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
 
                 // Track file size histogram to catch Ramnit/file infector identical sizes
@@ -184,6 +282,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 println!("\n✅ No overt executable worms or viruses detected on inspected sample.");
             }
+        }
+        Commands::Ui { port } => {
+            info!("===========================================================");
+            info!("   OmniConnect Sentinel - Desktop & Web GUI Dashboard      ");
+            info!("===========================================================");
+
+            let dashboard_index = std::env::current_dir()?.join("dashboard").join("index.html");
+            let url = if dashboard_index.exists() {
+                format!("file:///{}", dashboard_index.display().to_string().replace('\\', "/"))
+            } else {
+                format!("http://localhost:{}", port)
+            };
+
+            info!("Launching OmniConnect Sentinel Dashboard: {}", url);
+            #[cfg(target_os = "windows")]
+            {
+                std::process::Command::new("cmd")
+                    .args(["/C", "start", "", &url])
+                    .spawn()?;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open").arg(&url).spawn();
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            }
+
+            println!("\n🖥️ [SENTINEL DASHBOARD ACTIVE]");
+            println!("   Dashboard Location: {}", url);
+            println!("   Interactive Sentry: UMDF Interceptor, OpenSandbox Detonator & Quarantine Vault");
         }
     }
 
