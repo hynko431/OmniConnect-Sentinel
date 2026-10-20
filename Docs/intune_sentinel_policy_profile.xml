@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<SyncML xmlns="SYNCML:SYNCML1.2">
+  <SyncBody>
+    <!-- OmniConnect Sentinel Zero-Trust Peripheral Management Profile -->
+    <Item>
+      <Target>
+        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnect~Policy~Sentinel/EnforceRemovableMediaCDR</LocURI>
+      </Target>
+      <Data>1</Data>
+    </Item>
+    <Item>
+      <Target>
+        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnect~Policy~Sentinel/BlockUnauthorizedUSBHID</LocURI>
+      </Target>
+      <Data>1</Data>
+    </Item>
+    <Item>
+      <Target>
+        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnect~Policy~Sentinel/ChargeOnlyFallback</LocURI>
+      </Target>
+      <Data>1</Data>
+    </Item>
+    <Item>
+      <Target>
+        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnect~Policy~Sentinel/MaxFileSizeMB</LocURI>
+      </Target>
+      <Data>250</Data>
+    </Item>
+    <Item>
+      <Target>
+        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnect~Policy~Sentinel/HardwareWhitelist</LocURI>
+      </Target>
+      <Data>USB\VID_0781&*;USB\VID_0951&*</Data>
+    </Item>
+  </SyncBody>
+</SyncML>
