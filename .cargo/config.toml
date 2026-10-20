@@ -3,4 +3,3 @@ incremental = false
 
 [env]
 CARGO_INCREMENTAL = "0"
-PROTOC = "C:\\Users\\hulkh\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Google.Protobuf_Microsoft.Winget.Source_8wekyb3d8bbwe\\bin\\protoc.exe"
