@@ -1,5 +1,6 @@
 pub mod windows_umdf;
 pub mod linux_udev;
+pub mod drive_watcher;
 
 use crate::events::DeviceConnectedEvent;
 use async_trait::async_trait;

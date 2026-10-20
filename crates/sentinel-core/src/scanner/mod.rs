@@ -2,6 +2,12 @@ pub mod tier0_yara;
 pub mod tier1_cdr_client;
 pub mod tier3_sandbox;
 pub mod quarantine;
+pub mod secure_shredder;
+pub mod universal_scanner;
+pub mod polyglot_scanner;
+pub mod ntfs_ads_scanner;
+pub mod unicode_trojan_detector;
+pub mod content_scanner;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
