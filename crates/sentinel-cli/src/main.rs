@@ -71,7 +71,7 @@ enum Commands {
         limit: usize,
 
         /// Enable interactive remediation prompt on threats
-        #[arg(short, long, default_value_t = true)]
+        #[arg(short, long, default_value_t = false)]
         interactive: bool,
     },
     /// Permanently shred a malicious file or carrier without backdoors (NIST SP 800-88 Rev 1)

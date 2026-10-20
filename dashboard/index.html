@@ -212,46 +212,54 @@
       <!-- Bottom Panel: AES-256-GCM Quarantine Vault -->
       <section class="panel vault-panel">
         <div class="panel-header">
-          <h2><span class="icon">🔒</span> In-Place AES-256-GCM Quarantine Vault</h2>
-          <span class="tag tag-cyan">Hardware Rooted (DPAPI / TPM 2.0)</span>
+          <h2><span class="icon">🔒</span> NIST SP 800-88 Rev 1 Shredder & Quarantine Vault</h2>
+          <span class="tag tag-cyan">Hardware Rooted (CSPRNG Overwrite & Zero Remanence)</span>
         </div>
 
         <div class="vault-table-container">
           <table class="vault-table">
             <thead>
               <tr>
-                <th>Vault Entry ID</th>
-                <th>Original File Path</th>
-                <th>SHA-256 Hash</th>
-                <th>Threat Score</th>
-                <th>Quarantine Time (UTC)</th>
-                <th>Action</th>
+                <th>Threat Carrier</th>
+                <th>Target File Path</th>
+                <th>Exploit Vector / Carrier Details</th>
+                <th>Risk Score</th>
+                <th>MITRE ATT&CK</th>
+                <th>Remediation Action</th>
               </tr>
             </thead>
             <tbody>
               <tr>
-                <td><code>7efc45df-01</code></td>
-                <td>E:\SecurityCheck.exe</td>
-                <td><code class="hash">7efc45df51d52223415b08c77a08...</code></td>
-                <td><span class="badge badge-red">100 / 100</span></td>
-                <td>2026-10-20 16:28:10</td>
-                <td><button class="btn btn-sm btn-danger">Purge</button></td>
+                <td><span class="badge badge-red">POLYGLOT IMAGE</span></td>
+                <td>E:\Presentations\Roadmap.jpg</td>
+                <td>245 KB PE Executable (MZ) Appended Past JPEG EOI (0xFFD9)</td>
+                <td><span class="badge badge-red">98 / 100</span></td>
+                <td><code>T1027.001</code></td>
+                <td><button class="btn btn-sm btn-danger btn-shred" data-path="E:\Presentations\Roadmap.jpg">NIST SP 800-88 Shred</button></td>
               </tr>
               <tr>
-                <td><code>3c8b419a-02</code></td>
+                <td><span class="badge badge-red">NTFS ADS STREAM</span></td>
+                <td>E:\Contracts\Brief.docx:evil.exe</td>
+                <td>Alternate Data Stream hidden inside benign Word document ($DATA)</td>
+                <td><span class="badge badge-red">96 / 100</span></td>
+                <td><code>T1564.004</code></td>
+                <td><button class="btn btn-sm btn-danger btn-shred" data-path="E:\Contracts\Brief.docx:evil.exe">NIST SP 800-88 Shred</button></td>
+              </tr>
+              <tr>
+                <td><span class="badge badge-red">UNICODE BIDI SPOOF</span></td>
+                <td>E:\Invoices\receipt_‮cod.exe</td>
+                <td>Right-to-Left Override (U+202E) masquerading .exe as .doc</td>
+                <td><span class="badge badge-red">99 / 100</span></td>
+                <td><code>T1036.002</code></td>
+                <td><button class="btn btn-sm btn-danger btn-shred" data-path="E:\Invoices\receipt_‮cod.exe">NIST SP 800-88 Shred</button></td>
+              </tr>
+              <tr>
+                <td><span class="badge badge-orange">CPL SHORTCUT WORM</span></td>
                 <td>E:\autorun.inf</td>
-                <td><code class="hash">3c8b419a5840d4fef94c03498877...</code></td>
-                <td><span class="badge badge-red">95 / 100</span></td>
-                <td>2026-10-20 16:28:10</td>
-                <td><button class="btn btn-sm btn-danger">Purge</button></td>
-              </tr>
-              <tr>
-                <td><code>e0915f0d-03</code></td>
-                <td>E:\Documents.lnk</td>
-                <td><code class="hash">e0915f0d1109923847aa83b27164...</code></td>
-                <td><span class="badge badge-orange">75 / 100</span></td>
-                <td>2026-10-20 16:28:11</td>
-                <td><button class="btn btn-sm btn-danger">Purge</button></td>
+                <td>Automount Shell Execution Payload (Ramnit Carrier)</td>
+                <td><span class="badge badge-orange">95 / 100</span></td>
+                <td><code>T1091</code></td>
+                <td><button class="btn btn-sm btn-danger btn-shred" data-path="E:\autorun.inf">NIST SP 800-88 Shred</button></td>
               </tr>
             </tbody>
           </table>
