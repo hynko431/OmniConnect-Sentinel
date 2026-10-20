@@ -1406,6 +1406,7 @@ dependencies = [
 name = "sentinel-cli"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "hex",
  "sentinel-cdr",
@@ -1415,6 +1416,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "walkdir",
 ]
 
