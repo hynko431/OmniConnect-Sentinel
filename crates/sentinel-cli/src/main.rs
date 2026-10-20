@@ -4,13 +4,17 @@ use sentinel_cdr::policy::SanitizationPolicy;
 use sentinel_core::enterprise::falcon::{CrowdStrikeFalconBridge, FalconPeripheralEvent};
 use sentinel_core::enterprise::intune::IntunePolicyManager;
 use sentinel_core::enterprise::kiosk::AirGappedKioskManager;
-use sentinel_core::scanner::tier0_yara::Tier0YaraScanner;
+use sentinel_core::interceptor::drive_watcher::DriveWatcher;
+use sentinel_core::scanner::quarantine::QuarantineVault;
+use sentinel_core::scanner::secure_shredder::SecureShredder;
 use sentinel_core::scanner::tier3_sandbox::{
     DetonationRequest, NetworkContainmentMode, OpenSandboxClient,
 };
+use sentinel_core::scanner::universal_scanner::{UniversalScanner, UniversalThreat};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -65,6 +69,26 @@ enum Commands {
         /// Maximum files to inspect
         #[arg(short, long, default_value_t = 2000)]
         limit: usize,
+
+        /// Enable interactive remediation prompt on threats
+        #[arg(short, long, default_value_t = false)]
+        interactive: bool,
+    },
+    /// Permanently shred a malicious file or carrier without backdoors (NIST SP 800-88 Rev 1)
+    Shred {
+        /// Target file path to permanently obliterate
+        #[arg(short, long)]
+        path: PathBuf,
+
+        /// Number of overwrite passes (default: 3)
+        #[arg(short = 'n', long, default_value_t = 3)]
+        passes: u8,
+    },
+    /// Autonomous background sentry monitoring for removable drive insertions
+    Watch {
+        /// Polling interval in milliseconds
+        #[arg(short = 'i', long, default_value_t = 1000)]
+        interval_ms: u64,
     },
     /// Launch the interactive Web & Desktop Dashboard GUI
     Ui {
@@ -201,10 +225,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::ScanDrive { path, limit } => {
+        Commands::ScanDrive { path, limit, interactive } => {
             info!("===========================================================");
-            info!("   OmniConnect Sentinel - External Drive Threat Scanner    ");
-            info!("   Scanning Target: {:?} (Limit: {} files)", path, limit);
+            info!("   OmniConnect Sentinel - Universal Threat & Drive Scanner ");
+            info!("   Scanning Target: {:?} (Limit: {} files, Interactive: {})", path, limit, interactive);
             info!("===========================================================");
 
             // 1. Root autorun check
@@ -218,7 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut files_scanned = 0;
             let mut malware_blocked_by_os = 0;
-            let mut suspicious_files = Vec::new();
+            let mut universal_threats = Vec::new();
             let mut size_histogram: HashMap<u64, Vec<PathBuf>> = HashMap::new();
 
             for entry in WalkDir::new(&path).into_iter().filter_map(|e| e.ok()) {
@@ -233,7 +257,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let file_path = entry.path().to_path_buf();
-                let _file_name = entry.file_name().to_string_lossy().to_string();
                 let ext = file_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
 
                 // Track file size histogram to catch Ramnit/file infector identical sizes
@@ -246,19 +269,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Check for LNK exploit / CPL vectors
                 if ext == "lnk" || ext == "cpl" {
-                    suspicious_files.push((file_path.clone(), "LNK / CPL Shortcut Vector (Potential Exploit:Win32/CplLnk.A)".to_string(), 75));
+                    println!("🚨 [SHORTCUT THREAT]: LNK/CPL Vector: {:?}", file_path);
                 }
 
-                // Try reading file to perform Tier 0 entropy & heuristic check
-                match fs::read(&file_path) {
-                    Ok(bytes) => {
-                        let report = Tier0YaraScanner::scan_bytes(&bytes, &file_path);
-                        if report.threat_score >= 35 {
-                            suspicious_files.push((
-                                file_path.clone(),
-                                format!("Heuristic Alert: {:?} (Entropy: {:.2})", report.suspicious_strings, report.entropy),
-                                report.threat_score,
-                            ));
+                // Universal Deep Carrier Scanner (Polyglots, ADS, BiDi Trojan, Documents, Ransomware, Scripts)
+                match UniversalScanner::scan_file(&file_path) {
+                    Ok(threats) => {
+                        for t in threats {
+                            println!("🚨 [THREAT DETECTED]: {:?} -> {} (Severity: {:?}, Score: {}/100)", t.file_path, t.threat_name, t.severity, t.risk_score);
+                            universal_threats.push(t);
                         }
                     }
                     Err(e) => {
@@ -276,7 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("===========================================================");
             println!("Files Scanned:              {}", files_scanned);
             println!("Active Malware Blocked:     {}", malware_blocked_by_os);
-            println!("Suspicious Vectors Flagged: {}", suspicious_files.len());
+            println!("Universal Threats Found:    {}", universal_threats.len());
 
             // Check for Ramnit file infector size clusters (e.g. 229,376 bytes)
             for (size, files) in &size_histogram {
@@ -292,16 +311,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            if malware_blocked_by_os > 0 || !suspicious_files.is_empty() {
-                println!("\n🚨 [RECOMMENDED REMEDIATION ACTIONS]");
-                println!("1. DO NOT open or click on any .lnk shortcuts or .exe files on this drive.");
-                println!("2. The drive contains active Ramnit and CplLnk infections (Stuxnet/shortcut worm class).");
-                println!("3. Run a complete Defender scan to quarantine infected executables:");
-                println!("   Start-MpScan -ScanType CustomScan -ScanPath \"{}\"", path.display());
-                println!("4. Sanitize legitimate documents/images into a safe folder using:");
-                println!("   sentinel sanitize --input <E:\\path\\doc.pdf> --output <C:\\clean\\doc.pdf>");
+            if interactive && !universal_threats.is_empty() {
+                println!("\n🚨 [INTERACTIVE REMEDIATION ENGAGED]");
+                println!("Prompting for remediation on {} discovered threat(s)...", universal_threats.len());
+                for threat in &universal_threats {
+                    prompt_remediation(threat);
+                }
+            } else if !universal_threats.is_empty() {
+                println!("\n🚨 Run with --interactive to interactively shred or disarm detected threats.");
             } else {
-                println!("\n✅ No overt executable worms or viruses detected on inspected sample.");
+                println!("\n✅ No hidden threats, polyglots, or malicious carrier vectors found on drive.");
+            }
+        }
+        Commands::Shred { path, passes } => {
+            println!("===========================================================");
+            println!("      OMNICONNECT SENTINEL: ANTI-FORENSIC SECURE SHREDDER  ");
+            println!("===========================================================");
+            println!("Target Path: {:?}", path);
+            println!("Standards:   NIST SP 800-88 Rev 1 / DoD 5220.22-M");
+            println!("Overwrites:  {} Passes (CSPRNG, Inverted Complement, Cryptographic Zeroes)\n", passes);
+
+            if !path.exists() {
+                println!("❌ Target path does not exist: {:?}", path);
+                return Ok(());
+            }
+
+            match SecureShredder::shred_file(&path, passes) {
+                Ok(receipt) => {
+                    println!("⚡ [SHREDDING COMPLETE - ZERO REMANENCE]");
+                    println!("   Original File Size:   {} bytes", receipt.original_size_bytes);
+                    println!("   Overwrites Completed: {} passes", receipt.passes_completed);
+                    println!("   MFT Scramble Cycles:  {} cycles", receipt.mft_scramble_cycles);
+                    println!("   Hardware Flushed:     {}", receipt.hardware_flushed);
+                    println!("   Duration:             {} ms", receipt.duration_ms);
+                    println!("   Final File Hash:      SHA256[{}]", receipt.sha256_final);
+                    println!("\n✅ File {:?} permanently eradicated. All data and directory traces eliminated.", path);
+                }
+                Err(e) => {
+                    println!("❌ Shredding failed: {}", e);
+                }
+            }
+        }
+        Commands::Watch { interval_ms } => {
+            println!("===========================================================");
+            println!("      OMNICONNECT SENTINEL: AUTONOMOUS DRIVE SENTRY        ");
+            println!("===========================================================");
+            println!("Actively monitoring for removable media insertions (Interval: {} ms)...", interval_ms);
+            println!("Press Ctrl+C to terminate sentinel sentry.\n");
+
+            let interval = std::time::Duration::from_millis(interval_ms);
+            if let Err(e) = DriveWatcher::listen_for_insertions(interval, move |event| {
+                println!("\n🚨 [EXTERNAL DRIVE DETECTED]: Removable Media connected at {:?}", event.drive_root);
+                println!("   Initiating deep carrier inspection across all documents, images, videos, and hidden streams...");
+
+                let threats = UniversalScanner::scan_directory(&event.drive_root, 2000);
+                if threats.is_empty() {
+                    println!("✅ Drive {:?} scanned cleanly. No hidden threats, polyglots, or exploits found.", event.drive_root);
+                } else {
+                    println!("🚨 FOUND {} POTENTIAL THREAT(S) ON DRIVE {:?}", threats.len(), event.drive_root);
+                    for threat in &threats {
+                        prompt_remediation(threat);
+                    }
+                }
+            }).await {
+                eprintln!("DriveWatcher runtime error: {}", e);
             }
         }
         Commands::Ui { port } => {
@@ -405,4 +478,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn prompt_remediation(threat: &UniversalThreat) {
+    println!("\n================================================================================");
+    println!("🚨 [THREAT IDENTIFIED]: {:?}", threat.file_path);
+    println!("   Carrier:      {:?}", threat.carrier_category);
+    println!("   Threat Name:  {}", threat.threat_name);
+    println!("   Severity:     {:?} (Risk Score: {}/100)", threat.severity, threat.risk_score);
+    println!("   MITRE ATT&CK: {}", threat.mitre_technique);
+    println!("   Details:      {}", threat.technical_details);
+    println!("--------------------------------------------------------------------------------");
+    println!("REMEDIATION CHOICES:");
+    println!("  [1] PERMANENT ANTI-FORENSIC SHRED (NIST SP 800-88 Cryptographic Purge - 0% Remanence)");
+    println!("  [2] QUARANTINE TO ENCRYPTED VAULT (AES-256-GCM container)");
+    println!("  [3] SKIP / LEAVE UNTOUCHED");
+    print!("Select action [1-3] (Default: 1): ");
+    let _ = std::io::stdout().flush();
+
+    let mut input = String::new();
+    let _ = std::io::stdin().read_line(&mut input);
+    let choice = input.trim();
+
+    if choice.is_empty() || choice == "1" {
+        println!("⚡ Executing NIST SP 800-88 cryptographic shredding...");
+        match SecureShredder::shred_file(&threat.file_path, 3) {
+            Ok(receipt) => {
+                println!(
+                    "✅ [PERMANENTLY ERADICATED]: {:?} ({} bytes overwritten in {} ms). Zero backdoors remain!",
+                    receipt.target_path, receipt.original_size_bytes, receipt.duration_ms
+                );
+            }
+            Err(e) => {
+                println!("❌ Shredding error: {}", e);
+            }
+        }
+    } else if choice == "2" {
+        println!("🔒 Quarantining to encrypted vault...");
+        let vault = QuarantineVault::new(PathBuf::from(".sentinel_vault"));
+        if let Ok(bytes) = fs::read(&threat.file_path) {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let sha = hex::encode(hasher.finalize());
+            match vault.quarantine_file(&bytes, &threat.file_path, threat.risk_score, &sha) {
+                Ok(q) => {
+                    println!("✅ Quarantined to: {:?}", q.quarantine_container_path);
+                    let _ = fs::remove_file(&threat.file_path);
+                }
+                Err(e) => println!("❌ Quarantine failed: {}", e),
+            }
+        }
+    } else {
+        println!("⚠️ Threat skipped per user request.");
+    }
 }

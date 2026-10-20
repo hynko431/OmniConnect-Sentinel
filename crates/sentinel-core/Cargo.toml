@@ -32,3 +32,7 @@ async-trait.workspace = true
 # Cross-platform userspace I/O
 walkdir = "2.5"
 thiserror = "1.0"
+zip = { version = "2.1", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3.10"
