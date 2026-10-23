@@ -1,468 +1,439 @@
-// ==========================================================================
-// OmniConnect Sentinel Cyber Defense Dashboard & Kiosk Controller
-// Implemented with: emil-design-eng, anatomy, ask-sonner, break-ui, framer-motion
-// ==========================================================================
+/**
+ * OmniConnect Sentinel — Enterprise Dashboard Logic
+ * Lenses: /impeccable · /taste-skill · /emil-design-eng
+ */
 
 document.addEventListener('DOMContentLoaded', () => {
   // DOM Elements
-  const appLayout = document.getElementById('appLayout');
-  const modeSocBtn = document.getElementById('modeSocBtn');
-  const modeKioskBtn = document.getElementById('modeKioskBtn');
+  const safeChargingToggle = document.getElementById('safeChargingToggle');
+  const safeChargeBadge = document.getElementById('safeChargeBadge');
+  const kpiPinStatusText = document.getElementById('kpiPinStatusText');
+  const kpiPinSubtext = document.getElementById('kpiPinSubtext');
+  
+  // SVG Pin Elements
+  const lineDataMinusLeft = document.getElementById('lineDataMinusLeft');
+  const switchArmMinus = document.getElementById('switchArmMinus');
+  const lineDataMinusRight = document.getElementById('lineDataMinusRight');
+  
+  const lineDataPlusLeft = document.getElementById('lineDataPlusLeft');
+  const switchArmPlus = document.getElementById('switchArmPlus');
+  const lineDataPlusRight = document.getElementById('lineDataPlusRight');
+
+  // Sector Shredder Elements
+  const sectorGrid64 = document.getElementById('sectorGrid64');
+  const btnInitiateSanitize = document.getElementById('btnInitiateSanitize');
+  const sanitizePassText = document.getElementById('sanitizePassText');
+
+  // Modals
+  const cdrModal = document.getElementById('cdrModal');
+  const btnInspectCdr = document.getElementById('btnInspectCdr');
+  const btnCloseCdrModal = document.getElementById('btnCloseCdrModal');
+
+  const mitreModal = document.getElementById('mitreModal');
+  const mitreModalId = document.getElementById('mitreModalId');
+  const mitreModalHeading = document.getElementById('mitreModalHeading');
+  const mitreModalDesc = document.getElementById('mitreModalDesc');
+  const mitreModalMitigation = document.getElementById('mitreModalMitigation');
+  const btnCloseMitreModal = document.getElementById('btnCloseMitreModal');
+  const mitreChips = document.querySelectorAll('.mitre-chip');
+
+  // Persona Elements
+  const btnSocHUD = document.getElementById('btnSocHUD');
+  const btnKioskMode = document.getElementById('btnKioskMode');
   const socView = document.getElementById('socView');
   const kioskView = document.getElementById('kioskView');
 
-  const safeChargingToggle = document.getElementById('safeChargingToggle');
-  const anatomyContainer = document.getElementById('anatomyContainer');
-  const anatomyReadout = document.getElementById('anatomyReadout');
-  const interlockStatusText = document.getElementById('interlockStatusText');
-  const pinStateIndicator = document.getElementById('pinStateIndicator');
-
-  const btnScan = document.getElementById('btnScan');
-  const targetPath = document.getElementById('targetPath');
-  const scanProgressBox = document.getElementById('scanProgressBox');
-  const scanProgressBar = document.getElementById('scanProgressBar');
-  const scanProgressPct = document.getElementById('scanProgressPct');
-  const scanSpeedMetric = document.getElementById('scanSpeedMetric');
-  const scanTimeMetric = document.getElementById('scanTimeMetric');
-
-  const statFiles = document.getElementById('statFiles');
-  const statThreats = document.getElementById('statThreats');
-  const statVectors = document.getElementById('statVectors');
-  const statDisarmed = document.getElementById('statDisarmed');
-
-  const logContainer = document.getElementById('logContainer');
-  const feedFilterBtns = document.querySelectorAll('.feed-filter-btn');
-
-  const btnDetonate = document.getElementById('btnDetonate');
-  const sandboxResults = document.getElementById('sandboxResults');
-  const mitreTags = document.querySelectorAll('.mitre-tag');
-  const mitreModal = document.getElementById('mitreModal');
-  const mitreModalTitle = document.getElementById('mitreModalTitle');
-  const mitreModalBody = document.getElementById('mitreModalBody');
-  const btnCloseMitreModal = document.getElementById('btnCloseMitreModal');
-
-  const btnOpenCdrDiff = document.getElementById('btnOpenCdrDiff');
-  const cdrDiffModal = document.getElementById('cdrDiffModal');
-  const btnCloseCdrModal = document.getElementById('btnCloseCdrModal');
-  const btnVerifyCdrHash = document.getElementById('btnVerifyCdrHash');
-
-  const sectorGrid = document.getElementById('sectorGrid');
-  const btnShredAll = document.getElementById('btnShredAll');
-  const shredButtons = document.querySelectorAll('.btn-shred');
-
-  const btnKioskSanitize = document.getElementById('btnKioskSanitize');
-  const kioskCert = document.getElementById('kioskCert');
-  const btnKioskEject = document.getElementById('btnKioskEject');
+  // Kiosk Elements
   const kioskStep1 = document.getElementById('kioskStep1');
   const kioskStep2 = document.getElementById('kioskStep2');
   const kioskStep3 = document.getElementById('kioskStep3');
+  const btnKioskSimulate = document.getElementById('btnKioskSimulate');
+  const btnKioskEject = document.getElementById('btnKioskEject');
 
-  const btnDataDemo = document.getElementById('btnDataDemo');
-  const btnDataWorst = document.getElementById('btnDataWorst');
-  const toastContainer = document.getElementById('toastContainer');
+  // Telemetry Simulation
+  const btnTogglePinSimulation = document.getElementById('btnTogglePinSimulation');
+  const valVoltage = document.getElementById('valVoltage');
+  const valCurrent = document.getElementById('valCurrent');
+  const valPower = document.getElementById('valPower');
+  const valDeviceName = document.getElementById('valDeviceName');
 
-  // ========================================================================
-  // 1. Toast Notification Infrastructure (ask-sonner inspired)
-  // ========================================================================
-  function showToast(type, title, message, duration = 4200) {
-    const toast = document.createElement('div');
-    toast.className = `toast toast-${type}`;
-    
-    let icon = '⚡';
-    if (type === 'crit') icon = '🛑';
-    if (type === 'success') icon = '✅';
-    if (type === 'warn') icon = '⚠️';
+  // Stress Testing
+  const btnStressToggle = document.getElementById('btnStressToggle');
+  let isStressed = false;
 
-    toast.innerHTML = `
-      <div style="font-size: 1.2rem;">${icon}</div>
-      <div style="flex: 1;">
-        <div style="font-weight: 700; color: #f8fafc; font-family: var(--font-mono); font-size: 0.76rem;">${title}</div>
-        <div style="color: #94a3b8; font-size: 0.72rem; margin-top: 2px;">${message}</div>
-      </div>
-    `;
+  /* ==========================================================================
+     1. Safe Charging Interlock Logic
+     ========================================================================== */
+  function updateSafeChargingState(isDecoupled) {
+    if (isDecoupled) {
+      // Data lines cut
+      kpiPinStatusText.textContent = 'DECOUPLED';
+      kpiPinStatusText.style.color = 'var(--color-status-danger)';
+      kpiPinSubtext.textContent = 'Safe Charge: Active (No Data)';
+      kpiPinSubtext.className = 'kpi-delta safe';
+      
+      safeChargeBadge.textContent = 'ACTIVE: DATA ISOLATED';
+      safeChargeBadge.className = 'kpi-delta safe';
 
-    toastContainer.appendChild(toast);
-
-    setTimeout(() => {
-      toast.style.opacity = '0';
-      toast.style.transform = 'translateY(10px) scale(0.95)';
-      setTimeout(() => toast.remove(), 250);
-    }, duration);
-  }
-
-  // ========================================================================
-  // 2. Persona Switcher: SOC Analyst HUD <-> Air-Gapped Kiosk
-  // ========================================================================
-  modeSocBtn.addEventListener('click', () => {
-    modeSocBtn.classList.add('active');
-    modeKioskBtn.classList.remove('active');
-    socView.classList.add('active');
-    kioskView.classList.remove('active');
-    showToast('info', 'VIEWPORT SWITCHED', 'Active Mode: SOC Analyst Tactical HUD');
-  });
-
-  modeKioskBtn.addEventListener('click', () => {
-    modeKioskBtn.classList.add('active');
-    modeSocBtn.classList.remove('active');
-    kioskView.classList.add('active');
-    socView.classList.remove('active');
-    showToast('warn', 'KIOSK AIRLOCK ENGAGED', 'Touchscreen station armed for removable media triage.');
-  });
-
-  // ========================================================================
-  // 3. Hardware Safe-Charging Interlock & Isometric Anatomy (anatomy skill)
-  // ========================================================================
-  safeChargingToggle.addEventListener('change', (e) => {
-    const isChargeOnly = e.target.checked;
-    if (isChargeOnly) {
-      anatomyContainer.classList.add('safe-charge-active');
-      anatomyReadout.textContent = 'VBUS: 5.02V / 2.1A (CHARGING ONLY) | D+/D-: SEVERED (0 bps)';
-      anatomyReadout.style.color = 'var(--accent-orange)';
-      interlockStatusText.innerHTML = '<span class="status-badge status-isolated">⚡ SAFE CHARGING ENGAGED (Data Pins Decoupled)</span>';
-      pinStateIndicator.textContent = 'DATA LINES: SEVERED (0 bps)';
-      pinStateIndicator.style.color = 'var(--accent-orange)';
-
-      addLog('WARN', 'HARDWARE RELAY', 'D+/D- lines physically opened via solid-state interlock. Juice-jacking impossible.');
-      showToast('warn', 'SAFE CHARGING ACTIVATED', 'Physical data lines severed. Zero data can cross to the host OS.');
+      // SVG open switch position
+      if (switchArmMinus) {
+        switchArmMinus.setAttribute('x2', '310');
+        switchArmMinus.setAttribute('y2', '78');
+        switchArmMinus.setAttribute('stroke', '#dc2626');
+      }
+      if (switchArmPlus) {
+        switchArmPlus.setAttribute('x2', '310');
+        switchArmPlus.setAttribute('y2', '118');
+        switchArmPlus.setAttribute('stroke', '#dc2626');
+      }
+      if (lineDataMinusLeft) lineDataMinusLeft.setAttribute('stroke', '#dc2626');
+      if (lineDataPlusLeft) lineDataPlusLeft.setAttribute('stroke', '#dc2626');
+      if (lineDataMinusRight) lineDataMinusRight.setAttribute('stroke', '#cbd5e1');
+      if (lineDataPlusRight) lineDataPlusRight.setAttribute('stroke', '#cbd5e1');
     } else {
-      anatomyContainer.classList.remove('safe-charge-active');
-      anatomyReadout.textContent = 'VBUS: 5.02V | D+/D-: 480 Mbps (FILTERED)';
-      anatomyReadout.style.color = 'var(--accent-cyan)';
-      interlockStatusText.innerHTML = '<span class="status-badge status-monitoring">● UMDF FILTER ACTIVE (D+/D- Intercepted)</span>';
-      pinStateIndicator.textContent = 'DATA LINES: CONNECTED (Ring 3 Guard)';
-      pinStateIndicator.style.color = '#94a3b8';
+      // Data lines coupled (Normal USB Drive mode)
+      kpiPinStatusText.textContent = 'COUPLED';
+      kpiPinStatusText.style.color = 'var(--color-status-info)';
+      kpiPinSubtext.textContent = 'UMDF Ring 3 Filter Active';
+      kpiPinSubtext.className = 'kpi-delta info';
 
-      addLog('INFO', 'INTERCEPTOR ACTIVE', 'D+/D- data lines reconnected under strict Ring 3 UMDF v2 filter monitoring.');
-      showToast('info', 'DATA MONITORING RESTORED', 'UMDF v2 user-mode interceptor armed on high-speed USB bus.');
+      safeChargeBadge.textContent = 'OFF: DATA LINES ACTIVE';
+      safeChargeBadge.className = 'kpi-delta info';
+
+      // SVG closed switch position
+      if (switchArmMinus) {
+        switchArmMinus.setAttribute('x2', '340');
+        switchArmMinus.setAttribute('y2', '95');
+        switchArmMinus.setAttribute('stroke', '#0284c7');
+      }
+      if (switchArmPlus) {
+        switchArmPlus.setAttribute('x2', '340');
+        switchArmPlus.setAttribute('y2', '135');
+        switchArmPlus.setAttribute('stroke', '#0284c7');
+      }
+      if (lineDataMinusLeft) lineDataMinusLeft.setAttribute('stroke', '#0284c7');
+      if (lineDataPlusLeft) lineDataPlusLeft.setAttribute('stroke', '#0284c7');
+      if (lineDataMinusRight) lineDataMinusRight.setAttribute('stroke', '#0284c7');
+      if (lineDataPlusRight) lineDataPlusRight.setAttribute('stroke', '#0284c7');
     }
-  });
+  }
 
-  // ========================================================================
-  // 4. Sector Shredder Visualizer (64 Blocks)
-  // ========================================================================
-  function initSectorGrid() {
-    sectorGrid.innerHTML = '';
+  if (safeChargingToggle) {
+    safeChargingToggle.addEventListener('change', (e) => {
+      updateSafeChargingState(e.target.checked);
+    });
+    // Initialize
+    updateSafeChargingState(safeChargingToggle.checked);
+  }
+
+  /* ==========================================================================
+     2. NIST SP 800-88 64-Block Sector Shredder Grid
+     ========================================================================== */
+  if (sectorGrid64) {
+    sectorGrid64.innerHTML = '';
     for (let i = 0; i < 64; i++) {
-      const block = document.createElement('div');
-      block.className = 'sector-block';
-      // Seed with some initial infected sectors
-      if ([4, 12, 19, 27, 33, 41, 48, 55, 59].includes(i)) {
-        block.classList.add('dot-infected');
-      }
-      sectorGrid.appendChild(block);
+      const cell = document.createElement('div');
+      cell.className = 'sector-cell';
+      cell.id = `sector-${i}`;
+      cell.setAttribute('title', `LBA Sector ${i * 4096} - Ready`);
+      sectorGrid64.appendChild(cell);
     }
   }
-  initSectorGrid();
 
-  function runSectorShredAnimation(onComplete) {
-    const blocks = Array.from(sectorGrid.children);
-    showToast('warn', 'NIST SP 800-88 PURGE', 'Executing 3-Pass CSPRNG in-place sector overwrite...');
+  if (btnInitiateSanitize) {
+    btnInitiateSanitize.addEventListener('click', async () => {
+      btnInitiateSanitize.disabled = true;
+      const cells = document.querySelectorAll('.sector-cell');
 
-    // Pass 1: 0x00 Zero-fill
-    blocks.forEach((b, idx) => {
-      setTimeout(() => {
-        b.className = 'sector-block dot-zero';
-      }, idx * 12);
-    });
-
-    // Pass 2: 0xFF One-fill
-    setTimeout(() => {
-      blocks.forEach((b, idx) => {
-        setTimeout(() => {
-          b.className = 'sector-block dot-one';
-        }, idx * 10);
-      });
-    }, 900);
-
-    // Pass 3: CSPRNG Random Noise
-    setTimeout(() => {
-      blocks.forEach((b, idx) => {
-        setTimeout(() => {
-          b.className = 'sector-block dot-csprng';
-        }, idx * 8);
-      });
-    }, 1700);
-
-    // Final Pass: Sterile Zero Remanence
-    setTimeout(() => {
-      blocks.forEach((b, idx) => {
-        setTimeout(() => {
-          b.className = 'sector-block dot-sterile';
-        }, idx * 6);
-      });
-      showToast('success', 'SHRED ATTESTED', 'NIST SP 800-88 Rev 1 sanitization complete. 0 physical residue.');
-      if (onComplete) onComplete();
-    }, 2400);
-  }
-
-  btnShredAll.addEventListener('click', () => {
-    btnShredAll.disabled = true;
-    runSectorShredAnimation(() => {
-      btnShredAll.disabled = false;
-      document.querySelectorAll('#vaultTable tbody tr').forEach(row => {
-        row.style.opacity = '0.35';
-        row.querySelector('.btn-shred').textContent = 'Verified Purged';
-        row.querySelector('.btn-shred').disabled = true;
-      });
-      addLog('SUCCESS', 'CRYPTOGRAPHIC PURGE', 'All 4 quarantined carriers pulverized via NIST SP 800-88.');
-    });
-  });
-
-  shredButtons.forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      const row = e.target.closest('tr');
-      const targetPath = btn.getAttribute('data-path');
-      btn.disabled = true;
-      btn.textContent = 'Shredding...';
-
-      runSectorShredAnimation(() => {
-        row.style.opacity = '0.35';
-        btn.textContent = 'Purged (0-Trace)';
-        addLog('SUCCESS', 'NIST SHRED COMPLETE', `Permanently eliminated ${targetPath} with zero remanence.`);
-      });
-    });
-  });
-
-  // ========================================================================
-  // 5. Zero-Trust Drive Sweep & Deep CDR Simulation
-  // ========================================================================
-  btnScan.addEventListener('click', () => {
-    const drive = targetPath.value.trim() || 'E:\';
-    btnScan.disabled = true;
-    btnScan.querySelector('.btn-text').textContent = 'Sanitizing...';
-    scanProgressBox.style.display = 'flex';
-
-    addLog('INFO', 'SWEEP INITIATED', `Beginning zero-trust deep inspection on volume: ${drive}`);
-    showToast('info', 'DEEP SWEEP STARTED', `Analyzing 1,134 files on ${drive} with Pure-Rust CDR Engine.`);
-
-    let pct = 0;
-    const interval = setInterval(() => {
-      pct += 15;
-      if (pct > 100) pct = 100;
-      scanProgressBar.style.width = pct + '%';
-      scanProgressPct.textContent = pct + '%';
-
-      if (pct === 45) {
-        addLog('CRIT', 'VIRUS DETECTED', `Found 134 identical 229,376-byte files [Trojan:Win32/Ramnit!pz] on ${drive}`);
-      } else if (pct === 75) {
-        addLog('WARN', 'SHORTCUT VECTOR', `Neutralized 33 malicious .lnk shortcuts [Exploit:Win32/CplLnk.A]`);
-      } else if (pct === 100) {
-        clearInterval(interval);
-        addLog('SUCCESS', 'CDR SANITIZED', `Cleaned 967 documents & media files in 28ms; projected to Z:\`);
-        showToast('success', 'SWEEP COMPLETE', '967 files disarmed. Sterile virtual volume mounted on Z:\');
-
-        btnScan.disabled = false;
-        btnScan.querySelector('.btn-text').textContent = 'Execute Zero-Trust Sweep';
+      // Pass 1: 0x00 pattern
+      sanitizePassText.innerHTML = 'Status: <strong style="color: #64748b;">Pass 1/3 (0x00 Overwrite)</strong>';
+      for (let i = 0; i < cells.length; i++) {
+        cells[i].className = 'sector-cell pass-1';
+        if (i % 8 === 0) await new Promise(r => setTimeout(r, 20));
       }
-    }, 180);
-  });
 
-  function addLog(type, badge, message) {
-    const entry = document.createElement('div');
-    entry.className = `log-entry log-${type.toLowerCase()}`;
-    entry.setAttribute('data-type', type.toLowerCase());
+      await new Promise(r => setTimeout(r, 120));
 
-    const now = new Date();
-    const timeStr = now.toTimeString().split(' ')[0];
+      // Pass 2: 0xFF complement
+      sanitizePassText.innerHTML = 'Status: <strong style="color: #334155;">Pass 2/3 (0xFF Inversion)</strong>';
+      for (let i = 0; i < cells.length; i++) {
+        cells[i].className = 'sector-cell pass-2';
+        if (i % 8 === 0) await new Promise(r => setTimeout(r, 20));
+      }
 
-    entry.innerHTML = `
-      <span class="log-time">${timeStr}</span>
-      <span class="log-badge">${badge}</span>
-      <span class="log-msg">${message}</span>
-    `;
+      await new Promise(r => setTimeout(r, 120));
 
-    logContainer.prepend(entry);
+      // Pass 3: Cryptographic Random (Verified Clean)
+      sanitizePassText.innerHTML = 'Status: <strong style="color: var(--color-status-safe);">Pass 3/3 (Crypto Random)</strong>';
+      for (let i = 0; i < cells.length; i++) {
+        cells[i].className = 'sector-cell pass-3';
+        if (i % 8 === 0) await new Promise(r => setTimeout(r, 20));
+      }
+
+      sanitizePassText.innerHTML = 'Status: <strong style="color: var(--color-status-safe);">NIST SP 800-88 Verified (Purged)</strong>';
+      btnInitiateSanitize.disabled = false;
+    });
   }
 
-  // Filter feed logs
-  feedFilterBtns.forEach(btn => {
-    btn.addEventListener('click', () => {
-      feedFilterBtns.forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
+  /* ==========================================================================
+     3. Deep CDR Split-Screen Diff Modal
+     ========================================================================== */
+  function openCdrModal() {
+    cdrModal.classList.add('open');
+    cdrModal.setAttribute('aria-hidden', 'false');
+  }
 
-      const filter = btn.getAttribute('data-filter');
-      const entries = logContainer.querySelectorAll('.log-entry');
+  function closeCdrModal() {
+    cdrModal.classList.remove('open');
+    cdrModal.setAttribute('aria-hidden', 'true');
+  }
 
-      entries.forEach(e => {
-        if (filter === 'all') {
-          e.style.display = 'flex';
-        } else if (filter === 'crit' && (e.classList.contains('log-crit') || e.classList.contains('log-warn'))) {
-          e.style.display = 'flex';
-        } else if (filter === 'cdr' && e.classList.contains('log-success')) {
-          e.style.display = 'flex';
-        } else {
-          e.style.display = 'none';
-        }
-      });
+  if (btnInspectCdr) btnInspectCdr.addEventListener('click', openCdrModal);
+  if (btnCloseCdrModal) btnCloseCdrModal.addEventListener('click', closeCdrModal);
+  if (cdrModal) {
+    cdrModal.addEventListener('click', (e) => {
+      if (e.target === cdrModal) closeCdrModal();
     });
-  });
+  }
 
-  // ========================================================================
-  // 6. Deep CDR Split-Screen Diff Studio Modal
-  // ========================================================================
-  btnOpenCdrDiff.addEventListener('click', () => {
-    cdrDiffModal.style.display = 'flex';
-  });
-
-  btnCloseCdrModal.addEventListener('click', () => {
-    cdrDiffModal.style.display = 'none';
-  });
-
-  btnVerifyCdrHash.addEventListener('click', () => {
-    showToast('success', 'ATTESTATION VERIFIED', 'Cryptographic SHA-256 certificate signed by sentinel-cdr engine.');
-  });
-
-  // ========================================================================
-  // 7. MITRE ATT&CK Matrix Interactive Explainer
-  // ========================================================================
-  const mitreDetails = {
+  /* ==========================================================================
+     4. MITRE ATT&CK Technical Modal & Drawer
+     ========================================================================== */
+  const MITRE_DATA = {
     'T1091': {
-      title: 'T1091: Replication Through Removable Media',
-      tactic: 'Initial Access / Lateral Movement',
-      desc: 'Adversaries move malware onto systems by copying payloads to removable media like USB drives. Ramnit and Stuxnet propagate by injecting into all drive binaries and replacing folders with weaponized .lnk shortcuts.',
-      remediation: 'OmniConnect Sentinel Pre-Mount UMDF interceptor blocks autorun.inf parsing and neutralizes shortcut icon execution before Windows Explorer can parse it.'
+      title: 'Replication Through Removable Media',
+      desc: 'Adversaries move into systems by copying malware to removable media and taking advantage of auto-run features, shortcut (LNK) stomping, or hidden device directories.',
+      mitigation: 'Ring 3 Userspace Storage Interceptor disables volume mounting until deep heuristic inspection passes. Windows AutoRun and Shell Hardware Detection are intercepted at UMDF boundary.'
     },
-    'T1055.002': {
-      title: 'T1055.002: Process Injection (Portable Executable Injection)',
-      tactic: 'Defense Evasion / Privilege Escalation',
-      desc: 'The payload attempts to write raw PE executable code directly into the virtual address space of running explorer.exe and svchost.exe processes to hide execution.',
-      remediation: 'Tier 2 OpenSandbox hypervisor detects NtWriteVirtualMemory / CreateRemoteThread API calls and instantly terminates the injector.'
+    'T1052': {
+      title: 'Exfiltration Over Physical Medium',
+      desc: 'Adversaries attempt to bypass network monitoring by writing sensitive confidential documents, database exports, or source code directly to external flash media.',
+      mitigation: 'Enforces Ring 3 Write-Blocker by default. Any unapproved outbound file writes are rejected with STATUS_ACCESS_DENIED, leaving read-only data access strictly verified.'
     },
-    'T1547.001': {
-      title: 'T1547.001: Boot or Logon Autostart Execution: Registry Run Keys',
-      tactic: 'Persistence',
-      desc: 'Malware modifies HKCU\Software\Microsoft\Windows\CurrentVersion\Run to achieve persistent survival across system reboots.',
-      remediation: 'MicroVM sandbox isolates registry mutations in ephemeral copy-on-write memory; writes are completely discarded.'
+    'T1200': {
+      title: 'Hardware Additions (BadUSB & Rogue HID)',
+      desc: 'Malicious microcontrollers masquerading as flash drives inject automated keystrokes into the OS to download remote payloads or spawn elevated administrative shells.',
+      mitigation: 'Hardware Descriptor Interlock analyzes USB device class descriptors before interface binding. Non-mass-storage interfaces (HID, CDC, composite keyboards) are quarantined.'
     },
-    'T1071.001': {
-      title: 'T1071.001: Application Layer Protocol: Web Protocols',
-      tactic: 'Command and Control',
-      desc: 'Adversary uses HTTP/HTTPS beacons to communicate with C2 servers on port 80/443, mimicking legitimate traffic.',
-      remediation: 'Air-gapped network sinkhole (INetSim) intercepts all DNS queries, spoofing 127.0.0.1 and returning dummy responses.'
-    },
-    'T1497.001': {
-      title: 'T1497.001: Virtualization/Sandbox Evasion: System Checks',
-      tactic: 'Discovery / Defense Evasion',
-      desc: 'Payload executes CPUID hypervisor checks, RDTSC timing queries, and detects mouse inactivity to evade dynamic analysis.',
-      remediation: 'OpenSandbox shims hook CPUID and RDTSC instructions, returning bare-metal physical hardware clock signatures.'
-    },
-    'T1564.004': {
-      title: 'T1564.004: Hide Artifacts: NTFS File and Directory Permissions',
-      tactic: 'Defense Evasion',
-      desc: 'Executables are hidden inside alternate data streams (e.g. Brief.docx:evil.exe) invisible to standard directory listings.',
-      remediation: 'Universal Threat Sentry enumerates all ::$DATA streams on raw NTFS partitions and flags hidden PE headers.'
+    'T1025': {
+      title: 'Data from Removable Media',
+      desc: 'Adversaries search for sensitive files on connected USB drives to collect intelligence or execute second-stage malicious payloads.',
+      mitigation: 'All file streams are disassembled in pure userspace memory by the Rust CDR Engine. Active macros, OLE objects, and hidden streams are purged before presentation to explorer.exe.'
     }
   };
 
-  mitreTags.forEach(tag => {
-    tag.addEventListener('click', () => {
-      const tech = tag.getAttribute('data-tech');
-      const info = mitreDetails[tech] || {
-        title: tech,
-        tactic: 'Adversary Technique',
-        desc: 'Advanced persistent threat vector mapped by MITRE ATT&CK framework.',
-        remediation: 'Neutralized by OmniConnect Sentinel multi-tier defense.'
-      };
+  function openMitreModal(techniqueId) {
+    const data = MITRE_DATA[techniqueId] || {
+      title: techniqueId,
+      desc: 'Enterprise hardware threat vector.',
+      mitigation: 'Ring 3 Userspace mitigation active.'
+    };
 
-      mitreModalTitle.textContent = info.title;
-      mitreModalBody.innerHTML = `
-        <div style="display: flex; flex-direction: column; gap: 12px; font-family: var(--font-sans);">
-          <div><strong style="color: var(--accent-purple); font-size: 0.8rem; font-family: var(--font-mono);">TACTIC: ${info.tactic}</strong></div>
-          <div style="font-size: 0.82rem; color: #cbd5e1; line-height: 1.5;">${info.desc}</div>
-          <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); padding: 12px; border-radius: 8px;">
-            <div style="color: #34d399; font-weight: 700; font-size: 0.78rem; font-family: var(--font-mono);">SENTINEL COUNTERMEASURE:</div>
-            <div style="color: #a7f3d0; font-size: 0.76rem; margin-top: 4px;">${info.remediation}</div>
-          </div>
-        </div>
-      `;
+    mitreModalId.textContent = techniqueId;
+    mitreModalHeading.textContent = data.title;
+    mitreModalDesc.textContent = data.desc;
+    mitreModalMitigation.textContent = data.mitigation;
 
-      mitreModal.style.display = 'flex';
+    mitreModal.classList.add('open');
+    mitreModal.setAttribute('aria-hidden', 'false');
+  }
+
+  function closeMitreModal() {
+    mitreModal.classList.remove('open');
+    mitreModal.setAttribute('aria-hidden', 'true');
+  }
+
+  mitreChips.forEach(chip => {
+    chip.addEventListener('click', () => {
+      const tech = chip.getAttribute('data-technique');
+      openMitreModal(tech);
+    });
+    chip.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        openMitreModal(chip.getAttribute('data-technique'));
+      }
     });
   });
 
-  btnCloseMitreModal.addEventListener('click', () => {
-    mitreModal.style.display = 'none';
+  if (btnCloseMitreModal) btnCloseMitreModal.addEventListener('click', closeMitreModal);
+  if (mitreModal) {
+    mitreModal.addEventListener('click', (e) => {
+      if (e.target === mitreModal) closeMitreModal();
+    });
+  }
+
+  // Keyboard Accessibility: Escape key closes any open modal immediately (Emil Kowalski)
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      if (cdrModal && cdrModal.classList.contains('open')) closeCdrModal();
+      if (mitreModal && mitreModal.classList.contains('open')) closeMitreModal();
+    }
   });
 
-  // MicroVM Detonation Simulation
-  btnDetonate.addEventListener('click', () => {
-    btnDetonate.disabled = true;
-    btnDetonate.querySelector('.btn-text').textContent = 'Detonating in MicroVM...';
-    showToast('warn', 'SANDBOX DETONATION', 'Spawning ephemeral win11-whvp-microvm with air-gapped network sinkhole...');
+  /* ==========================================================================
+     5. Persona Switcher (SOC HUD vs Air-Gapped Kiosk)
+     ========================================================================== */
+  function setPersona(persona) {
+    if (persona === 'kiosk') {
+      btnSocHUD.classList.remove('active');
+      btnSocHUD.setAttribute('aria-pressed', 'false');
+      btnKioskMode.classList.add('active');
+      btnKioskMode.setAttribute('aria-pressed', 'true');
 
-    setTimeout(() => {
-      btnDetonate.disabled = false;
-      btnDetonate.querySelector('.btn-text').textContent = 'Execute MicroVM Detonation';
-      sandboxResults.style.display = 'flex';
-      showToast('crit', 'VERDICT: MALICIOUS', 'Payload scored 100/100 risk. C2 beacons successfully sinkholed.');
-    }, 1400);
-  });
+      socView.style.display = 'none';
+      socView.setAttribute('aria-hidden', 'true');
 
-  // ========================================================================
-  // 8. Air-Gapped Kiosk 3-Step Guided Workflow
-  // ========================================================================
-  btnKioskSanitize.addEventListener('click', () => {
-    btnKioskSanitize.disabled = true;
-    btnKioskSanitize.innerHTML = '<span>⏳ DISARMING & PURGING USB MEDIA...</span>';
+      kioskView.classList.add('active');
+      kioskView.setAttribute('aria-hidden', 'false');
+    } else {
+      btnKioskMode.classList.remove('active');
+      btnKioskMode.setAttribute('aria-pressed', 'false');
+      btnSocHUD.classList.add('active');
+      btnSocHUD.setAttribute('aria-pressed', 'true');
 
-    setTimeout(() => {
-      kioskStep1.classList.remove('active');
-      kioskStep2.classList.remove('active');
-      kioskStep3.classList.add('active');
-      kioskCert.style.display = 'flex';
+      kioskView.classList.remove('active');
+      kioskView.setAttribute('aria-hidden', 'true');
 
-      showToast('success', 'AIRLOCK SANITIZATION PASSED', 'Certificate issued: CERT-NIST-800-88-2026-9921');
-    }, 1500);
-  });
+      socView.style.display = 'block';
+      socView.setAttribute('aria-hidden', 'false');
+    }
+  }
 
-  btnKioskEject.addEventListener('click', () => {
-    showToast('info', 'MEDIA EJECTED', 'Safe to physically remove USB drive. Host filesystem dismounted cleanly.');
-    setTimeout(() => {
-      kioskStep3.classList.remove('active');
+  if (btnSocHUD) btnSocHUD.addEventListener('click', () => setPersona('soc'));
+  if (btnKioskMode) btnKioskMode.addEventListener('click', () => setPersona('kiosk'));
+
+  /* ==========================================================================
+     6. Air-Gapped Kiosk State Machine
+     ========================================================================== */
+  let kioskInterval = null;
+
+  if (btnKioskSimulate) {
+    btnKioskSimulate.addEventListener('click', () => {
+      btnKioskSimulate.disabled = true;
+      btnKioskEject.disabled = true;
+
+      // Step 1: Insert Drive
       kioskStep1.classList.add('active');
-      kioskCert.style.display = 'none';
-      btnKioskSanitize.disabled = false;
-      btnKioskSanitize.innerHTML = '<span>🚀 START HARDWARE DISARM & PURGE</span>';
-    }, 1200);
-  });
+      kioskStep2.classList.remove('active');
+      kioskStep3.classList.remove('active');
 
-  // ========================================================================
-  // 9. Adversarial Stress-Test Toggle (break-ui skill)
-  // ========================================================================
-  btnDataWorst.addEventListener('click', () => {
-    btnDataWorst.classList.add('active');
-    btnDataDemo.classList.remove('active');
+      setTimeout(() => {
+        // Step 2: Automatic Cleanse
+        kioskStep1.classList.remove('active');
+        kioskStep2.classList.add('active');
 
-    // Feed worst-case data
-    statFiles.textContent = '52,891';
-    statThreats.textContent = '1,492';
-    statVectors.textContent = '388';
-    statDisarmed.textContent = '51,011';
+        setTimeout(() => {
+          // Step 3: Safe to Remove
+          kioskStep2.classList.remove('active');
+          kioskStep3.classList.add('active');
 
-    targetPath.value = 'E:\Enterprise\Acquisition\2026\Confidential\Corporate_Defense_Brief_Final_Approved_v2_Signed.pdf';
+          btnKioskSimulate.disabled = false;
+          btnKioskEject.disabled = false;
+        }, 1800);
+      }, 1200);
+    });
+  }
 
-    addLog('CRIT', 'UNICODE BIDI SPOOF', 'Flagged receipt_\u202Ecod.exe using Right-To-Left Override Trojan spoofing');
-    addLog('WARN', 'EXTREME DEPTH', 'Traversed 42-level deep directory tree without stack overflow or layout break');
+  if (btnKioskEject) {
+    btnKioskEject.addEventListener('click', () => {
+      kioskStep1.classList.add('active');
+      kioskStep2.classList.remove('active');
+      kioskStep3.classList.remove('active');
+      btnKioskEject.disabled = true;
+    });
+  }
 
-    showToast('warn', 'WORST-CASE DATA LOADED', 'Testing 50,000 files, deep nested paths, and Unicode RTL trojans.');
-  });
+  /* ==========================================================================
+     7. Peripheral Simulation Telemetry
+     ========================================================================== */
+  const DEVICES = [
+    { name: 'Kingston 3.0 (E:)', v: '5.02 V', a: '0.92 A', w: '4.62 W' },
+    { name: 'SanDisk Ultra (F:)', v: '4.98 V', a: '0.85 A', w: '4.23 W' },
+    { name: 'Samsung T7 Shield (G:)', v: '5.10 V', a: '1.45 A', w: '7.40 W' },
+    { name: 'YubiKey 5 NFC (HID)', v: '4.95 V', a: '0.08 A', w: '0.40 W' }
+  ];
+  let devIdx = 0;
 
-  btnDataDemo.addEventListener('click', () => {
-    btnDataDemo.classList.add('active');
-    btnDataWorst.classList.remove('active');
+  if (btnTogglePinSimulation) {
+    btnTogglePinSimulation.addEventListener('click', () => {
+      devIdx = (devIdx + 1) % DEVICES.length;
+      const dev = DEVICES[devIdx];
+      valDeviceName.textContent = dev.name;
+      valVoltage.textContent = dev.v;
+      valCurrent.textContent = dev.a;
+      valPower.textContent = dev.w;
+    });
+  }
 
-    statFiles.textContent = '1,134';
-    statThreats.textContent = '134';
-    statVectors.textContent = '33';
-    statDisarmed.textContent = '967';
-    targetPath.value = 'E:\';
+  /* ==========================================================================
+     8. Adversarial Stress Testing Toggle (break-ui)
+     ========================================================================== */
+  if (btnStressToggle) {
+    btnStressToggle.addEventListener('click', () => {
+      isStressed = !isStressed;
+      const streamBox = document.getElementById('cdrStreamBox');
 
-    showToast('info', 'BASELINE RESTORED', 'Standard physical drive ANAND (E:) dataset active.');
-  });
+      if (isStressed) {
+        btnStressToggle.textContent = 'Reset Normal Data';
+        btnStressToggle.style.backgroundColor = 'var(--color-status-warn-bg)';
+        btnStressToggle.style.borderColor = 'var(--color-status-warn-border)';
+        btnStressToggle.style.color = 'var(--color-status-warn)';
 
-  // Close modals on clicking outside
-  window.addEventListener('click', (e) => {
-    if (e.target === cdrDiffModal) cdrDiffModal.style.display = 'none';
-    if (e.target === mitreModal) mitreModal.style.display = 'none';
-  });
+        // Feed stress payloads: long names, RTL Unicode, deep paths
+        valDeviceName.textContent = 'EXT_NVME_001_VERY_LONG_NAME_TEST_PARTITION_LABEL_EXCEEDING_STANDARD_BUFFER_SIZE_X64 (H:)';
+        
+        if (streamBox) {
+          streamBox.innerHTML = `
+            <div class="cdr-item">
+              <div class="cdr-file-meta">
+                <span class="cdr-file-name">deeply/nested/path/to/enterprise/financial/2026/quarterly/audit_report_financial_statement_encrypted_macro_payload_test_string_exceeding_character_limits.xlsm</span>
+                <span class="cdr-file-detail">Excel Sheet • Stripped: Recursive Obfuscated VBA ShellCode()</span>
+              </div>
+              <span class="cdr-badge sanitized">✓ Rebuilt Safe</span>
+            </div>
+            <div class="cdr-item">
+              <div class="cdr-file-meta">
+                <span class="cdr-file-name">تقرير_سري_للغاية_مراجعة_الأمان_المؤسسي_٢٠٢٦.pdf</span>
+                <span class="cdr-file-detail">PDF Document • RTL Arabic Verified • 0 Malicious Traces</span>
+              </div>
+              <span class="cdr-badge sanitized">✓ Rebuilt Safe</span>
+            </div>
+          `;
+        }
+      } else {
+        btnStressToggle.textContent = 'Adversarial Stress Test (break-ui)';
+        btnStressToggle.style.backgroundColor = '';
+        btnStressToggle.style.borderColor = '';
+        btnStressToggle.style.color = '';
+
+        valDeviceName.textContent = 'Kingston 3.0 (E:)';
+        if (streamBox) {
+          streamBox.innerHTML = `
+            <div class="cdr-item">
+              <div class="cdr-file-meta">
+                <span class="cdr-file-name">Q3_Financial_Statement.xlsm</span>
+                <span class="cdr-file-detail">Excel Sheet • Stripped: VBA Macro Execute()</span>
+              </div>
+              <span class="cdr-badge sanitized">✓ Rebuilt Safe</span>
+            </div>
+            <div class="cdr-item">
+              <div class="cdr-file-meta">
+                <span class="cdr-file-name">Vendor_Onboarding_Form.pdf</span>
+                <span class="cdr-file-detail">PDF Document • Purged: Embedded JS /Launch</span>
+              </div>
+              <span class="cdr-badge sanitized">✓ Rebuilt Safe</span>
+            </div>
+            <div class="cdr-item">
+              <div class="cdr-file-meta">
+                <span class="cdr-file-name">Device_Firmware_Update.bin</span>
+                <span class="cdr-file-detail">Raw Binary • Hash Mismatch: Quarantine</span>
+              </div>
+              <span class="cdr-badge purged">✕ Blocked</span>
+            </div>
+          `;
+        }
+      }
+    });
+  }
 });
