@@ -1,78 +1,854 @@
-use crate::error::{CdrError, Result};
-use crate::policy::SanitizationPolicy;
-use crate::sanitizers::DisarmReportItem;
+use std::collections::HashSet;
 use std::io::{Cursor, Read, Write};
-use tracing::{debug, info};
+use quick_xml::events::{BytesEnd, BytesStart, Event};
+use quick_xml::{Reader, Writer};
 use zip::write::SimpleFileOptions;
-use zip::{ZipArchive, ZipWriter};
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use crate::error::CdrError;
+use crate::policy::{ResourceBudget, SanitizationPolicy};
+use crate::sanitizers::DisarmReportItem;
+
+const MAX_ZIP_ENTRIES: usize = 4_096;
+
+/// OOXML & ZIP Container Sanitizer (`BUG-CDR-04`, `BUG-CDR-08`, `EV-04`, Phase 2.3)
+///
+/// Rebuilds `.docx`, `.xlsx`, `.pptx`, and general `.zip` archives from verified
+/// entries while enforcing actual decompressed byte budgets and structural XML
+/// rewriting via `quick-xml`.
 pub struct OpenXmlSanitizer;
 
 impl OpenXmlSanitizer {
-    pub fn sanitize(input: &[u8], policy: &SanitizationPolicy) -> Result<(Vec<u8>, Vec<DisarmReportItem>)> {
-        debug!("Beginning Office OpenXML deconstruction (input size: {} bytes)", input.len());
+    pub fn sanitize(
+        input_bytes: &[u8],
+        policy: &SanitizationPolicy,
+    ) -> Result<(Vec<u8>, Vec<DisarmReportItem>), CdrError> {
+        let mut budget = ResourceBudget::from_policy(policy);
+        Self::sanitize_with_budget(input_bytes, policy, &mut budget, false)
+    }
 
-        let reader = Cursor::new(input);
-        let mut archive = ZipArchive::new(reader)
-            .map_err(|e| CdrError::ParserCorruption(format!("Invalid OpenXML ZIP container: {}", e)))?;
+    pub fn sanitize_with_budget(
+        input_bytes: &[u8],
+        policy: &SanitizationPolicy,
+        budget: &mut ResourceBudget,
+        is_generic_zip: bool,
+    ) -> Result<(Vec<u8>, Vec<DisarmReportItem>), CdrError> {
+        let reader = Cursor::new(input_bytes);
+        let mut archive = ZipArchive::new(reader).map_err(|e| {
+            CdrError::ParserCorruption(format!("ZIP central directory parse failure: {}", e))
+        })?;
 
-        let mut output_bytes = Vec::with_capacity(input.len());
-        let mut writer = ZipWriter::new(Cursor::new(&mut output_bytes));
-
-        let mut reports = Vec::new();
-        let mut total_decompressed_bytes = 0u64;
-
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i)?;
-            let file_name = file.name().to_string();
-            let uncompressed_size = file.size();
-
-            total_decompressed_bytes += uncompressed_size;
-            if total_decompressed_bytes > policy.max_decompressed_bytes {
-                return Err(CdrError::ResourceLimitExceeded(format!(
-                    "Decompressed size exceeded threshold ({} > {})",
-                    total_decompressed_bytes, policy.max_decompressed_bytes
-                )));
-            }
-
-            // Rule 1: Strip VBA Macros
-            if policy.strip_office_macros {
-                if file_name.ends_with("vbaProject.bin") || file_name.contains("vbaData") {
-                    reports.push(DisarmReportItem::new("OFFICE_VBA_MACRO", &file_name, "STRIPPED"));
-                    continue;
-                }
-            }
-
-            // Rule 2: Strip Embedded OLE Objects & ActiveX
-            if policy.strip_office_ole_objects {
-                if file_name.contains("embeddings/") || file_name.contains("activeX/") || file_name.ends_with(".bin") {
-                    reports.push(DisarmReportItem::new("OFFICE_OLE_OBJECT", &file_name, "DROPPED"));
-                    continue;
-                }
-            }
-
-            // Rule 3: Sanitize Relationships (.rels) for External Template Injection (CVE-2022-30190)
-            if file_name.ends_with(".rels") && policy.sanitize_office_external_relationships {
-                let mut content = String::new();
-                file.read_to_string(&mut content)?;
-
-                if content.contains("TargetMode=\"External\"") {
-                    let sanitized_rels = content.replace("TargetMode=\"External\"", "TargetMode=\"InternalBlocked\"");
-                    reports.push(DisarmReportItem::new("EXTERNAL_RELATIONSHIP", &file_name, "BLOCKED"));
-
-                    writer.start_file(&file_name, SimpleFileOptions::default())?;
-                    writer.write_all(sanitized_rels.as_bytes())?;
-                    continue;
-                }
-            }
-
-            // Safe parts: Copy without modification
-            writer.start_file(&file_name, SimpleFileOptions::default())?;
-            std::io::copy(&mut file, &mut writer)?;
+        if archive.len() > MAX_ZIP_ENTRIES {
+            return Err(CdrError::ResourceLimitExceeded(format!(
+                "Archive entry count ({}) exceeds safety limit ({})",
+                archive.len(),
+                MAX_ZIP_ENTRIES
+            )));
         }
 
-        writer.finish()?;
-        info!("OpenXML CDR completed. Elements stripped: {}, Output size: {} bytes", reports.len(), output_bytes.len());
-        Ok((output_bytes, reports))
+        let mut report = Vec::new();
+        let mut stripped_parts: HashSet<String> = HashSet::new();
+        let mut raw_entries: Vec<(String, CompressionMethod, Vec<u8>)> =
+            Vec::with_capacity(archive.len());
+
+        // Pass 1: Read entries with bounded Take reader (fixes BUG-CDR-04 header spoofing)
+        // and identify macro / OLE / ActiveX parts to strip before rewriting .rels and [Content_Types].xml.
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).map_err(|e| {
+                CdrError::ParserCorruption(format!("ZIP entry index {} error: {}", i, e))
+            })?;
+
+            let name = file.name().replace('\\', "/");
+
+            // Reject path traversal inside archive
+            if name.contains("../") || name.starts_with('/') {
+                report.push(DisarmReportItem::new(
+                    "Archive Path Traversal",
+                    name,
+                    "Dropped unsafe relative path entry",
+                ));
+                continue;
+            }
+
+            if file.is_dir() {
+                raw_entries.push((name, CompressionMethod::Stored, Vec::new()));
+                continue;
+            }
+
+            // Decide if this part must be stripped based on policy
+            if !is_generic_zip {
+                if let Some((element_type, action_taken)) =
+                    Self::classify_stripped_part(&name, policy)
+                {
+                    stripped_parts.insert(Self::normalize_part_key(&name));
+                    report.push(DisarmReportItem::new(element_type, name, action_taken));
+                    continue;
+                }
+            }
+
+            // Read actual decompressed stream capped by remaining budget + 1 byte
+            let read_cap = budget.bytes_remaining.saturating_add(1);
+            let mut bounded_reader = (&mut file).take(read_cap);
+            let mut entry_bytes = Vec::new();
+            bounded_reader.read_to_end(&mut entry_bytes).map_err(|e| {
+                CdrError::ParserCorruption(format!(
+                    "Decompression stream error in {}: {}",
+                    name, e
+                ))
+            })?;
+
+            budget.charge_bytes(entry_bytes.len() as u64)?;
+
+            let method = match file.compression() {
+                CompressionMethod::Stored => CompressionMethod::Stored,
+                _ => CompressionMethod::Deflated,
+            };
+
+            raw_entries.push((name, method, entry_bytes));
+        }
+
+        // Pass 2a: Rewrite all *.rels parts first so we collect every removed Relationship `Id`
+        // (e.g., `rId5`) before rewriting content XML parts (`Row 115`, `SP4.1-06`).
+        let mut removed_rel_ids: HashSet<String> = HashSet::new();
+        if !is_generic_zip {
+            for (name, _method, entry_bytes) in &mut raw_entries {
+                if name.ends_with('/') {
+                    continue;
+                }
+                if name.to_ascii_lowercase().ends_with(".rels") {
+                    *entry_bytes = Self::rewrite_rels_xml(
+                        entry_bytes,
+                        name,
+                        &stripped_parts,
+                        policy,
+                        &mut removed_rel_ids,
+                        &mut report,
+                    )?;
+                }
+            }
+        }
+
+        // Pass 2b: Rewrite XML parts ([Content_Types].xml, document/sheet/slide XML)
+        // and recursively sanitize nested files when present.
+        let mut out_buf = Cursor::new(Vec::with_capacity(input_bytes.len()));
+        {
+            let mut zip_writer = ZipWriter::new(&mut out_buf);
+
+            for (name, method, mut entry_bytes) in raw_entries {
+                if name.ends_with('/') {
+                    let options =
+                        SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+                    let _ = zip_writer.add_directory(name, options);
+                    continue;
+                }
+
+                let lower_name = name.to_ascii_lowercase();
+
+                if !is_generic_zip && lower_name == "[content_types].xml" {
+                    entry_bytes = Self::rewrite_content_types_xml(
+                        &entry_bytes,
+                        &stripped_parts,
+                        policy,
+                        &mut report,
+                        &name,
+                    )?;
+                } else if !is_generic_zip && lower_name.ends_with(".rels") {
+                    // Already rewritten in Pass 2a while collecting `removed_rel_ids`
+                } else if !is_generic_zip && lower_name.ends_with(".xml") {
+                    if policy.strip_office_dde
+                        || policy.sanitize_office_external_relationships
+                        || !removed_rel_ids.is_empty()
+                    {
+                        entry_bytes = Self::sanitize_office_xml_dde_and_dangling_rels(
+                            &entry_bytes,
+                            &name,
+                            policy,
+                            &removed_rel_ids,
+                            &mut report,
+                        )?;
+                    }
+                } else if Self::is_nested_sanitizable(&lower_name, &entry_bytes) {
+                    // Fail closed when recursion depth is exhausted or nested sanitization fails (`Row 108`, `BUG-CDR-04`)
+                    let mut child_budget = budget.descend()?;
+                    let (clean_nested, nested_reports) =
+                        crate::engine::CdrEngine::sanitize_nested_with_budget(
+                            &entry_bytes,
+                            &name,
+                            policy,
+                            &mut child_budget,
+                        )?;
+                    entry_bytes = clean_nested;
+                    for mut r in nested_reports {
+                        r.location_path = format!("{} -> {}", name, r.location_path);
+                        report.push(r);
+                    }
+                    budget.bytes_remaining = child_budget.bytes_remaining;
+                    budget.objects_remaining = child_budget.objects_remaining;
+                }
+
+                let options = SimpleFileOptions::default()
+                    .compression_method(method)
+                    .unix_permissions(0o644);
+                zip_writer.start_file(&name, options).map_err(|e| {
+                    CdrError::ReconstructionFailure(format!(
+                        "Failed starting ZIP entry {}: {}",
+                        name, e
+                    ))
+                })?;
+                zip_writer.write_all(&entry_bytes).map_err(|e| {
+                    CdrError::ReconstructionFailure(format!(
+                        "Failed writing ZIP entry {}: {}",
+                        name, e
+                    ))
+                })?;
+            }
+
+            zip_writer.finish().map_err(|e| {
+                CdrError::ReconstructionFailure(format!("Failed finalizing ZIP archive: {}", e))
+            })?;
+        }
+
+        Ok((out_buf.into_inner(), report))
+    }
+
+    fn classify_stripped_part(
+        name: &str,
+        policy: &SanitizationPolicy,
+    ) -> Option<(&'static str, &'static str)> {
+        let lower = name.to_ascii_lowercase();
+        let file_name = lower.rsplit('/').next().unwrap_or(&lower);
+
+        // Notice: We intentionally do NOT strip arbitrary `.bin` files like
+        // `word/printerSettings/printerSettings1.bin` (`BUG-CDR-04`).
+        if policy.strip_office_macros {
+            if file_name == "vbaproject.bin"
+                || file_name == "vbaprojectsignature.bin"
+                || file_name == "vbadata.xml"
+                || file_name == "xlmacrosheet.xml"
+                || lower.contains("/macrosheets/")
+                || lower.starts_with("macrosheets/")
+                || lower.contains("/dialogsheets/")
+            {
+                return Some((
+                    "VBA_MACRO_PROJECT",
+                    "Removed executable VBA macro stream from OOXML container",
+                ));
+            }
+        }
+
+        if policy.strip_office_ole_objects {
+            if lower.contains("/embeddings/")
+                || lower.starts_with("embeddings/")
+                || lower.contains("/activex/")
+                || lower.starts_with("activex/")
+                || file_name.starts_with("oleobject")
+            {
+                return Some((
+                    "EMBEDDED_OLE_OBJECT",
+                    "Removed embedded OLE/ActiveX binary object from OOXML container",
+                ));
+            }
+        }
+
+        None
+    }
+
+    fn normalize_part_key(path: &str) -> String {
+        path.trim_start_matches('/').to_ascii_lowercase()
+    }
+
+    fn resolve_rel_target(rels_path: &str, target: &str) -> String {
+        let target_clean = target.trim_start_matches('/');
+        if target.starts_with('/') {
+            return target_clean.to_ascii_lowercase();
+        }
+        let base_dir = if let Some(idx) = rels_path.rfind("/_rels/") {
+            &rels_path[..idx]
+        } else {
+            ""
+        };
+        let combined = if base_dir.is_empty() {
+            target_clean.to_string()
+        } else {
+            format!("{}/{}", base_dir.trim_start_matches('/'), target_clean)
+        };
+        let mut stack: Vec<&str> = Vec::new();
+        for seg in combined.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
+            } else if seg == ".." {
+                stack.pop();
+            } else {
+                stack.push(seg);
+            }
+        }
+        stack.join("/").to_ascii_lowercase()
+    }
+
+    /// Rewrites `[Content_Types].xml` using `quick-xml` (`BUG-CDR-04`):
+    /// - Drops `<Override>` elements referencing stripped parts (`vbaProject.bin`, `embeddings/*`, etc.)
+    /// - Rewrites macro-enabled main document ContentTypes to standard OOXML ContentTypes so
+    ///   Word/Excel/PowerPoint open the disarmed file without corruption dialogs.
+    fn rewrite_content_types_xml(
+        xml_bytes: &[u8],
+        stripped_parts: &HashSet<String>,
+        policy: &SanitizationPolicy,
+        report: &mut Vec<DisarmReportItem>,
+        location: &str,
+    ) -> Result<Vec<u8>, CdrError> {
+        let mut reader = Reader::from_reader(xml_bytes);
+        let mut writer = Writer::new(Vec::with_capacity(xml_bytes.len()));
+        let mut buf = Vec::new();
+        let mut skip_depth = 0usize;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Eof) => break,
+                Ok(event) => {
+                    if skip_depth > 0 {
+                        match event {
+                            Event::Start(_) => skip_depth += 1,
+                            Event::End(_) => skip_depth -= 1,
+                            _ => {}
+                        }
+                        buf.clear();
+                        continue;
+                    }
+
+                    match event {
+                        Event::Start(ref e) | Event::Empty(ref e) => {
+                            let is_empty = matches!(event, Event::Empty(_));
+                            let local_bytes = e.name().local_name().into_inner().to_vec();
+                            let local =
+                                String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
+
+                            if local == "override" {
+                                let mut part_name = String::new();
+                                let mut content_type = String::new();
+                                for attr in e.attributes().flatten() {
+                                    let k = String::from_utf8_lossy(
+                                        attr.key.local_name().into_inner(),
+                                    )
+                                    .to_ascii_lowercase();
+                                    let v = String::from_utf8_lossy(&attr.value).into_owned();
+                                    if k == "partname" {
+                                        part_name = v;
+                                    } else if k == "contenttype" {
+                                        content_type = v;
+                                    }
+                                }
+
+                                let norm_part = Self::normalize_part_key(&part_name);
+                                let is_vba_ct = policy.strip_office_macros
+                                    && content_type
+                                        .to_ascii_lowercase()
+                                        .contains("vnd.ms-office.vbaproject");
+
+                                if stripped_parts.contains(&norm_part) || is_vba_ct {
+                                    if !is_empty {
+                                        skip_depth = 1;
+                                    }
+                                    buf.clear();
+                                    continue;
+                                }
+
+                                let new_ct = if policy.strip_office_macros {
+                                    Self::upgrade_macro_content_type(&content_type)
+                                } else {
+                                    None
+                                };
+
+                                if let Some(replaced_ct) = new_ct {
+                                    let tag_name =
+                                        String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                                    let mut clean_elem = BytesStart::new(tag_name);
+                                    for attr in e.attributes().flatten() {
+                                        let key_str =
+                                            String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+                                        let local_k = String::from_utf8_lossy(
+                                            attr.key.local_name().into_inner(),
+                                        )
+                                        .to_ascii_lowercase();
+                                        if local_k == "contenttype" {
+                                            clean_elem
+                                                .push_attribute((key_str.as_str(), replaced_ct));
+                                        } else {
+                                            let val_str =
+                                                String::from_utf8_lossy(&attr.value).into_owned();
+                                            clean_elem.push_attribute((
+                                                key_str.as_str(),
+                                                val_str.as_str(),
+                                            ));
+                                        }
+                                    }
+                                    report.push(DisarmReportItem::new(
+                                        "MACRO_ENABLED_CONTENT_TYPE",
+                                        location.to_string(),
+                                        format!(
+                                            "Converted {} to standard document ContentType",
+                                            content_type
+                                        ),
+                                    ));
+                                    let write_ev = if is_empty {
+                                        Event::Empty(clean_elem)
+                                    } else {
+                                        Event::Start(clean_elem)
+                                    };
+                                    writer
+                                        .write_event(write_ev)
+                                        .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                                    buf.clear();
+                                    continue;
+                                }
+                            }
+
+                            writer
+                                .write_event(event.into_owned())
+                                .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                        }
+                        other => {
+                            writer
+                                .write_event(other.into_owned())
+                                .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(CdrError::ParserCorruption(format!(
+                        "[Content_Types].xml parse error: {}",
+                        e
+                    )));
+                }
+            }
+            buf.clear();
+        }
+
+        Ok(writer.into_inner())
+    }
+
+    fn upgrade_macro_content_type(ct: &str) -> Option<&'static str> {
+        match ct {
+            "application/vnd.ms-word.document.macroEnabled.main+xml" => Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+            ),
+            "application/vnd.ms-word.template.macroEnabledTemplate.main+xml" => Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+            ),
+            "application/vnd.ms-excel.sheet.macroEnabled.main+xml" => {
+                Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml")
+            }
+            "application/vnd.ms-excel.template.macroEnabled.main+xml" => Some(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+            ),
+            "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml" => Some(
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+            ),
+            _ => None,
+        }
+    }
+
+    /// Rewrites `.rels` files using `quick-xml` (`BUG-CDR-04`, `EV-04`):
+    /// - Drops `<Relationship>` elements pointing to stripped parts (`vbaProject.bin`, `embeddings/*`).
+    /// - Drops `<Relationship>` elements with `TargetMode="External"` (matched case-insensitively,
+    ///   independent of single/double quotes or whitespace around `=`) or unsafe URI schemes
+    ///   when `policy.sanitize_office_external_relationships` is enabled.
+    fn rewrite_rels_xml(
+        xml_bytes: &[u8],
+        rels_path: &str,
+        stripped_parts: &HashSet<String>,
+        policy: &SanitizationPolicy,
+        removed_rel_ids: &mut HashSet<String>,
+        report: &mut Vec<DisarmReportItem>,
+    ) -> Result<Vec<u8>, CdrError> {
+        let mut reader = Reader::from_reader(xml_bytes);
+        let mut writer = Writer::new(Vec::with_capacity(xml_bytes.len()));
+        let mut buf = Vec::new();
+        let mut skip_depth = 0usize;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Eof) => break,
+                Ok(event) => {
+                    if skip_depth > 0 {
+                        match event {
+                            Event::Start(_) => skip_depth += 1,
+                            Event::End(_) => skip_depth -= 1,
+                            _ => {}
+                        }
+                        buf.clear();
+                        continue;
+                    }
+
+                    match event {
+                        Event::Start(ref e) | Event::Empty(ref e) => {
+                            let is_empty = matches!(event, Event::Empty(_));
+                            let local_bytes = e.name().local_name().into_inner().to_vec();
+                            let local =
+                                String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
+
+                            if local == "relationship" {
+                                let mut rel_id = String::new();
+                                let mut target = String::new();
+                                let mut target_mode = String::new();
+                                let mut rel_type = String::new();
+
+                                for attr_res in e.attributes() {
+                                    let attr = attr_res.map_err(|err| {
+                                        CdrError::ParserCorruption(format!(
+                                            "Malformed Relationship attribute in {}: {}",
+                                            rels_path, err
+                                        ))
+                                    })?;
+                                    let k = String::from_utf8_lossy(
+                                        attr.key.local_name().into_inner(),
+                                    )
+                                    .to_ascii_lowercase();
+                                    let v = String::from_utf8_lossy(&attr.value).into_owned();
+                                    if k == "id" {
+                                        rel_id = v;
+                                    } else if k == "target" {
+                                        target = v;
+                                    } else if k == "targetmode" {
+                                        target_mode = v;
+                                    } else if k == "type" {
+                                        rel_type = v;
+                                    }
+                                }
+
+                                let resolved_target = Self::resolve_rel_target(rels_path, &target);
+                                let rel_type_lower = rel_type.to_ascii_lowercase();
+                                let target_lower = target.trim().to_ascii_lowercase();
+
+                                // 1. Drop relationships pointing to stripped macro/OLE parts
+                                let is_stripped_target = stripped_parts.contains(&resolved_target)
+                                    || (policy.strip_office_macros
+                                        && (rel_type_lower.contains("vbaproject")
+                                            || rel_type_lower.contains("macrosheet")
+                                            || target_lower.ends_with("vbaproject.bin")))
+                                    || (policy.strip_office_ole_objects
+                                        && (rel_type_lower.contains("/oleobject")
+                                            || rel_type_lower.contains("/control")
+                                            || rel_type_lower.contains("/activex")));
+
+                                if is_stripped_target {
+                                    if !rel_id.is_empty() {
+                                        removed_rel_ids.insert(rel_id);
+                                    }
+                                    report.push(DisarmReportItem::new(
+                                        "DANGLING_MACRO_OR_OLE_REL",
+                                        rels_path.to_string(),
+                                        format!(
+                                            "Removed <Relationship> referencing stripped target '{}'",
+                                            target
+                                        ),
+                                    ));
+                                    if !is_empty {
+                                        skip_depth = 1;
+                                    }
+                                    buf.clear();
+                                    continue;
+                                }
+
+                                // 2. Drop external relationships (`TargetMode="External"` case-insensitive) on
+                                //    templates, framesets, OLE, packages, subdocuments, slideMasters, externalWorkbooks,
+                                //    or dangerous URI schemes, while preserving benign external hyperlinks (`Row 115`, `EV-04`, `BUG-CDR-04`).
+                                let is_external_mode =
+                                    target_mode.trim().eq_ignore_ascii_case("external");
+                                let has_dangerous_scheme = target_lower.starts_with("ms-msdt:")
+                                    || target_lower.starts_with("javascript:")
+                                    || target_lower.starts_with("vbscript:")
+                                    || target_lower.starts_with("mhtml:")
+                                    || target_lower.starts_with("file:")
+                                    || target_lower.starts_with("data:")
+                                    || target_lower.starts_with("\\\\");
+                                let is_benign_hyperlink = rel_type_lower.ends_with("/hyperlink")
+                                    && !has_dangerous_scheme
+                                    && !policy.strip_external_hyperlinks;
+
+                                if policy.sanitize_office_external_relationships
+                                    && (has_dangerous_scheme
+                                        || (is_external_mode && !is_benign_hyperlink))
+                                {
+                                    if !rel_id.is_empty() {
+                                        removed_rel_ids.insert(rel_id);
+                                    }
+                                    report.push(DisarmReportItem::new(
+                                        "EXTERNAL_RELATIONSHIP_INJECTION",
+                                        rels_path.to_string(),
+                                        format!(
+                                            "Removed external <Relationship> targeting '{}'",
+                                            target
+                                        ),
+                                    ));
+                                    if !is_empty {
+                                        skip_depth = 1;
+                                    }
+                                    buf.clear();
+                                    continue;
+                                }
+                            }
+
+                            writer
+                                .write_event(event.into_owned())
+                                .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                        }
+                        other => {
+                            writer
+                                .write_event(other.into_owned())
+                                .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(CdrError::ParserCorruption(format!(
+                        "Relationship XML parse error in {}: {}",
+                        rels_path, e
+                    )));
+                }
+            }
+            buf.clear();
+        }
+
+        Ok(writer.into_inner())
+    }
+
+    pub fn neutralize_dde_in_xml(
+        xml_bytes: &[u8],
+        xml_path: &str,
+        report: &mut Vec<DisarmReportItem>,
+    ) -> Result<Vec<u8>, CdrError> {
+        Self::sanitize_office_xml_dde(xml_bytes, xml_path, report)
+    }
+
+    /// Strips `<ddeLink>`, `ddeService`, `ddeTopic`, `DDEAUTO`/`DDE` fields, and `=cmd|` formulas
+    /// from OOXML content XML files when `policy.strip_office_dde` is true (`Row 118`, `BUG-CDR-04`).
+    /// Fails closed (`Err(CdrError::ParserCorruption)`) on invalid UTF-8 or malformed XML.
+    fn sanitize_office_xml_dde(
+        xml_bytes: &[u8],
+        xml_path: &str,
+        report: &mut Vec<DisarmReportItem>,
+    ) -> Result<Vec<u8>, CdrError> {
+        let default_policy = SanitizationPolicy::default();
+        let empty_removed = HashSet::new();
+        Self::sanitize_office_xml_dde_and_dangling_rels(
+            xml_bytes,
+            xml_path,
+            &default_policy,
+            &empty_removed,
+            report,
+        )
+    }
+
+    /// Rewrites OOXML content XML parts to:
+    /// 1. Strip `<ddeLink>`, `ddeService`, `ddeTopic`, `DDEAUTO`/`DDE` fields, `=cmd|` formulas,
+    ///    and `<!DOCTYPE>` declarations when `policy.strip_office_dde` is true (`Row 118`).
+    /// 2. Strip dangling `r:id` / `r:embed` / `r:link` / `id` hyperlink and relationship attributes
+    ///    that reference any `<Relationship>` removed during `.rels` sanitization (`Row 115`, `SP4.1-06`).
+    /// 3. Fail closed (`Err(CdrError::ParserCorruption)`) on invalid UTF-8 or malformed XML.
+    fn sanitize_office_xml_dde_and_dangling_rels(
+        xml_bytes: &[u8],
+        xml_path: &str,
+        policy: &SanitizationPolicy,
+        removed_rel_ids: &HashSet<String>,
+        report: &mut Vec<DisarmReportItem>,
+    ) -> Result<Vec<u8>, CdrError> {
+        let _xml_str = std::str::from_utf8(xml_bytes).map_err(|e| {
+            CdrError::ParserCorruption(format!("Invalid UTF-8 in OOXML part {}: {}", xml_path, e))
+        })?;
+
+        let mut reader = Reader::from_reader(xml_bytes);
+        let mut writer = Writer::new(Vec::with_capacity(xml_bytes.len()));
+        let mut buf = Vec::new();
+        let mut skip_depth = 0usize;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Eof) => break,
+                Ok(Event::DocType(_)) => {
+                    report.push(DisarmReportItem::new(
+                        "OOXML_DOCTYPE_DECLARATION",
+                        xml_path.to_string(),
+                        "Removed DOCTYPE/ENTITY declaration from OOXML part",
+                    ));
+                    buf.clear();
+                    continue;
+                }
+                Ok(event) => {
+                    if skip_depth > 0 {
+                        match event {
+                            Event::Start(_) => skip_depth += 1,
+                            Event::End(_) => skip_depth -= 1,
+                            _ => {}
+                        }
+                        buf.clear();
+                        continue;
+                    }
+
+                    match event {
+                        Event::Start(ref e) | Event::Empty(ref e) => {
+                            let is_empty = matches!(event, Event::Empty(_));
+                            let local_bytes = e.name().local_name().into_inner().to_vec();
+                            let local =
+                                String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
+
+                            if policy.strip_office_dde
+                                && (local == "ddelink" || local == "ddeitem" || local == "olelink")
+                            {
+                                report.push(DisarmReportItem::new(
+                                    "OOXML_DDE_LINK",
+                                    xml_path.to_string(),
+                                    "Removed Dynamic Data Exchange link element",
+                                ));
+                                if !is_empty {
+                                    skip_depth = 1;
+                                }
+                                buf.clear();
+                                continue;
+                            }
+
+                            let mut neutralized_attr = false;
+                            let tag_name =
+                                String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                            let mut clean_elem = BytesStart::new(tag_name);
+
+                            for attr_res in e.attributes() {
+                                let attr = attr_res.map_err(|err| {
+                                    CdrError::ParserCorruption(format!(
+                                        "Malformed XML attribute in {}: {}",
+                                        xml_path, err
+                                    ))
+                                })?;
+                                let key_str =
+                                    String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+                                let key_lower = key_str.to_ascii_lowercase();
+                                let local_key = String::from_utf8_lossy(
+                                    attr.key.local_name().into_inner(),
+                                )
+                                .to_ascii_lowercase();
+                                let val_str = String::from_utf8_lossy(&attr.value).into_owned();
+                                let val_upper = val_str.to_ascii_uppercase();
+
+                                // Strip dangling `r:id` / `r:embed` / `r:link` / `id` attributes whose
+                                // target `<Relationship>` was removed from `.rels` (`Row 115`, `SP4.1-06`).
+                                let is_rel_ref_attr = key_lower == "r:id"
+                                    || key_lower == "r:embed"
+                                    || key_lower == "r:link"
+                                    || local_key == "id";
+                                if is_rel_ref_attr && removed_rel_ids.contains(val_str.trim()) {
+                                    report.push(DisarmReportItem::new(
+                                        "DANGLING_RELATIONSHIP_ATTR",
+                                        xml_path.to_string(),
+                                        format!(
+                                            "Stripped dangling relationship attribute {}='{}'",
+                                            key_str, val_str
+                                        ),
+                                    ));
+                                    continue;
+                                }
+
+                                if policy.strip_office_dde
+                                    && (key_lower.contains("ddeservice")
+                                        || key_lower.contains("ddetopic")
+                                        || val_upper.contains("DDEAUTO")
+                                        || val_upper.starts_with("DDE ")
+                                        || val_upper.contains("CMD|")
+                                        || val_upper.contains("POWERSHELL"))
+                                {
+                                    neutralized_attr = true;
+                                    clean_elem.push_attribute((key_str.as_str(), "REM_DISARMED"));
+                                } else {
+                                    clean_elem
+                                        .push_attribute((key_str.as_str(), val_str.as_str()));
+                                }
+                            }
+
+                            if neutralized_attr {
+                                report.push(DisarmReportItem::new(
+                                    "OOXML_DDE_ATTRIBUTE",
+                                    xml_path.to_string(),
+                                    "Neutralized DDE/DDEAUTO instruction attribute",
+                                ));
+                            }
+
+                            let out_ev = if is_empty {
+                                Event::Empty(clean_elem)
+                            } else {
+                                Event::Start(clean_elem)
+                            };
+                            writer
+                                .write_event(out_ev)
+                                .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                        }
+                        Event::Text(ref t) => {
+                            let raw_text = String::from_utf8_lossy(t.as_ref()).into_owned();
+                            let upper = raw_text.to_ascii_uppercase();
+                            if policy.strip_office_dde
+                                && (upper.contains("DDEAUTO")
+                                    || upper.trim_start().starts_with("DDE ")
+                                    || upper.contains("CMD|"))
+                            {
+                                report.push(DisarmReportItem::new(
+                                    "DDE_FORMULA_INJECTION",
+                                    xml_path.to_string(),
+                                    "Neutralized inline DDE/command formula instruction",
+                                ));
+                                writer
+                                    .write_event(Event::Text(quick_xml::events::BytesText::new(
+                                        "REM_DISARMED",
+                                    )))
+                                    .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                            } else {
+                                writer
+                                    .write_event(Event::Text(t.clone().into_owned()))
+                                    .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                            }
+                        }
+                        Event::End(ref e) => {
+                            let tag_name =
+                                String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                            writer
+                                .write_event(Event::End(BytesEnd::new(tag_name)))
+                                .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                        }
+                        other => {
+                            writer
+                                .write_event(other.into_owned())
+                                .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(CdrError::ParserCorruption(format!(
+                        "Malformed OOXML content in {}: {}",
+                        xml_path, e
+                    )));
+                }
+            }
+            buf.clear();
+        }
+
+        Ok(writer.into_inner())
+    }
+
+    fn is_nested_sanitizable(lower_name: &str, bytes: &[u8]) -> bool {
+        lower_name.ends_with(".pdf")
+            || lower_name.ends_with(".docx")
+            || lower_name.ends_with(".xlsx")
+            || lower_name.ends_with(".pptx")
+            || lower_name.ends_with(".svg")
+            || lower_name.ends_with(".zip")
+            || lower_name.ends_with(".png")
+            || lower_name.ends_with(".jpg")
+            || lower_name.ends_with(".jpeg")
+            || lower_name.ends_with(".webp")
+            || lower_name.ends_with(".doc")
+            || lower_name.ends_with(".xls")
+            || lower_name.ends_with(".ppt")
+            || bytes.starts_with(b"%PDF-")
+            || bytes.starts_with(b"PK\x03\x04")
+            || bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+            || (bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+            || (bytes.len() >= 8 && bytes[..8] == crate::sanitizers::ole2::OLE2_MAGIC)
     }
 }

@@ -28,6 +28,15 @@ pub enum CdrError {
 
     #[error("Security violation: resource limit exceeded ({0})")]
     ResourceLimitExceeded(String),
+
+    #[error("CDR_WORKER_TIMEOUT: {0}")]
+    WorkerTimeout(String),
+
+    #[error("CDR_SANDBOX_FAILURE: {0}")]
+    SandboxFailure(String),
+
+    #[error("CDR_OUTPUT_REJECTED: {0}")]
+    OutputRejected(String),
 }
 
 pub type Result<T> = std::result::Result<T, CdrError>;
