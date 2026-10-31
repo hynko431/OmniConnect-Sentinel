@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/sentinel-proto",
+    "crates/sentinel-sys",
     "crates/sentinel-cdr",
     "crates/sentinel-core",
     "crates/sentinel-cli",
@@ -37,12 +38,22 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 aes-gcm = "0.10"
 rand = "0.8"
+base64 = "0.21.7"
+crc32fast = "1.5.2"
 
 # Observability & Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# OS-Level System Bindings
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
 # Internal workspace crates
 sentinel-proto = { path = "crates/sentinel-proto" }
+sentinel-sys = { path = "crates/sentinel-sys" }
 sentinel-cdr = { path = "crates/sentinel-cdr" }
 sentinel-core = { path = "crates/sentinel-core" }

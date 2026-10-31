@@ -1383,11 +1383,14 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "crc32fast",
+ "hex",
  "image",
  "lopdf",
  "prost",
  "quick-xml",
  "sentinel-proto",
+ "sentinel-sys",
  "serde",
  "serde_json",
  "sha2",
@@ -1406,14 +1409,22 @@ dependencies = [
 name = "sentinel-cli"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "clap",
  "hex",
+ "http",
+ "hyper",
  "sentinel-cdr",
  "sentinel-core",
  "sentinel-proto",
+ "sentinel-sys",
+ "serde",
+ "serde_json",
  "sha2",
+ "subtle",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1426,12 +1437,15 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "hex",
+ "lopdf",
  "rand",
  "sentinel-cdr",
  "sentinel-proto",
+ "sentinel-sys",
  "serde",
  "serde_json",
  "sha2",
@@ -1457,6 +1471,18 @@ dependencies = [
  "prost-types",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "sentinel-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "sha2",
+ "thiserror",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1835,6 +1861,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
