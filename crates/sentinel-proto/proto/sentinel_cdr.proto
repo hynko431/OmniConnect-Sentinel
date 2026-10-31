@@ -23,6 +23,11 @@ enum FileFormatType {
   FORMAT_JPEG = 5;
   FORMAT_PNG = 6;
   FORMAT_WEBP = 7;
+  FORMAT_SVG = 8;
+  FORMAT_OLE2 = 9;
+  FORMAT_TXT = 10;
+  FORMAT_CSV = 11;
+  FORMAT_ARCHIVE_ZIP = 12;
 }
 
 message DisarmRequest {
@@ -48,6 +53,10 @@ message DisarmPolicy {
   bool strip_exif_metadata = 5;
   bool truncate_overlay_bytes = 6;
   uint32 max_recursion_depth = 7;
+  bool strip_pdf_actions = 8;
+  bool strip_office_dde = 9;
+  bool reencode_images = 10;
+  uint64 max_decompressed_bytes = 11;
 }
 
 message DisarmResponse {

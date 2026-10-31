@@ -1,5 +1,8 @@
 [build]
 incremental = false
 
+[target.'cfg(windows)']
+rustflags = ["-C", "control-flow-guard=yes"]
+
 [env]
 CARGO_INCREMENTAL = "0"

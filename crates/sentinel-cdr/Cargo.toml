@@ -10,8 +10,13 @@ description = "High-performance, memory-safe Content Disarm and Reconstruction (
 name = "sentinel-cdr-daemon"
 path = "src/main.rs"
 
+[[bin]]
+name = "sentinel-cdr-worker"
+path = "src/bin/sentinel_cdr_worker.rs"
+
 [dependencies]
 sentinel-proto.workspace = true
+sentinel-sys.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
@@ -26,6 +31,8 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 thiserror = "1.0"
+hex = "0.4"
+crc32fast.workspace = true
 
 # Document & Media parsing crates
 lopdf = "0.33"

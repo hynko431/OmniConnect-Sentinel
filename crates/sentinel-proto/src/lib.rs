@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 //! Generated gRPC client and server bindings for OmniConnect Sentinel CDR service.
 
 pub mod v1 {
