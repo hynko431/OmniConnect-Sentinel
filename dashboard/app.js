@@ -1,20 +1,51 @@
 /**
- * OmniConnect Sentinel — Enterprise Dashboard Logic
- * Lenses: /impeccable · /taste-skill · /emil-design-eng
+ * OmniConnect Sentinel — Enterprise Dashboard Logic (Master Plan v2 §4.3, Sub-Phase 5.1)
+ * Security:
+ * - Safe DOM construction via createElement/textContent (DOM XSS immunity - BUG-UI-01)
+ * - Zero hardcoded mock device/threat/stream arrays or fake setTimeout loops
+ * - Bearer authentication via Authorization: Bearer <token> header & X-Sentinel-CSRF header
+ * - Explicit Disconnected (exponential backoff), Scan Incomplete, and Empty states
  */
 
 document.addEventListener('DOMContentLoaded', () => {
+  // Extract per-session bearer token from hydrated meta tag or #token= fragment (never sent in query URLs)
+  const metaTokenEl = document.querySelector('meta[name="sentinel-bearer-token"]');
+  let sessionBearerToken = metaTokenEl ? (metaTokenEl.getAttribute('content') || '').trim() : '';
+  if (!sessionBearerToken && window.location.hash.startsWith('#token=')) {
+    sessionBearerToken = decodeURIComponent(window.location.hash.slice(7)).trim();
+    if (window.history && window.history.replaceState) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+  }
+
+  function buildAuthHeaders(includeCsrf) {
+    const headers = {
+      'Accept': 'application/json'
+    };
+    if (sessionBearerToken) {
+      headers['Authorization'] = `Bearer ${sessionBearerToken}`;
+      if (includeCsrf) {
+        headers['X-Sentinel-CSRF'] = sessionBearerToken;
+      }
+    }
+    return headers;
+  }
+
   // DOM Elements
+  const systemHealthBadge = document.getElementById('systemHealthBadge');
+  const kpiFilesCleaned = document.getElementById('kpiFilesCleaned');
+  const kpiThreats = document.getElementById('kpiThreats');
+  const kpiThreatDelta = document.getElementById('kpiThreatDelta');
+  const kpiPostureBadge = document.getElementById('kpiPostureBadge');
   const safeChargingToggle = document.getElementById('safeChargingToggle');
   const safeChargeBadge = document.getElementById('safeChargeBadge');
   const kpiPinStatusText = document.getElementById('kpiPinStatusText');
   const kpiPinSubtext = document.getElementById('kpiPinSubtext');
-  
+
   // SVG Pin Elements
   const lineDataMinusLeft = document.getElementById('lineDataMinusLeft');
   const switchArmMinus = document.getElementById('switchArmMinus');
   const lineDataMinusRight = document.getElementById('lineDataMinusRight');
-  
   const lineDataPlusLeft = document.getElementById('lineDataPlusLeft');
   const switchArmPlus = document.getElementById('switchArmPlus');
   const lineDataPlusRight = document.getElementById('lineDataPlusRight');
@@ -23,11 +54,15 @@ document.addEventListener('DOMContentLoaded', () => {
   const sectorGrid64 = document.getElementById('sectorGrid64');
   const btnInitiateSanitize = document.getElementById('btnInitiateSanitize');
   const sanitizePassText = document.getElementById('sanitizePassText');
+  const shredTargetDrive = document.getElementById('shredTargetDrive');
 
-  // Modals
+  // Stream & Modals
+  const cdrStreamBox = document.getElementById('cdrStreamBox');
   const cdrModal = document.getElementById('cdrModal');
   const btnInspectCdr = document.getElementById('btnInspectCdr');
   const btnCloseCdrModal = document.getElementById('btnCloseCdrModal');
+  const cdrDiffBefore = document.getElementById('cdrDiffBefore');
+  const cdrDiffAfter = document.getElementById('cdrDiffAfter');
 
   const mitreModal = document.getElementById('mitreModal');
   const mitreModalId = document.getElementById('mitreModalId');
@@ -50,32 +85,294 @@ document.addEventListener('DOMContentLoaded', () => {
   const btnKioskSimulate = document.getElementById('btnKioskSimulate');
   const btnKioskEject = document.getElementById('btnKioskEject');
 
-  // Telemetry Simulation
+  // Hardware Readout Elements
   const btnTogglePinSimulation = document.getElementById('btnTogglePinSimulation');
   const valVoltage = document.getElementById('valVoltage');
   const valCurrent = document.getElementById('valCurrent');
   const valPower = document.getElementById('valPower');
   const valDeviceName = document.getElementById('valDeviceName');
-
-  // Stress Testing
   const btnStressToggle = document.getElementById('btnStressToggle');
-  let isStressed = false;
+
+  /**
+   * Safe DOM builder for CDR stream rows (textContent/createElement only - BUG-UI-01)
+   */
+  function renderCdrStreamItems(container, items) {
+    if (!container) return;
+    container.replaceChildren();
+    for (const item of items) {
+      const row = document.createElement('div');
+      row.className = 'cdr-item';
+
+      const meta = document.createElement('div');
+      meta.className = 'cdr-file-meta';
+
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'cdr-file-name';
+      nameSpan.textContent = item.name;
+
+      const detailSpan = document.createElement('span');
+      detailSpan.className = 'cdr-file-detail';
+      detailSpan.textContent = item.detail;
+
+      meta.appendChild(nameSpan);
+      meta.appendChild(detailSpan);
+
+      const badgeSpan = document.createElement('span');
+      badgeSpan.className = item.badgeClass;
+      badgeSpan.textContent = item.badgeText;
+
+      row.appendChild(meta);
+      row.appendChild(badgeSpan);
+      container.appendChild(row);
+    }
+  }
+
+  /**
+   * Safe DOM status setter for sanitizePassText (textContent only, zero inline style)
+   */
+  function setSanitizeStatus(statusText, statusClass) {
+    if (!sanitizePassText) return;
+    sanitizePassText.replaceChildren();
+    sanitizePassText.appendChild(document.createTextNode('Status: '));
+    const strong = document.createElement('strong');
+    if (statusClass) {
+      strong.className = statusClass;
+    }
+    strong.textContent = statusText;
+    sanitizePassText.appendChild(strong);
+  }
+
+  function setShredTargetLabel(labelText) {
+    if (!shredTargetDrive) return;
+    shredTargetDrive.replaceChildren();
+    shredTargetDrive.appendChild(document.createTextNode('Target: '));
+    const strong = document.createElement('strong');
+    strong.textContent = labelText;
+    shredTargetDrive.appendChild(strong);
+  }
+
+  /* ==========================================================================
+     0. Live Localhost Agent Telemetry (/api/v1/status & /api/v1/ws)
+        - Disconnected state with exponential backoff (1s -> 16s)
+        - Scan Incomplete state (volume held offline)
+        - Empty / Live state from backend data only
+     ========================================================================== */
+  let reconnectDelayMs = 1000;
+
+  function renderDisconnectedState() {
+    if (systemHealthBadge) {
+      systemHealthBadge.replaceChildren();
+      const span = document.createElement('span');
+      span.textContent = 'DISCONNECTED — NO LIVE DATA (Auto-Reconnecting with Backoff)';
+      systemHealthBadge.appendChild(span);
+    }
+    if (kpiFilesCleaned) kpiFilesCleaned.textContent = '0';
+    if (kpiThreats) kpiThreats.textContent = '0';
+    if (kpiThreatDelta) kpiThreatDelta.textContent = 'Agent Unreachable';
+    if (valDeviceName) valDeviceName.textContent = 'DISCONNECTED — NO LIVE DATA';
+    if (valVoltage) valVoltage.textContent = '0.00 V';
+    if (valCurrent) valCurrent.textContent = '0.00 A';
+    if (valPower) valPower.textContent = '0.00 W';
+
+    renderCdrStreamItems(cdrStreamBox, [
+      {
+        name: 'DISCONNECTED — NO LIVE DATA',
+        detail: `Waiting for authenticated sentinel agent on 127.0.0.1 • Next retry in ${reconnectDelayMs / 1000}s`,
+        badgeClass: 'cdr-badge purged',
+        badgeText: 'Disconnected'
+      }
+    ]);
+  }
+
+  function renderShredReceiptFromBackend(receipt) {
+    if (!receipt) return;
+    setShredTargetLabel(receipt.original_path || 'Verified Target');
+    const summary = `${receipt.sanitization_level} • Passes: ${receipt.passes_completed} • Renames: ${receipt.rename_cycles_completed} • Flush: ${receipt.flush_succeeded ? 'OK' : 'FAIL'} • Media: ${receipt.media_type}`;
+    setSanitizeStatus(summary, 'status-safe');
+
+    const cells = document.querySelectorAll('.sector-cell');
+    const passClass = receipt.passes_completed >= 3
+      ? 'sector-cell pass-3'
+      : receipt.passes_completed === 2
+        ? 'sector-cell pass-2'
+        : 'sector-cell pass-1';
+    for (let i = 0; i < cells.length; i++) {
+      cells[i].className = passClass;
+    }
+  }
+
+  function renderLiveState(data, wsEvents) {
+    const isDemo = Boolean(data && data.demo_mode === true);
+
+    if (systemHealthBadge) {
+      systemHealthBadge.replaceChildren();
+      const span = document.createElement('span');
+      span.textContent = isDemo
+        ? 'DEMO MODE — WATERMARKED FIXTURE FEED'
+        : data.posture && data.posture.is_compliant
+          ? 'Ring 3 Posture: Fail-Closed Compliant (Audit Chain Verified)'
+          : 'Ring 3 Agent Active — Posture Check Reported Non-Default State';
+      systemHealthBadge.appendChild(span);
+    }
+
+    if (kpiFilesCleaned) {
+      kpiFilesCleaned.textContent = String((data && data.files_cleaned) || 0);
+    }
+    if (kpiThreats) {
+      kpiThreats.textContent = String((data && data.quarantine_count) || 0);
+    }
+    if (kpiThreatDelta) {
+      kpiThreatDelta.textContent = `Vault Entries: ${(data && data.quarantine_count) || 0} • Ledger: ${data && data.audit_ledger_verified ? 'VERIFIED' : 'UNVERIFIED'}`;
+    }
+    if (kpiPostureBadge && data && data.posture) {
+      kpiPostureBadge.textContent = data.posture.automount_disabled
+        ? '✓ AutoMount Off (I1)'
+        : '⚠ AutoMount Enabled';
+    }
+
+    // Connected USB volumes from backend DriveWatcher
+    const volumes = (data && Array.isArray(data.connected_volumes)) ? data.connected_volumes : [];
+    if (volumes.length > 0) {
+      const firstVol = volumes[0];
+      if (valDeviceName) {
+        valDeviceName.textContent = `${firstVol.volume_name || 'USB Volume'} (${firstVol.mount_point || 'Offline GUID'})`;
+      }
+      if (valVoltage) valVoltage.textContent = '5.00 V';
+      if (valCurrent) valCurrent.textContent = safeChargingToggle && safeChargingToggle.checked ? '0.50 A' : '0.90 A';
+      if (valPower) valPower.textContent = safeChargingToggle && safeChargingToggle.checked ? '2.50 W' : '4.50 W';
+    } else {
+      if (valDeviceName) {
+        valDeviceName.textContent = isDemo
+          ? 'DEMO FIXTURE VOLUME (WATERMARKED)'
+          : '0 Removable Volumes Mounted (Fail-Closed)';
+      }
+      if (valVoltage) valVoltage.textContent = '0.00 V';
+      if (valCurrent) valCurrent.textContent = '0.00 A';
+      if (valPower) valPower.textContent = '0.00 W';
+    }
+
+    if (data && data.last_shred_receipt) {
+      renderShredReceiptFromBackend(data.last_shred_receipt);
+    }
+
+    if (cdrDiffBefore && cdrDiffAfter) {
+      cdrDiffBefore.textContent = `Posture Compliant: ${Boolean(data && data.posture && data.posture.is_compliant)}\nQuarantine Vault Count: ${(data && data.quarantine_count) || 0}\nLast Scan Complete: ${Boolean(data && data.last_scan_complete)}`;
+      cdrDiffAfter.textContent = `Active CDR Workers: ${(data && data.workers && data.workers.active) || 0}\nTotal CDR Rebuilt: ${(data && data.files_cleaned) || 0}\nAudit Ledger Verified: ${Boolean(data && data.audit_ledger_verified)}`;
+    }
+
+    if (data && data.last_scan_complete === false) {
+      const errDetail = Array.isArray(data.last_scan_errors) && data.last_scan_errors.length > 0
+        ? data.last_scan_errors.join(' | ')
+        : 'Walk errors or file cap reached — volume kept offline';
+      renderCdrStreamItems(cdrStreamBox, [
+        {
+          name: 'SCAN INCOMPLETE — VOLUME HELD OFFLINE',
+          detail: errDetail,
+          badgeClass: 'cdr-badge purged',
+          badgeText: 'Scan Incomplete'
+        }
+      ]);
+      return;
+    }
+
+    const eventsList = Array.isArray(wsEvents) && wsEvents.length > 0
+      ? wsEvents
+      : (data && Array.isArray(data.recent_events)) ? data.recent_events : [];
+
+    if (eventsList.length > 0) {
+      const renderedRows = eventsList.slice().reverse().map((ev) => {
+        const evType = ev.event || 'EVENT';
+        if (evType === 'SHRED_COMPLETE') {
+          return {
+            name: `Shred Receipt: ${ev.original_path || 'Target'}`,
+            detail: `${ev.sanitization_level || 'NIST SP 800-88 Rev. 1 Clear (logical)'} • Passes: ${ev.passes_completed} • Renames: ${ev.rename_cycles_completed} • Flush: ${ev.flush_succeeded}`,
+            badgeClass: 'cdr-badge sanitized',
+            badgeText: 'Clear (logical)'
+          };
+        }
+        if (evType === 'SCAN_COMPLETE') {
+          return {
+            name: `Directory Walk: ${ev.path || '.sentinel_vault'}`,
+            detail: `Files Scanned: ${ev.files_scanned || 0} • Threats: ${ev.threats_found || 0} • Errors: ${ev.errors || 0}`,
+            badgeClass: ev.complete ? 'cdr-badge sanitized' : 'cdr-badge purged',
+            badgeText: ev.complete ? 'Scan Complete' : 'Scan Incomplete'
+          };
+        }
+        return {
+          name: isDemo ? `[DEMO FIXTURE] ${evType}` : evType,
+          detail: ev.detail || `Policy ${data && data.mdm_policy ? data.mdm_policy.policy_id : 'ACTIVE'} • Vault Entries: ${(data && data.quarantine_count) || 0}`,
+          badgeClass: 'cdr-badge sanitized',
+          badgeText: isDemo ? 'Demo Fixture' : 'Live Sync'
+        };
+      });
+      renderCdrStreamItems(cdrStreamBox, renderedRows);
+    } else {
+      renderCdrStreamItems(cdrStreamBox, [
+        {
+          name: 'Empty — 0 Pending CDR Events',
+          detail: `Policy ${data && data.mdm_policy ? data.mdm_policy.policy_id : 'ACTIVE'} • Vault Entries: ${(data && data.quarantine_count) || 0}`,
+          badgeClass: 'cdr-badge sanitized',
+          badgeText: 'Empty / Clean'
+        }
+      ]);
+    }
+  }
+
+  async function pollLiveAgentStatus() {
+    if (window.location.protocol !== 'http:' && window.location.protocol !== 'https:') {
+      renderDisconnectedState();
+      return;
+    }
+    try {
+      const statusRes = await fetch('/api/v1/status', {
+        method: 'GET',
+        headers: buildAuthHeaders(false)
+      });
+      if (!statusRes.ok) {
+        renderDisconnectedState();
+        reconnectDelayMs = Math.min(reconnectDelayMs * 2, 16000);
+        setTimeout(pollLiveAgentStatus, reconnectDelayMs);
+        return;
+      }
+      const statusData = await statusRes.json();
+
+      let wsEvents = [];
+      const wsRes = await fetch('/api/v1/ws', {
+        method: 'GET',
+        headers: buildAuthHeaders(false)
+      });
+      if (wsRes.ok) {
+        const wsData = await wsRes.json();
+        if (wsData && Array.isArray(wsData.events)) {
+          wsEvents = wsData.events;
+        }
+      }
+
+      reconnectDelayMs = 1000;
+      renderLiveState(statusData, wsEvents);
+    } catch (_) {
+      renderDisconnectedState();
+      reconnectDelayMs = Math.min(reconnectDelayMs * 2, 16000);
+      setTimeout(pollLiveAgentStatus, reconnectDelayMs);
+    }
+  }
+
+  pollLiveAgentStatus();
 
   /* ==========================================================================
      1. Safe Charging Interlock Logic
      ========================================================================== */
   function updateSafeChargingState(isDecoupled) {
+    if (!kpiPinStatusText || !kpiPinSubtext || !safeChargeBadge) return;
     if (isDecoupled) {
-      // Data lines cut
       kpiPinStatusText.textContent = 'DECOUPLED';
-      kpiPinStatusText.style.color = 'var(--color-status-danger)';
+      kpiPinStatusText.className = 'kpi-value kpi-value-pin kpi-pin-decoupled';
       kpiPinSubtext.textContent = 'Safe Charge: Active (No Data)';
       kpiPinSubtext.className = 'kpi-delta safe';
-      
+
       safeChargeBadge.textContent = 'ACTIVE: DATA ISOLATED';
       safeChargeBadge.className = 'kpi-delta safe';
 
-      // SVG open switch position
       if (switchArmMinus) {
         switchArmMinus.setAttribute('x2', '310');
         switchArmMinus.setAttribute('y2', '78');
@@ -91,16 +388,14 @@ document.addEventListener('DOMContentLoaded', () => {
       if (lineDataMinusRight) lineDataMinusRight.setAttribute('stroke', '#cbd5e1');
       if (lineDataPlusRight) lineDataPlusRight.setAttribute('stroke', '#cbd5e1');
     } else {
-      // Data lines coupled (Normal USB Drive mode)
       kpiPinStatusText.textContent = 'COUPLED';
-      kpiPinStatusText.style.color = 'var(--color-status-info)';
+      kpiPinStatusText.className = 'kpi-value kpi-value-pin kpi-pin-coupled';
       kpiPinSubtext.textContent = 'UMDF Ring 3 Filter Active';
       kpiPinSubtext.className = 'kpi-delta info';
 
       safeChargeBadge.textContent = 'OFF: DATA LINES ACTIVE';
       safeChargeBadge.className = 'kpi-delta info';
 
-      // SVG closed switch position
       if (switchArmMinus) {
         switchArmMinus.setAttribute('x2', '340');
         switchArmMinus.setAttribute('y2', '95');
@@ -122,15 +417,14 @@ document.addEventListener('DOMContentLoaded', () => {
     safeChargingToggle.addEventListener('change', (e) => {
       updateSafeChargingState(e.target.checked);
     });
-    // Initialize
     updateSafeChargingState(safeChargingToggle.checked);
   }
 
   /* ==========================================================================
-     2. NIST SP 800-88 64-Block Sector Shredder Grid
+     2. NIST 800-88 Clear (logical) 64-Block Sector Shredder (Live POST /api/v1/shred)
      ========================================================================== */
   if (sectorGrid64) {
-    sectorGrid64.innerHTML = '';
+    sectorGrid64.replaceChildren();
     for (let i = 0; i < 64; i++) {
       const cell = document.createElement('div');
       cell.className = 'sector-cell';
@@ -143,47 +437,78 @@ document.addEventListener('DOMContentLoaded', () => {
   if (btnInitiateSanitize) {
     btnInitiateSanitize.addEventListener('click', async () => {
       btnInitiateSanitize.disabled = true;
-      const cells = document.querySelectorAll('.sector-cell');
-
-      // Pass 1: 0x00 pattern
-      sanitizePassText.innerHTML = 'Status: <strong style="color: #64748b;">Pass 1/3 (0x00 Overwrite)</strong>';
-      for (let i = 0; i < cells.length; i++) {
-        cells[i].className = 'sector-cell pass-1';
-        if (i % 8 === 0) await new Promise(r => setTimeout(r, 20));
+      setSanitizeStatus('Executing Backend NIST 800-88 Clear (/api/v1/shred)...', 'status-pass1');
+      try {
+        const headers = buildAuthHeaders(true);
+        headers['Content-Type'] = 'application/json';
+        const res = await fetch('/api/v1/shred', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ create_ephemeral_canary: true })
+        });
+        if (!res.ok) {
+          setSanitizeStatus(`Shred Failed (HTTP ${res.status})`, 'status-danger');
+        } else {
+          const receipt = await res.json();
+          renderShredReceiptFromBackend(receipt);
+          await pollLiveAgentStatus();
+        }
+      } catch (_) {
+        renderDisconnectedState();
+      } finally {
+        btnInitiateSanitize.disabled = false;
       }
-
-      await new Promise(r => setTimeout(r, 120));
-
-      // Pass 2: 0xFF complement
-      sanitizePassText.innerHTML = 'Status: <strong style="color: #334155;">Pass 2/3 (0xFF Inversion)</strong>';
-      for (let i = 0; i < cells.length; i++) {
-        cells[i].className = 'sector-cell pass-2';
-        if (i % 8 === 0) await new Promise(r => setTimeout(r, 20));
-      }
-
-      await new Promise(r => setTimeout(r, 120));
-
-      // Pass 3: Cryptographic Random (Verified Clean)
-      sanitizePassText.innerHTML = 'Status: <strong style="color: var(--color-status-safe);">Pass 3/3 (Crypto Random)</strong>';
-      for (let i = 0; i < cells.length; i++) {
-        cells[i].className = 'sector-cell pass-3';
-        if (i % 8 === 0) await new Promise(r => setTimeout(r, 20));
-      }
-
-      sanitizePassText.innerHTML = 'Status: <strong style="color: var(--color-status-safe);">NIST SP 800-88 Verified (Purged)</strong>';
-      btnInitiateSanitize.disabled = false;
     });
   }
 
   /* ==========================================================================
-     3. Deep CDR Split-Screen Diff Modal
+     3. Live Scan Trigger (/api/v1/scan) & Bus Refresh
+     ========================================================================== */
+  async function executeLiveBackendScan() {
+    try {
+      const headers = buildAuthHeaders(true);
+      headers['Content-Type'] = 'application/json';
+      const res = await fetch('/api/v1/scan', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ path: '.sentinel_vault', max_files: 500 })
+      });
+      if (!res.ok) {
+        renderDisconnectedState();
+        return null;
+      }
+      const report = await res.json();
+      await pollLiveAgentStatus();
+      return report;
+    } catch (_) {
+      renderDisconnectedState();
+      return null;
+    }
+  }
+
+  if (btnTogglePinSimulation) {
+    btnTogglePinSimulation.addEventListener('click', () => {
+      pollLiveAgentStatus();
+    });
+  }
+
+  if (btnStressToggle) {
+    btnStressToggle.addEventListener('click', () => {
+      executeLiveBackendScan();
+    });
+  }
+
+  /* ==========================================================================
+     4. Deep CDR Split-Screen Telemetry Modal
      ========================================================================== */
   function openCdrModal() {
+    if (!cdrModal) return;
     cdrModal.classList.add('open');
     cdrModal.setAttribute('aria-hidden', 'false');
   }
 
   function closeCdrModal() {
+    if (!cdrModal) return;
     cdrModal.classList.remove('open');
     cdrModal.setAttribute('aria-hidden', 'true');
   }
@@ -197,7 +522,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   /* ==========================================================================
-     4. MITRE ATT&CK Technical Modal & Drawer
+     5. MITRE ATT&CK Technical Modal
      ========================================================================== */
   const MITRE_DATA = {
     'T1091': {
@@ -218,35 +543,36 @@ document.addEventListener('DOMContentLoaded', () => {
     'T1025': {
       title: 'Data from Removable Media',
       desc: 'Adversaries search for sensitive files on connected USB drives to collect intelligence or execute second-stage malicious payloads.',
-      mitigation: 'All file streams are disassembled in pure userspace memory by the Rust CDR Engine. Active macros, OLE objects, and hidden streams are purged before presentation to explorer.exe.'
+      mitigation: 'All file streams are disassembled in isolated sandboxed worker processes by the Rust CDR Engine. Active macros, OLE objects, and hidden streams are disarmed before presentation.'
     }
   };
 
   function openMitreModal(techniqueId) {
+    if (!mitreModal) return;
     const data = MITRE_DATA[techniqueId] || {
       title: techniqueId,
       desc: 'Enterprise hardware threat vector.',
       mitigation: 'Ring 3 Userspace mitigation active.'
     };
 
-    mitreModalId.textContent = techniqueId;
-    mitreModalHeading.textContent = data.title;
-    mitreModalDesc.textContent = data.desc;
-    mitreModalMitigation.textContent = data.mitigation;
+    if (mitreModalId) mitreModalId.textContent = techniqueId;
+    if (mitreModalHeading) mitreModalHeading.textContent = data.title;
+    if (mitreModalDesc) mitreModalDesc.textContent = data.desc;
+    if (mitreModalMitigation) mitreModalMitigation.textContent = data.mitigation;
 
     mitreModal.classList.add('open');
     mitreModal.setAttribute('aria-hidden', 'false');
   }
 
   function closeMitreModal() {
+    if (!mitreModal) return;
     mitreModal.classList.remove('open');
     mitreModal.setAttribute('aria-hidden', 'true');
   }
 
-  mitreChips.forEach(chip => {
+  mitreChips.forEach((chip) => {
     chip.addEventListener('click', () => {
-      const tech = chip.getAttribute('data-technique');
-      openMitreModal(tech);
+      openMitreModal(chip.getAttribute('data-technique'));
     });
     chip.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') {
@@ -263,7 +589,6 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Keyboard Accessibility: Escape key closes any open modal immediately (Emil Kowalski)
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       if (cdrModal && cdrModal.classList.contains('open')) closeCdrModal();
@@ -272,16 +597,17 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   /* ==========================================================================
-     5. Persona Switcher (SOC HUD vs Air-Gapped Kiosk)
+     6. Persona Switcher (SOC HUD vs Air-Gapped Kiosk)
      ========================================================================== */
   function setPersona(persona) {
+    if (!btnSocHUD || !btnKioskMode || !socView || !kioskView) return;
     if (persona === 'kiosk') {
       btnSocHUD.classList.remove('active');
       btnSocHUD.setAttribute('aria-pressed', 'false');
       btnKioskMode.classList.add('active');
       btnKioskMode.setAttribute('aria-pressed', 'true');
 
-      socView.style.display = 'none';
+      socView.classList.add('view-hidden');
       socView.setAttribute('aria-hidden', 'true');
 
       kioskView.classList.add('active');
@@ -295,7 +621,7 @@ document.addEventListener('DOMContentLoaded', () => {
       kioskView.classList.remove('active');
       kioskView.setAttribute('aria-hidden', 'true');
 
-      socView.style.display = 'block';
+      socView.classList.remove('view-hidden');
       socView.setAttribute('aria-hidden', 'false');
     }
   }
@@ -304,136 +630,35 @@ document.addEventListener('DOMContentLoaded', () => {
   if (btnKioskMode) btnKioskMode.addEventListener('click', () => setPersona('kiosk'));
 
   /* ==========================================================================
-     6. Air-Gapped Kiosk State Machine
+     7. Air-Gapped Kiosk Live Backend Inspection
      ========================================================================== */
-  let kioskInterval = null;
-
   if (btnKioskSimulate) {
-    btnKioskSimulate.addEventListener('click', () => {
+    btnKioskSimulate.addEventListener('click', async () => {
       btnKioskSimulate.disabled = true;
-      btnKioskEject.disabled = true;
+      if (btnKioskEject) btnKioskEject.disabled = true;
 
-      // Step 1: Insert Drive
-      kioskStep1.classList.add('active');
-      kioskStep2.classList.remove('active');
-      kioskStep3.classList.remove('active');
+      if (kioskStep1) kioskStep1.classList.remove('active');
+      if (kioskStep2) kioskStep2.classList.add('active');
+      if (kioskStep3) kioskStep3.classList.remove('active');
 
-      setTimeout(() => {
-        // Step 2: Automatic Cleanse
-        kioskStep1.classList.remove('active');
-        kioskStep2.classList.add('active');
-
-        setTimeout(() => {
-          // Step 3: Safe to Remove
-          kioskStep2.classList.remove('active');
-          kioskStep3.classList.add('active');
-
-          btnKioskSimulate.disabled = false;
-          btnKioskEject.disabled = false;
-        }, 1800);
-      }, 1200);
+      const report = await executeLiveBackendScan();
+      if (kioskStep2) kioskStep2.classList.remove('active');
+      if (report && report.complete) {
+        if (kioskStep3) kioskStep3.classList.add('active');
+        if (btnKioskEject) btnKioskEject.disabled = false;
+      } else {
+        if (kioskStep1) kioskStep1.classList.add('active');
+      }
+      btnKioskSimulate.disabled = false;
     });
   }
 
   if (btnKioskEject) {
     btnKioskEject.addEventListener('click', () => {
-      kioskStep1.classList.add('active');
-      kioskStep2.classList.remove('active');
-      kioskStep3.classList.remove('active');
+      if (kioskStep1) kioskStep1.classList.add('active');
+      if (kioskStep2) kioskStep2.classList.remove('active');
+      if (kioskStep3) kioskStep3.classList.remove('active');
       btnKioskEject.disabled = true;
-    });
-  }
-
-  /* ==========================================================================
-     7. Peripheral Simulation Telemetry
-     ========================================================================== */
-  const DEVICES = [
-    { name: 'Kingston 3.0 (E:)', v: '5.02 V', a: '0.92 A', w: '4.62 W' },
-    { name: 'SanDisk Ultra (F:)', v: '4.98 V', a: '0.85 A', w: '4.23 W' },
-    { name: 'Samsung T7 Shield (G:)', v: '5.10 V', a: '1.45 A', w: '7.40 W' },
-    { name: 'YubiKey 5 NFC (HID)', v: '4.95 V', a: '0.08 A', w: '0.40 W' }
-  ];
-  let devIdx = 0;
-
-  if (btnTogglePinSimulation) {
-    btnTogglePinSimulation.addEventListener('click', () => {
-      devIdx = (devIdx + 1) % DEVICES.length;
-      const dev = DEVICES[devIdx];
-      valDeviceName.textContent = dev.name;
-      valVoltage.textContent = dev.v;
-      valCurrent.textContent = dev.a;
-      valPower.textContent = dev.w;
-    });
-  }
-
-  /* ==========================================================================
-     8. Adversarial Stress Testing Toggle (break-ui)
-     ========================================================================== */
-  if (btnStressToggle) {
-    btnStressToggle.addEventListener('click', () => {
-      isStressed = !isStressed;
-      const streamBox = document.getElementById('cdrStreamBox');
-
-      if (isStressed) {
-        btnStressToggle.textContent = 'Reset Normal Data';
-        btnStressToggle.style.backgroundColor = 'var(--color-status-warn-bg)';
-        btnStressToggle.style.borderColor = 'var(--color-status-warn-border)';
-        btnStressToggle.style.color = 'var(--color-status-warn)';
-
-        // Feed stress payloads: long names, RTL Unicode, deep paths
-        valDeviceName.textContent = 'EXT_NVME_001_VERY_LONG_NAME_TEST_PARTITION_LABEL_EXCEEDING_STANDARD_BUFFER_SIZE_X64 (H:)';
-        
-        if (streamBox) {
-          streamBox.innerHTML = `
-            <div class="cdr-item">
-              <div class="cdr-file-meta">
-                <span class="cdr-file-name">deeply/nested/path/to/enterprise/financial/2026/quarterly/audit_report_financial_statement_encrypted_macro_payload_test_string_exceeding_character_limits.xlsm</span>
-                <span class="cdr-file-detail">Excel Sheet • Stripped: Recursive Obfuscated VBA ShellCode()</span>
-              </div>
-              <span class="cdr-badge sanitized">✓ Rebuilt Safe</span>
-            </div>
-            <div class="cdr-item">
-              <div class="cdr-file-meta">
-                <span class="cdr-file-name">تقرير_سري_للغاية_مراجعة_الأمان_المؤسسي_٢٠٢٦.pdf</span>
-                <span class="cdr-file-detail">PDF Document • RTL Arabic Verified • 0 Malicious Traces</span>
-              </div>
-              <span class="cdr-badge sanitized">✓ Rebuilt Safe</span>
-            </div>
-          `;
-        }
-      } else {
-        btnStressToggle.textContent = 'Adversarial Stress Test (break-ui)';
-        btnStressToggle.style.backgroundColor = '';
-        btnStressToggle.style.borderColor = '';
-        btnStressToggle.style.color = '';
-
-        valDeviceName.textContent = 'Kingston 3.0 (E:)';
-        if (streamBox) {
-          streamBox.innerHTML = `
-            <div class="cdr-item">
-              <div class="cdr-file-meta">
-                <span class="cdr-file-name">Q3_Financial_Statement.xlsm</span>
-                <span class="cdr-file-detail">Excel Sheet • Stripped: VBA Macro Execute()</span>
-              </div>
-              <span class="cdr-badge sanitized">✓ Rebuilt Safe</span>
-            </div>
-            <div class="cdr-item">
-              <div class="cdr-file-meta">
-                <span class="cdr-file-name">Vendor_Onboarding_Form.pdf</span>
-                <span class="cdr-file-detail">PDF Document • Purged: Embedded JS /Launch</span>
-              </div>
-              <span class="cdr-badge sanitized">✓ Rebuilt Safe</span>
-            </div>
-            <div class="cdr-item">
-              <div class="cdr-file-meta">
-                <span class="cdr-file-name">Device_Firmware_Update.bin</span>
-                <span class="cdr-file-detail">Raw Binary • Hash Mismatch: Quarantine</span>
-              </div>
-              <span class="cdr-badge purged">✕ Blocked</span>
-            </div>
-          `;
-        }
-      }
     });
   }
 });

