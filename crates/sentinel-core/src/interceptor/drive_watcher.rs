@@ -1,95 +1,80 @@
 use std::collections::HashSet;
-#[allow(unused_imports)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::sleep;
-use tracing::{debug, info};
+use tokio::sync::mpsc;
+use tracing::info;
 
-#[derive(Debug, Clone)]
-pub struct DriveArrivalEvent {
-    pub drive_root: PathBuf,
-    pub volume_label: Option<String>,
-    pub filesystem: Option<String>,
+use sentinel_sys::{get_removable_drives, register_pnp_notification_watcher};
+
+/// Real-Time Removable Volume Watcher (`BUG-CORE-12`, Phase 3.1, Row 139)
+///
+/// Queries `sentinel_sys::get_removable_drives()` (`DRIVE_REMOVABLE` & `BusTypeUsb` volumes
+/// on Windows, removable `/media` & `/run/media` mounts on Linux) so fixed internal drives
+/// (`D:\`, `E:\`) and SMB network shares (`Z:\`) are never scanned, listens for native PnP
+/// device arrival notifications (`CM_Register_Notification` / `NETLINK_KOBJECT_UEVENT`), and
+/// offloads scan callbacks onto `tokio::task::spawn_blocking` without `.await`ing inside the
+/// detection loop so concurrent USB insertions are never missed.
+pub struct DriveWatcher {
+    known_drives: HashSet<PathBuf>,
 }
 
-pub struct DriveWatcher;
+impl Default for DriveWatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl DriveWatcher {
-    /// Discovers all currently active drive roots on the system
-    pub fn get_active_drives() -> Vec<PathBuf> {
-        let mut drives = Vec::new();
-
-        #[cfg(windows)]
-        {
-            // Scan drive letters A through Z
-            for letter in b'A'..=b'Z' {
-                let drive_str = format!("{}:\\", letter as char);
-                let p = PathBuf::from(&drive_str);
-                if p.exists() {
-                    drives.push(p);
-                }
-            }
+    pub fn new() -> Self {
+        let initial = Self::enumerate_mounted_drives();
+        Self {
+            known_drives: initial,
         }
-
-        #[cfg(not(windows))]
-        {
-            // On Linux / macOS, check /media, /run/media, and /Volumes
-            for mount_root in &["/media", "/run/media", "/Volumes"] {
-                let p = Path::new(mount_root);
-                if p.is_dir() {
-                    if let Ok(entries) = std::fs::read_dir(p) {
-                        for entry in entries.flatten() {
-                            let ep = entry.path();
-                            if ep.is_dir() {
-                                drives.push(ep);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        drives
     }
 
-    /// Continuously monitors the system for new external / removable drive arrivals.
-    /// When a newly inserted drive is detected, executes the provided callback.
-    pub async fn listen_for_insertions<F>(
-        poll_interval: Duration,
-        mut callback: F,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    pub fn enumerate_mounted_drives() -> HashSet<PathBuf> {
+        get_removable_drives().into_iter().collect()
+    }
+
+    pub async fn watch_loop<F>(&mut self, on_drive_inserted: F)
     where
-        F: FnMut(DriveArrivalEvent) + Send + Sync + 'static,
+        F: Fn(PathBuf) + Send + Sync + 'static,
     {
-        info!("DriveWatcher sentry actively monitoring for hardware drive arrivals...");
-        let mut known_drives: HashSet<PathBuf> = Self::get_active_drives().into_iter().collect();
+        let callback = Arc::new(on_drive_inserted);
+        info!(
+            "DriveWatcher active. Baseline removable drives: {:?}",
+            self.known_drives
+        );
 
+        let (pnp_tx, mut pnp_rx) = mpsc::unbounded_channel::<()>();
+        let _pnp_guard = register_pnp_notification_watcher(move || {
+            let _ = pnp_tx.send(());
+        });
+
+        let mut interval = tokio::time::interval(Duration::from_millis(800));
         loop {
-            sleep(poll_interval).await;
-            let current_drives = Self::get_active_drives();
-            let current_set: HashSet<PathBuf> = current_drives.iter().cloned().collect();
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = pnp_rx.recv() => {}
+            }
 
-            // Detect newly arrived drives
-            for drive in &current_set {
-                if !known_drives.contains(drive) {
-                    info!("🚨 Hardware Drive Insertion Detected: {:?}", drive);
+            let current = Self::enumerate_mounted_drives();
 
-                    let event = DriveArrivalEvent {
-                        drive_root: drive.clone(),
-                        volume_label: None,
-                        filesystem: None,
-                    };
-
-                    callback(event);
+            for drive in &current {
+                if !self.known_drives.contains(drive) {
+                    info!("New removable USB volume detected: {}", drive.display());
+                    let cb = Arc::clone(&callback);
+                    let drive_clone = drive.clone();
+                    // Spawn onto blocking pool without `.await`ing inside the detection loop
+                    // so a second device inserted during a long scan is detected immediately (`Row 139`).
+                    tokio::task::spawn_blocking(move || {
+                        cb(drive_clone);
+                    });
                 }
             }
 
-            // Detect removed drives
-            for removed in known_drives.difference(&current_set) {
-                debug!("Device disconnected / dismounted: {:?}", removed);
-            }
-
-            known_drives = current_set;
+            self.known_drives = current;
         }
     }
 }
