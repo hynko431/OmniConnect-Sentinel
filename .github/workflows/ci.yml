@@ -1,0 +1,92 @@
+name: OmniConnect Sentinel Enterprise Security & Supply-Chain CI
+
+on:
+  push:
+    branches: ["main", "master", "release/**"]
+  pull_request:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test-and-verify:
+    name: Test Matrix, Clippy & Fuzz Corpus Regression
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install qpdf output oracle (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y qpdf libfuse3-dev pkg-config
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy strict lint gate (no unwrap/expect in production crates)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Execute full test pyramid (unit, property, invariant I1-I5, output oracles, chaos)
+        run: cargo test --workspace -- --nocapture
+
+  supply-chain-and-sbom:
+    name: Supply-Chain Gate (cargo-deny, cargo-audit, cargo-machete, CycloneDX SBOM, SLSA)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run cargo-deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+      - name: Run cargo-audit (RustSec advisory database)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run cargo-machete (unused dependency check — EV-04)
+        run: |
+          cargo install --locked cargo-machete
+          cargo machete
+
+      - name: Generate CycloneDX SBOM (sbom.cdx.json)
+        run: |
+          cargo install --locked cargo-cyclonedx
+          cargo cyclonedx --format json --all --override-filename sbom
+          test -f sbom.cdx.json
+
+      - name: Build release binaries for SLSA provenance & signing
+        run: cargo build --workspace --release --locked
+
+      - name: Attest SLSA Build Provenance & CycloneDX SBOM
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            target/release/sentinel-cli*
+            target/release/sentinel-agent*
+            target/release/sentinel-cdr-daemon*
+            target/release/sentinel-cdr-worker*
+            sbom.cdx.json
+

@@ -1,0 +1,21 @@
+[package]
+name = "sentinel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1.5.0", features = ["derive"] }
+sentinel-cdr = { path = "../crates/sentinel-cdr" }
+sentinel-core = { path = "../crates/sentinel-core" }
+
+[[bin]]
+name = "fuzz_cdr_all"
+path = "fuzz_targets/fuzz_cdr_all.rs"
+test = false
+doc = false
+bench = false
+
