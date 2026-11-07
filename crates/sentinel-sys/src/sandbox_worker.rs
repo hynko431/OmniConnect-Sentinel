@@ -982,14 +982,141 @@ pub fn apply_worker_process_mitigations() -> io::Result<()> {
             rlim_cur: 0,
             rlim_max: 0,
         };
-        let _ = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero_rlim) };
-        let _ = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &zero_rlim) };
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero_rlim) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &zero_rlim) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        // Isolate network namespace (attempt CLONE_NEWNET directly, then unprivileged CLONE_NEWUSER | CLONE_NEWNET)
-        if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
-            let _ = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) };
+        // Isolate network and IPC namespaces where permitted (do not pass CLONE_NEWUSER)
+        let _ = unsafe { libc::unshare(libc::CLONE_NEWNET | libc::CLONE_NEWIPC) };
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            struct SockFilter {
+                code: u16,
+                jt: u8,
+                jf: u8,
+                k: u32,
+            }
+            #[repr(C)]
+            struct SockFprog {
+                len: u16,
+                filter: *const SockFilter,
+            }
+
+            const BPF_LD_W_ABS: u16 = 0x20;
+            const BPF_JMP_JEQ_K: u16 = 0x15;
+            const BPF_RET_K: u16 = 0x06;
+            const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
+            const SECCOMP_RET_ERRNO_EPERM: u32 = 0x0005_0000 | (libc::EPERM as u32);
+            const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+
+            // seccomp_data offsets: nr = 0, arch = 4
+            // Block execve (59), execveat (322), fork (57), vfork (58), socket (41), connect (42) with EPERM
+            let filter: [SockFilter; 11] = [
+                // 0: load seccomp_data.arch (offset 4)
+                SockFilter {
+                    code: BPF_LD_W_ABS,
+                    jt: 0,
+                    jf: 0,
+                    k: 4,
+                },
+                // 1: if arch != AUDIT_ARCH_X86_64 -> deny (jump to idx 9)
+                SockFilter {
+                    code: BPF_JMP_JEQ_K,
+                    jt: 0,
+                    jf: 7,
+                    k: AUDIT_ARCH_X86_64,
+                },
+                // 2: load seccomp_data.nr (offset 0)
+                SockFilter {
+                    code: BPF_LD_W_ABS,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                },
+                // 3: if nr == SYS_execve (59) -> jump to idx 9 (EPERM)
+                SockFilter {
+                    code: BPF_JMP_JEQ_K,
+                    jt: 5,
+                    jf: 0,
+                    k: libc::SYS_execve as u32,
+                },
+                // 4: if nr == SYS_execveat (322) -> jump to idx 9 (EPERM)
+                SockFilter {
+                    code: BPF_JMP_JEQ_K,
+                    jt: 4,
+                    jf: 0,
+                    k: libc::SYS_execveat as u32,
+                },
+                // 5: if nr == SYS_fork (57) -> jump to idx 9 (EPERM)
+                SockFilter {
+                    code: BPF_JMP_JEQ_K,
+                    jt: 3,
+                    jf: 0,
+                    k: libc::SYS_fork as u32,
+                },
+                // 6: if nr == SYS_vfork (58) -> jump to idx 9 (EPERM)
+                SockFilter {
+                    code: BPF_JMP_JEQ_K,
+                    jt: 2,
+                    jf: 0,
+                    k: libc::SYS_vfork as u32,
+                },
+                // 7: if nr == SYS_socket (41) -> jump to idx 9 (EPERM)
+                SockFilter {
+                    code: BPF_JMP_JEQ_K,
+                    jt: 1,
+                    jf: 0,
+                    k: libc::SYS_socket as u32,
+                },
+                // 8: if nr == SYS_connect (42) -> jump to idx 9 (EPERM), else jump to idx 10 (ALLOW)
+                SockFilter {
+                    code: BPF_JMP_JEQ_K,
+                    jt: 0,
+                    jf: 1,
+                    k: libc::SYS_connect as u32,
+                },
+                // 9: return EPERM
+                SockFilter {
+                    code: BPF_RET_K,
+                    jt: 0,
+                    jf: 0,
+                    k: SECCOMP_RET_ERRNO_EPERM,
+                },
+                // 10: return ALLOW
+                SockFilter {
+                    code: BPF_RET_K,
+                    jt: 0,
+                    jf: 0,
+                    k: SECCOMP_RET_ALLOW,
+                },
+            ];
+            let prog = SockFprog {
+                len: filter.len() as u16,
+                filter: filter.as_ptr(),
+            };
+            if unsafe {
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &prog as *const SockFprog,
+                    0,
+                    0,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
         }
         Ok(())
     }

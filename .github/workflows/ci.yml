@@ -67,18 +67,8 @@ jobs:
         with:
           tool: cargo-audit,cargo-machete,cargo-cyclonedx
 
-      - name: Run cargo-audit (RustSec advisory database with VEX config)
-        run: |
-          cargo audit \
-            --ignore RUSTSEC-2026-0258 \
-            --ignore RUSTSEC-2026-0187 \
-            --ignore RUSTSEC-2026-0194 \
-            --ignore RUSTSEC-2026-0195 \
-            --ignore RUSTSEC-2026-0367 \
-            --ignore RUSTSEC-2026-0368 \
-            --ignore RUSTSEC-2026-0369 \
-            --ignore RUSTSEC-2026-0429 \
-            --ignore RUSTSEC-2026-0384
+      - name: Run cargo-audit (RustSec advisory database with zero-ignore policy)
+        run: cargo audit --deny yanked
 
       - name: Run cargo-machete (unused dependency check — EV-04)
         run: cargo machete
@@ -92,7 +82,7 @@ jobs:
           test -f sbom.cdx.json
 
       - name: Build release binaries for SLSA provenance & signing
-        run: cargo build --workspace --release
+        run: cargo build --workspace --release --locked
 
       - name: Attest SLSA Build Provenance & CycloneDX SBOM
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')

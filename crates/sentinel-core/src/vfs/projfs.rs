@@ -143,7 +143,7 @@ impl VirtualFileSystemProvider for ProjFsProvider {
         Ok(())
     }
 
-    async fn on_file_First_open(&self, relative_path: &Path) -> Result<PathBuf, String> {
+    async fn on_file_first_open(&self, relative_path: &Path) -> Result<PathBuf, String> {
         let root = self
             .active_root
             .lock()

@@ -3,7 +3,6 @@
 //! All other workspace crates (`sentinel-cdr`, `sentinel-core`, `sentinel-cli`)
 //! enforce `#![forbid(unsafe_code)]` and delegate low-level OS interactions here.
 
-#![allow(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod crypto_seal;

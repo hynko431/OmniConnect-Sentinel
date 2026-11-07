@@ -1,17 +1,7 @@
-# RustSec cargo-audit configuration aligned with VEX entries in deny.toml
+# RustSec cargo-audit configuration aligned with zero-ignore supply-chain policy in deny.toml
 [advisories]
-ignore = [
-    "RUSTSEC-2026-0258",
-    "RUSTSEC-2026-0187",
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
-    "RUSTSEC-2026-0367",
-    "RUSTSEC-2026-0368",
-    "RUSTSEC-2026-0369",
-    "RUSTSEC-2026-0429",
-    "RUSTSEC-2026-0384",
-]
+ignore = []
 
 [yanked]
-enabled = false
+enabled = true
 update_index = true

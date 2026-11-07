@@ -36,8 +36,8 @@ impl VirtualFileSystemProvider for WinFspProvider {
             .await
     }
 
-    async fn on_file_First_open(&self, relative_path: &Path) -> Result<PathBuf, String> {
-        self.inner.on_file_First_open(relative_path).await
+    async fn on_file_first_open(&self, relative_path: &Path) -> Result<PathBuf, String> {
+        self.inner.on_file_first_open(relative_path).await
     }
 
     async fn unmount_volume(&self, virtual_mount_point: &Path) -> Result<(), String> {

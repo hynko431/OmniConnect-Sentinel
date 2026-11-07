@@ -2,7 +2,10 @@
 incremental = false
 
 [target.'cfg(windows)']
-rustflags = ["-C", "control-flow-guard=yes"]
+rustflags = ["-C", "control-flow-guard=yes", "-D", "warnings"]
+
+[target.'cfg(not(windows))']
+rustflags = ["-D", "warnings"]
 
 [env]
 CARGO_INCREMENTAL = "0"

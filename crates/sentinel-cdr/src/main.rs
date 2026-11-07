@@ -8,7 +8,6 @@ use tracing_subscriber::FmtSubscriber;
 use sentinel_cdr::policy::SanitizationPolicy;
 use sentinel_cdr::worker::{write_inspect_response_framed, WorkerCommand, WorkerLauncher};
 use sentinel_cdr::WorkerResponse;
-use sentinel_sys::apply_worker_process_mitigations;
 
 /// Local Pipe CDR Daemon (`sentinel-cdr-daemon`) (`BUG-CDR-10`, Master Plan v2 §0.2 & §2.1, Invariant I3)
 ///
@@ -26,8 +25,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_thread_ids(true)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
-
-    apply_worker_process_mitigations()?;
 
     let policy = SanitizationPolicy::default();
     info!("=========================================================");

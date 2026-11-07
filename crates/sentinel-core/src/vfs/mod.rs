@@ -63,8 +63,7 @@ pub trait VirtualFileSystemProvider: Send + Sync {
         virtual_mount_point: &Path,
     ) -> Result<(), String>;
 
-    #[allow(non_snake_case)]
-    async fn on_file_First_open(&self, relative_path: &Path) -> Result<PathBuf, String>;
+    async fn on_file_first_open(&self, relative_path: &Path) -> Result<PathBuf, String>;
 
     async fn unmount_volume(&self, virtual_mount_point: &Path) -> Result<(), String>;
 
@@ -1094,7 +1093,7 @@ impl VirtualFileSystemProvider for StagingFolderProvider {
         Ok(())
     }
 
-    async fn on_file_First_open(&self, relative_path: &Path) -> Result<PathBuf, String> {
+    async fn on_file_first_open(&self, relative_path: &Path) -> Result<PathBuf, String> {
         let mount_root = self
             .active_mount
             .lock()

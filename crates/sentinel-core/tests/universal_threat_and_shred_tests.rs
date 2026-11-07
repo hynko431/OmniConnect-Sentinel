@@ -934,10 +934,10 @@ async fn test_interceptor_retains_channel_sender_and_vfs_shadow_cache() {
         .await
         .expect("VFS shadow cache projection must succeed");
 
-    // Verify encrypted-only at-rest posture: before `on_file_First_open`, no plaintext copy exists in `virt_mount` (`Rows 147, 223`)
+    // Verify encrypted-only at-rest posture: before `on_file_first_open`, no plaintext copy exists in `virt_mount` (`Rows 147, 223`)
     assert!(
         !virt_mount.join("notes.txt").exists(),
-        "Plaintext must NOT be pre-written to virtual_mount_point before on_file_First_open (`Row 147`)"
+        "Plaintext must NOT be pre-written to virtual_mount_point before on_file_first_open (`Row 147`)"
     );
 
     // Verify `read_projected_file` decrypts from `.enc` and verifies `sanitized_sha256` (`Row 148`)
@@ -952,7 +952,7 @@ async fn test_interceptor_retains_channel_sender_and_vfs_shadow_cache() {
     assert_eq!(actual_sha, expected_sanitized_sha);
 
     let projected_txt = vfs
-        .on_file_First_open(std::path::Path::new("notes.txt"))
+        .on_file_first_open(std::path::Path::new("notes.txt"))
         .await
         .expect("Sanitized notes.txt must be projected");
     let clean_content = fs::read_to_string(&projected_txt).unwrap();
@@ -961,7 +961,7 @@ async fn test_interceptor_retains_channel_sender_and_vfs_shadow_cache() {
         "Projected file in ShadowCache must have BiDi characters disarmed"
     );
     assert!(
-        vfs.on_file_First_open(std::path::Path::new("dropper.exe"))
+        vfs.on_file_first_open(std::path::Path::new("dropper.exe"))
             .await
             .is_err(),
         "Default-deny ShadowCache must withhold unapproved executable format"
@@ -2009,6 +2009,7 @@ async fn invariant_i3() {
 
     // 2. Worker exceeding 256 MB memory cap (`__TEST_ALLOC_300MB__.bin`) is killed by the OS Job Object
     //    and `Tier1CdrClient::disarm_file` returns `Err` so the caller quarantines the file.
+    std::env::set_var("SENTINEL_CDR_ENABLE_FAULT_PROBES", "1");
     let oom_src = dir.path().join("__TEST_ALLOC_300MB__.bin");
     let oom_dst = dir.path().join("oom_out.bin");
     fs::write(&oom_src, b"trigger 300MB allocation").unwrap();

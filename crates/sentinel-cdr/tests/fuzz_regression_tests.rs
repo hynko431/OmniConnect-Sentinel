@@ -1009,6 +1009,7 @@ fn worker_memory_cap() {
     // 2. Spawn `sentinel-cdr-worker` inside the 256 MB Job Object sandbox and trigger a 300 MB
     //    allocation (`__TEST_ALLOC_300MB__.bin`), verifying the OS Job Object terminates the
     //    worker and `WorkerLauncher::sanitize_isolated` returns `Err(CdrError::ResourceLimitExceeded)`.
+    std::env::set_var("SENTINEL_CDR_ENABLE_FAULT_PROBES", "1");
     let launcher = WorkerLauncher::new();
     let res = launcher.sanitize_isolated(WorkerRequest {
         file_name: "__TEST_ALLOC_300MB__.bin".to_string(),

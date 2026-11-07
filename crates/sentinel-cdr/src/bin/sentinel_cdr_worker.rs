@@ -42,7 +42,10 @@ fn main() {
 
     match command {
         WorkerCommand::Disarm(request) => {
-            if request.file_name == "__TEST_ALLOC_300MB__.bin" {
+            let fault_probes_enabled = std::env::var_os("SENTINEL_CDR_ENABLE_FAULT_PROBES")
+                .is_some_and(|v| v == "1")
+                || cfg!(debug_assertions);
+            if fault_probes_enabled && request.file_name == "__TEST_ALLOC_300MB__.bin" {
                 let target_bytes = 300 * 1024 * 1024usize;
                 let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(300);
                 for i in 0..300usize {
@@ -53,10 +56,10 @@ fn main() {
                 std::hint::black_box(&chunks);
                 let _ = target_bytes;
             }
-            if request.file_name == "__TEST_HANG_60S__.bin" {
+            if fault_probes_enabled && request.file_name == "__TEST_HANG_60S__.bin" {
                 std::thread::sleep(std::time::Duration::from_secs(60));
             }
-            if request.file_name == "__TEST_SPAWN_CHILD__.bin" {
+            if fault_probes_enabled && request.file_name == "__TEST_SPAWN_CHILD__.bin" {
                 let exe =
                     std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("cmd.exe"));
                 match std::process::Command::new(exe).arg("--version").spawn() {

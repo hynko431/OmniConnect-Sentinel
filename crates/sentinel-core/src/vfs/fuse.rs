@@ -1,9 +1,12 @@
 use async_trait::async_trait;
+#[cfg(not(unix))]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tracing::info;
+#[cfg(target_os = "linux")]
+use tracing::warn;
 
 use crate::vfs::{ShadowCacheManager, VirtualFileSystemProvider};
 
@@ -89,6 +92,15 @@ impl VirtualFileSystemProvider for FuseVfsProvider {
             }
         }
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                virtual_mount_point,
+                std::fs::Permissions::from_mode(0o500),
+            );
+        }
+        #[cfg(not(unix))]
         if let Ok(meta) = fs::metadata(virtual_mount_point) {
             let mut perms = meta.permissions();
             perms.set_readonly(true);
@@ -101,30 +113,31 @@ impl VirtualFileSystemProvider for FuseVfsProvider {
         Ok(())
     }
 
-    async fn on_file_First_open(&self, relative_path: &Path) -> Result<PathBuf, String> {
+    async fn on_file_first_open(&self, relative_path: &Path) -> Result<PathBuf, String> {
         let root = self
             .active_root
             .lock()
             .map_err(|e| e.to_string())?
             .clone()
             .ok_or_else(|| "FUSE3 mount root is not active".to_string())?;
-        if let Ok(meta) = fs::metadata(&root) {
-            let mut perms = meta.permissions();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                perms.set_mode(0o700);
-            }
-            #[cfg(not(unix))]
-            #[allow(clippy::permissions_set_readonly_false)]
-            {
-                perms.set_readonly(false);
-            }
-            let _ = fs::set_permissions(&root, perms);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = sentinel_sys::normalize_file_attributes(&root);
         }
         let res = self
             .shadow_cache
             .resolve_projected_file(&root, relative_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500));
+        }
+        #[cfg(not(unix))]
         if let Ok(meta) = fs::metadata(&root) {
             let mut perms = meta.permissions();
             perms.set_readonly(true);
@@ -146,19 +159,17 @@ impl VirtualFileSystemProvider for FuseVfsProvider {
                 *fm = false;
             }
         }
-        if let Ok(meta) = fs::metadata(virtual_mount_point) {
-            let mut perms = meta.permissions();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                perms.set_mode(0o700);
-            }
-            #[cfg(not(unix))]
-            #[allow(clippy::permissions_set_readonly_false)]
-            {
-                perms.set_readonly(false);
-            }
-            let _ = fs::set_permissions(virtual_mount_point, perms);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                virtual_mount_point,
+                std::fs::Permissions::from_mode(0o700),
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = sentinel_sys::normalize_file_attributes(virtual_mount_point);
         }
         self.shadow_cache.teardown_session(virtual_mount_point)?;
         if let Ok(mut guard) = self.active_root.lock() {
