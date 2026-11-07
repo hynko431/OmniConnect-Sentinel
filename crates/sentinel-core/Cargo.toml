@@ -15,7 +15,6 @@ sentinel-proto.workspace = true
 sentinel-cdr.workspace = true
 sentinel-sys.workspace = true
 tokio.workspace = true
-bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
