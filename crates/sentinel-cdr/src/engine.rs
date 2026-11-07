@@ -429,6 +429,16 @@ impl CdrEngine {
     ) -> Result<()> {
         match format {
             DetectedFormat::Pdf => {
+                PdfSanitizer::validate_pdf_token_nesting_depth(
+                    clean_bytes,
+                    PdfSanitizer::MAX_PDF_NESTING_DEPTH,
+                )
+                .map_err(|e| {
+                    CdrError::OutputRejected(format!(
+                        "CDR_OUTPUT_REJECTED: Sanitized PDF failed nesting depth precheck: {}",
+                        e
+                    ))
+                })?;
                 let doc = lopdf::Document::load_mem(clean_bytes).map_err(|e| {
                     CdrError::OutputRejected(format!(
                         "CDR_OUTPUT_REJECTED: Sanitized PDF failed AST re-parse: {}",
@@ -1080,7 +1090,14 @@ impl CdrEngine {
                     is_malicious_polyglot = true;
                     risk_tags.push("POLYGLOT_ZIP_ARCHIVE_APPENDED".to_string());
                 }
-                if let Ok(doc) = lopdf::Document::load_mem(bytes) {
+                if PdfSanitizer::validate_pdf_token_nesting_depth(
+                    bytes,
+                    PdfSanitizer::MAX_PDF_NESTING_DEPTH,
+                )
+                .is_err()
+                {
+                    risk_tags.push("PDF_EXCESSIVE_NESTING_DEPTH".to_string());
+                } else if let Ok(doc) = lopdf::Document::load_mem(bytes) {
                     for (_, obj) in &doc.objects {
                         Self::inspect_pdf_object_risks(obj, &mut risk_tags);
                     }

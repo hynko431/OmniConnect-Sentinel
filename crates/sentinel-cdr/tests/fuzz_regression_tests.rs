@@ -311,8 +311,8 @@ fn test_pdf_preserves_transparency_and_dests_while_stripping_js_and_inline_annot
     // Verify /Group << /S /Transparency >> survived intact
     let group_dict = clean_page.get(b"Group").unwrap().as_dict().unwrap();
     assert_eq!(
-        group_dict.get(b"S").unwrap().as_name_str().unwrap(),
-        "Transparency"
+        group_dict.get(b"S").unwrap().as_name().unwrap(),
+        b"Transparency"
     );
 
     // Verify /Dests survived in Catalog while /OpenAction was removed
@@ -1483,4 +1483,74 @@ fn test_xml_namespace_flood_and_element_depth_rejected_rustsec_2026_0195() {
         ),
         "Custom XML entity reference in .rels must fail closed with ParserCorruption, got: {entity_rels_res:?}"
     );
+}
+
+#[test]
+fn test_pdf_deep_array_nesting_rejected_before_lopdf_load_mem() {
+    let engine = CdrEngine::new(SanitizationPolicy::default());
+
+    // 1. Deeply nested array payload (> 64 levels) must be rejected in < 50 ms before lopdf::Document::load_mem
+    let mut deep_pdf = b"%PDF-1.7\n1 0 obj\n".to_vec();
+    deep_pdf.extend_from_slice(&b"[".repeat(120));
+    deep_pdf.extend_from_slice(&b"]".repeat(120));
+    deep_pdf.extend_from_slice(b"\nendobj\n%%EOF\n");
+
+    let start = std::time::Instant::now();
+    let res = engine.sanitize(&deep_pdf);
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(
+            res,
+            Err(sentinel_cdr::CdrError::ResourceLimitExceeded(ref msg))
+                if msg.contains("PDF structural nesting depth exceeds maximum allowed")
+        ),
+        "Deeply nested PDF array must fail with ResourceLimitExceeded (RUSTSEC-2026-0187), got: {res:?}"
+    );
+    assert!(
+        elapsed.as_millis() < 50,
+        "Pre-check rejection must be instantaneous (< 50 ms), took {elapsed:?}"
+    );
+
+    // 2. CdrEngine::inspect_bytes must flag PDF_EXCESSIVE_NESTING_DEPTH without crashing
+    let assessment = CdrEngine::inspect_bytes(&deep_pdf, "bomb.pdf");
+    assert!(
+        assessment
+            .risk_tags
+            .iter()
+            .any(|t| t == "PDF_EXCESSIVE_NESTING_DEPTH"),
+        "inspect_bytes must flag PDF_EXCESSIVE_NESTING_DEPTH on deep PDF array, got: {:?}",
+        assessment.risk_tags
+    );
+
+    // 3. Valid PDF containing 120 '[' characters inside a PDF literal string `(...)` and a `%` comment must be accepted!
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let brackets_in_string = format!("BT /F1 12 Tf ({}) Tj ET", "[".repeat(120));
+    let contents_id = doc.add_object(Stream::new(dictionary! {}, brackets_in_string.into_bytes()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => contents_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let mut valid_pdf = Vec::new();
+    doc.save_to(&mut valid_pdf)
+        .expect("valid PDF save_to should succeed");
+
+    let (clean_pdf, _) = engine
+        .sanitize(&valid_pdf)
+        .expect("Valid PDF with '[' inside a string literal must not be falsely rejected");
+    assert!(clean_pdf.starts_with(b"%PDF-"));
 }

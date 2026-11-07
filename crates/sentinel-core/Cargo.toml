@@ -27,14 +27,13 @@ sha2.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
 hex = "0.4"
-base64.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 async-trait.workspace = true
 
 # Cross-platform userspace I/O
 walkdir = "2.5"
-thiserror = "1.0"
+thiserror = "2.0"
 zip = { version = "2.1", default-features = false, features = ["deflate"] }
 
 [features]
@@ -43,4 +42,3 @@ vfs-winfsp = []
 
 [dev-dependencies]
 tempfile = "3.10"
-lopdf = "0.33"

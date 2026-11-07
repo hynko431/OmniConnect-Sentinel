@@ -31,11 +31,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 async-trait.workspace = true
-thiserror = "1.0"
+thiserror = "2.0"
 hex = "0.4"
 
 # Document & Media parsing crates
-lopdf = "0.33"
+lopdf = { version = "0.45", default-features = false }
 zip = { version = "2.1", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 quick-xml = "0.42"

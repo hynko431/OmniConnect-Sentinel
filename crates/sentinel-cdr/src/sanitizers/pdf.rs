@@ -9,6 +9,9 @@ use crate::sanitizers::DisarmReportItem;
 
 const MAX_PDF_WALK_DEPTH: u32 = 64;
 
+/// Maximum permitted lexical array (`[...]`) and dictionary (`<<...>>`) nesting depth before `lopdf::Document::load_mem` (`RUSTSEC-2026-0187` `[Standard]`).
+pub const MAX_PDF_NESTING_DEPTH: usize = 64;
+
 /// Structural PDF Sanitizer (`BUG-CDR-06`, Phase 2.4)
 ///
 /// Parses the PDF Object AST via `lopdf`, selectively cleans `/Root -> /Names`
@@ -18,6 +21,100 @@ const MAX_PDF_WALK_DEPTH: u32 = 64;
 pub struct PdfSanitizer;
 
 impl PdfSanitizer {
+    pub const MAX_PDF_NESTING_DEPTH: usize = MAX_PDF_NESTING_DEPTH;
+
+    /// Single-pass `O(N)` lexical state machine that validates PDF array (`[`/`]`) and dictionary (`<<`/`>>`)
+    /// nesting depth prior to invoking `lopdf::Document::load_mem` (`RUSTSEC-2026-0187` mitigation).
+    /// Accurately tracks PDF comments (`%` outside strings until `\r` or `\n`) and PDF literal strings
+    /// (`(` ... `)` with nested balanced parentheses and `\` escapes) so `[` or `<<` inside comments
+    /// or literal strings never cause false positives.
+    pub fn validate_pdf_token_nesting_depth(raw: &[u8], max_depth: usize) -> Result<(), CdrError> {
+        let mut depth: usize = 0;
+        let mut in_comment = false;
+        let mut string_paren_depth: usize = 0;
+        let mut escaped = false;
+        let mut idx = 0;
+        let len = raw.len();
+
+        while idx < len {
+            let b = raw[idx];
+
+            if in_comment {
+                if b == b'\r' || b == b'\n' {
+                    in_comment = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if string_paren_depth > 0 {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'(' {
+                    string_paren_depth = string_paren_depth.saturating_add(1);
+                } else if b == b')' {
+                    string_paren_depth = string_paren_depth.saturating_sub(1);
+                }
+                idx += 1;
+                continue;
+            }
+
+            match b {
+                b'%' => {
+                    in_comment = true;
+                    idx += 1;
+                }
+                b'(' => {
+                    string_paren_depth = 1;
+                    escaped = false;
+                    idx += 1;
+                }
+                b'[' => {
+                    depth = depth.saturating_add(1);
+                    if depth > max_depth {
+                        return Err(CdrError::ResourceLimitExceeded(format!(
+                            "PDF structural nesting depth exceeds maximum allowed ({max_depth}) (RUSTSEC-2026-0187 mitigation)"
+                        )));
+                    }
+                    idx += 1;
+                }
+                b']' => {
+                    depth = depth.saturating_sub(1);
+                    idx += 1;
+                }
+                b'<' if idx + 1 < len && raw[idx + 1] == b'<' => {
+                    depth = depth.saturating_add(1);
+                    if depth > max_depth {
+                        return Err(CdrError::ResourceLimitExceeded(format!(
+                            "PDF structural nesting depth exceeds maximum allowed ({max_depth}) (RUSTSEC-2026-0187 mitigation)"
+                        )));
+                    }
+                    idx += 2;
+                }
+                b'>' if idx + 1 < len && raw[idx + 1] == b'>' => {
+                    depth = depth.saturating_sub(1);
+                    idx += 2;
+                }
+                _ => {
+                    idx += 1;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Pre-checks raw PDF byte budget and lexical array/dictionary nesting depth before `lopdf::Document::load_mem` (`RUSTSEC-2026-0187`).
+    pub fn precheck_stream_nesting_and_counts(
+        raw: &[u8],
+        budget: &mut ResourceBudget,
+    ) -> Result<(), CdrError> {
+        budget.charge_bytes(raw.len() as u64)?;
+        Self::validate_pdf_token_nesting_depth(raw, Self::MAX_PDF_NESTING_DEPTH)
+    }
+
     pub fn sanitize(
         input_bytes: &[u8],
         policy: &SanitizationPolicy,
@@ -31,6 +128,7 @@ impl PdfSanitizer {
         policy: &SanitizationPolicy,
         budget: &mut ResourceBudget,
     ) -> Result<(Vec<u8>, Vec<DisarmReportItem>), CdrError> {
+        Self::precheck_stream_nesting_and_counts(input_bytes, budget)?;
         let mut doc = Document::load_mem(input_bytes)
             .map_err(|e| CdrError::ParserCorruption(format!("PDF AST parse error: {}", e)))?;
 

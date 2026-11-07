@@ -65,6 +65,14 @@ impl ContentScanner {
                         .to_string(),
                     false,
                 ),
+                "PDF_DEEP_NESTING_ATTACK" => (
+                    CarrierCategory::Document,
+                    "Weaponized PDF: Excessive Structural Nesting Bomb".to_string(),
+                    ThreatSeverity::Critical,
+                    99,
+                    "T1499.004 (Application or System Exploitation / Parser DoS)".to_string(),
+                    false,
+                ),
                 "PDF_LAUNCH_ACTION" => (
                     CarrierCategory::Document,
                     "Weaponized PDF: /Launch OS Command Execution".to_string(),
@@ -536,6 +544,77 @@ impl ContentScanner {
         let mut saw_auto = false;
         let mut saw_embed = false;
         let mut saw_encrypt = false;
+        let mut saw_deep_nesting = false;
+        let mut nesting_depth: usize = 0;
+        let mut in_comment = false;
+        let mut string_paren_depth: usize = 0;
+        let mut escaped = false;
+        let mut pending_lt = false;
+        let mut pending_gt = false;
+
+        let mut advance_nesting_lexer = |slice: &[u8]| {
+            if saw_deep_nesting {
+                return;
+            }
+            for &b in slice {
+                if in_comment {
+                    if b == b'\r' || b == b'\n' {
+                        in_comment = false;
+                    }
+                    continue;
+                }
+                if string_paren_depth > 0 {
+                    if escaped {
+                        escaped = false;
+                    } else if b == b'\\' {
+                        escaped = true;
+                    } else if b == b'(' {
+                        string_paren_depth = string_paren_depth.saturating_add(1);
+                    } else if b == b')' {
+                        string_paren_depth = string_paren_depth.saturating_sub(1);
+                    }
+                    continue;
+                }
+                if pending_lt {
+                    pending_lt = false;
+                    if b == b'<' {
+                        nesting_depth = nesting_depth.saturating_add(1);
+                        if nesting_depth > 64 {
+                            saw_deep_nesting = true;
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                if pending_gt {
+                    pending_gt = false;
+                    if b == b'>' {
+                        nesting_depth = nesting_depth.saturating_sub(1);
+                        continue;
+                    }
+                }
+                match b {
+                    b'%' => in_comment = true,
+                    b'(' => {
+                        string_paren_depth = 1;
+                        escaped = false;
+                    }
+                    b'[' => {
+                        nesting_depth = nesting_depth.saturating_add(1);
+                        if nesting_depth > 64 {
+                            saw_deep_nesting = true;
+                            return;
+                        }
+                    }
+                    b']' => {
+                        nesting_depth = nesting_depth.saturating_sub(1);
+                    }
+                    b'<' => pending_lt = true,
+                    b'>' => pending_gt = true,
+                    _ => {}
+                }
+            }
+        };
 
         let mut check_window = |window: &[u8]| {
             if !saw_js
@@ -574,6 +653,7 @@ impl ContentScanner {
                 match reader.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => {
+                        advance_nesting_lexer(&chunk[..n]);
                         window.clear();
                         window.extend_from_slice(&overlap);
                         window.extend_from_slice(&chunk[..n]);
@@ -583,13 +663,26 @@ impl ContentScanner {
                         overlap.extend_from_slice(&chunk[tail_start..n]);
                     }
                     Err(_) => {
+                        advance_nesting_lexer(head_bytes);
                         check_window(head_bytes);
                         break;
                     }
                 }
             }
         } else {
+            advance_nesting_lexer(head_bytes);
             check_window(head_bytes);
+        }
+
+        if saw_deep_nesting {
+            findings.push(ContentFinding {
+                category: "PDF_DEEP_NESTING_ATTACK".to_string(),
+                severity: "CRITICAL".to_string(),
+                indicator: "PDF nesting depth > 64".to_string(),
+                description:
+                    "PDF array/dictionary nesting depth exceeded 64 levels (RUSTSEC-2026-0187 vector)"
+                        .to_string(),
+            });
         }
 
         if saw_encrypt {
@@ -976,5 +1069,37 @@ impl ContentScanner {
             }
         }
         entropy as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scan_pdf_reader_detects_deep_nesting_attack_rustsec_2026_0187() {
+        let mut deep_pdf = b"%PDF-1.7\n1 0 obj\n".to_vec();
+        deep_pdf.extend_from_slice(&b"[".repeat(80));
+        deep_pdf.extend_from_slice(&b"]".repeat(80));
+        deep_pdf.extend_from_slice(b"\nendobj\n%%EOF\n");
+
+        let findings = ContentScanner::scan(Path::new("bomb.pdf"), &deep_pdf);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == "PDF_DEEP_NESTING_ATTACK" && f.severity == "CRITICAL"),
+            "ContentScanner::scan must emit PDF_DEEP_NESTING_ATTACK (CRITICAL) when nesting exceeds 64, got: {findings:?}"
+        );
+
+        let mut safe_pdf = b"%PDF-1.7\n1 0 obj\n(".to_vec();
+        safe_pdf.extend_from_slice(&b"[".repeat(100));
+        safe_pdf.extend_from_slice(b")\nendobj\n%%EOF\n");
+        let safe_findings = ContentScanner::scan(Path::new("safe.pdf"), &safe_pdf);
+        assert!(
+            !safe_findings
+                .iter()
+                .any(|f| f.category == "PDF_DEEP_NESTING_ATTACK"),
+            "Brackets inside PDF string literals must not trigger PDF_DEEP_NESTING_ATTACK"
+        );
     }
 }
