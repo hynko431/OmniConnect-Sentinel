@@ -1,0 +1,7 @@
+# RustSec cargo-audit configuration aligned with zero-ignore supply-chain policy in deny.toml
+[advisories]
+ignore = []
+
+[yanked]
+enabled = true
+update_index = true

@@ -41,20 +41,18 @@ impl Default for SentinelConfig {
         Self {
             node_id: uuid::Uuid::new_v4().to_string(),
             environment: AgentMode::EnterpriseManaged,
-            cdr_service_endpoint: "http://127.0.0.1:50051".to_string(),
+            cdr_service_endpoint: sentinel_sys::DEFAULT_NAMED_PIPE_ENDPOINT.to_string(),
             quarantine_vault_path: PathBuf::from(r"C:\ProgramData\OmniConnect\Quarantine"),
             vfs_provider: VfsProviderPreference::AutoDetect,
             auto_sanitize_removable_media: true,
             charge_only_fallback_enabled: true,
             telemetry_reporting_enabled: true,
-            hardware_whitelist: vec![
-                HardwareIdentifier {
-                    vendor_id: 0x0781, // SanDisk Enterprise Token
-                    product_id: 0x5583,
-                    serial_number: None,
-                    friendly_name: "Corporate Encrypted Hardware Key".to_string(),
-                },
-            ],
+            hardware_whitelist: vec![HardwareIdentifier {
+                vendor_id: 0x0781, // SanDisk Enterprise Token
+                product_id: 0x5583,
+                serial_number: None,
+                friendly_name: "Corporate Encrypted Hardware Key".to_string(),
+            }],
         }
     }
 }

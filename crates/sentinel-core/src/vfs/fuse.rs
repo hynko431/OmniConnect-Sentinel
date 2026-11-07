@@ -1,49 +1,180 @@
-use super::{VfsError, VirtualStorageProvider};
 use async_trait::async_trait;
+#[cfg(not(unix))]
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
 use tracing::info;
+#[cfg(target_os = "linux")]
+use tracing::warn;
 
-pub struct UnixFuseProvider;
+use crate::vfs::{ShadowCacheManager, VirtualFileSystemProvider};
 
-impl UnixFuseProvider {
+/// Linux FUSE3 Read-Only Userspace VFS Provider (`BUG-CORE-13`, `Row 150`, Phase 3.2)
+///
+/// Ingests removable volumes once into the encrypted `ShadowCacheManager` (`/var/lib/omniconnect/shadow_cache/<session>`),
+/// enforces read-only mount permissions on `virtual_mount_point` (using `bindfs`/`fusermount3` when
+/// `/dev/fuse` is available, or read-only on-demand hydration), and decrypts/verifies `sanitized_sha256`
+/// before serving any file.
+pub struct FuseVfsProvider {
+    shadow_cache: Arc<ShadowCacheManager>,
+    active_root: Arc<Mutex<Option<PathBuf>>>,
+    fuse_mounted: Arc<Mutex<bool>>,
+}
+
+impl Default for FuseVfsProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FuseVfsProvider {
     pub fn new() -> Self {
-        Self
+        Self {
+            shadow_cache: Arc::new(ShadowCacheManager::new()),
+            active_root: Arc::new(Mutex::new(None)),
+            fuse_mounted: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    pub fn read_projected_file(&self, relative_path: &Path) -> Result<Vec<u8>, String> {
+        let root = self
+            .active_root
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clone()
+            .ok_or_else(|| "FUSE3 mount root is not active".to_string())?;
+        self.shadow_cache.read_projected_file(&root, relative_path)
     }
 }
 
 #[async_trait]
-impl VirtualStorageProvider for UnixFuseProvider {
-    fn provider_name(&self) -> &'static str {
-        "Unix FUSE (Filesystem in Userspace)"
-    }
-
-    async fn is_supported(&self) -> bool {
-        #[cfg(not(target_os = "windows"))]
-        {
-            Path::new("/dev/fuse").exists()
-        }
-        #[cfg(target_os = "windows")]
-        {
-            false
-        }
-    }
-
-    async fn mount_virtual_volume(
+impl VirtualFileSystemProvider for FuseVfsProvider {
+    async fn mount_sanitized_volume(
         &self,
-        raw_source_path: &Path,
-        virtual_mount_point: &str,
-    ) -> Result<PathBuf, VfsError> {
+        raw_volume_path: &Path,
+        virtual_mount_point: &Path,
+    ) -> Result<(), String> {
         info!(
-            "Mounting FUSE loopback from {:?} to '{}'",
-            raw_source_path, virtual_mount_point
+            "FUSE3 mounting read-once sanitized projection: {} -> {}",
+            raw_volume_path.display(),
+            virtual_mount_point.display()
         );
 
-        let target_path = PathBuf::from(virtual_mount_point);
-        Ok(target_path)
+        let cache = Arc::clone(&self.shadow_cache);
+        let raw_buf = raw_volume_path.to_path_buf();
+        let virt_buf = virtual_mount_point.to_path_buf();
+
+        tokio::task::spawn_blocking(move || cache.ingest_volume_read_once(&raw_buf, &virt_buf))
+            .await
+            .map_err(|e| format!("FUSE3 ingestion join error: {e}"))??;
+
+        #[cfg(target_os = "linux")]
+        {
+            if Path::new("/dev/fuse").exists() {
+                if let Ok(status) = Command::new("bindfs")
+                    .args([
+                        "-r",
+                        "--no-allow-other",
+                        &virtual_mount_point.to_string_lossy(),
+                        &virtual_mount_point.to_string_lossy(),
+                    ])
+                    .status()
+                {
+                    if status.success() {
+                        if let Ok(mut fm) = self.fuse_mounted.lock() {
+                            *fm = true;
+                        }
+                    }
+                }
+            } else {
+                warn!("FUSE3 /dev/fuse device not present; using read-only ShadowCache hydration");
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                virtual_mount_point,
+                std::fs::Permissions::from_mode(0o500),
+            );
+        }
+        #[cfg(not(unix))]
+        if let Ok(meta) = fs::metadata(virtual_mount_point) {
+            let mut perms = meta.permissions();
+            perms.set_readonly(true);
+            let _ = fs::set_permissions(virtual_mount_point, perms);
+        }
+
+        if let Ok(mut guard) = self.active_root.lock() {
+            *guard = Some(virtual_mount_point.to_path_buf());
+        }
+        Ok(())
     }
 
-    async fn unmount_volume(&self, virtual_mount_point: &str) -> Result<(), VfsError> {
-        info!("Unmounting FUSE mount point at '{}'", virtual_mount_point);
+    async fn on_file_first_open(&self, relative_path: &Path) -> Result<PathBuf, String> {
+        let root = self
+            .active_root
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clone()
+            .ok_or_else(|| "FUSE3 mount root is not active".to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = sentinel_sys::normalize_file_attributes(&root);
+        }
+        let res = self
+            .shadow_cache
+            .resolve_projected_file(&root, relative_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500));
+        }
+        #[cfg(not(unix))]
+        if let Ok(meta) = fs::metadata(&root) {
+            let mut perms = meta.permissions();
+            perms.set_readonly(true);
+            let _ = fs::set_permissions(&root, perms);
+        }
+        res
+    }
+
+    async fn unmount_volume(&self, virtual_mount_point: &Path) -> Result<(), String> {
+        info!(
+            "FUSE3 unmounting volume and crypto-erasing session cache: {}",
+            virtual_mount_point.display()
+        );
+        if let Ok(mut fm) = self.fuse_mounted.lock() {
+            if *fm {
+                let _ = Command::new("fusermount3")
+                    .args(["-u", &virtual_mount_point.to_string_lossy()])
+                    .status();
+                *fm = false;
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                virtual_mount_point,
+                std::fs::Permissions::from_mode(0o700),
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = sentinel_sys::normalize_file_attributes(virtual_mount_point);
+        }
+        self.shadow_cache.teardown_session(virtual_mount_point)?;
+        if let Ok(mut guard) = self.active_root.lock() {
+            *guard = None;
+        }
         Ok(())
     }
 }

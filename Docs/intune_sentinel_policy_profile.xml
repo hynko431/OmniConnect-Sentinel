@@ -1,36 +1,64 @@
-<?xml version="1.0" encoding="utf-8"?>
-<SyncML xmlns="SYNCML:SYNCML1.2">
-  <SyncBody>
-    <!-- OmniConnect Sentinel Zero-Trust Peripheral Management Profile -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- OmniConnect Sentinel - Microsoft Intune OMA-URI SyncML Configuration Profile -->
+<SyncBody>
+  <Replace>
+    <CmdID>1</CmdID>
     <Item>
       <Target>
-        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnect~Policy~Sentinel/EnforceRemovableMediaCDR</LocURI>
+        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnectSentinel/PolicyId</LocURI>
       </Target>
-      <Data>1</Data>
+      <Meta>
+        <Format xmlns="syncml:metinf">chr</Format>
+      </Meta>
+      <Data>MDM-POL-SENTINEL-ZERO-TRUST-001</Data>
     </Item>
+  </Replace>
+  <Replace>
+    <CmdID>2</CmdID>
     <Item>
       <Target>
-        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnect~Policy~Sentinel/BlockUnauthorizedUSBHID</LocURI>
+        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnectSentinel/BlockCompositeHidStorage</LocURI>
       </Target>
-      <Data>1</Data>
+      <Meta>
+        <Format xmlns="syncml:metinf">bool</Format>
+      </Meta>
+      <Data>true</Data>
     </Item>
+  </Replace>
+  <Replace>
+    <CmdID>3</CmdID>
     <Item>
       <Target>
-        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnect~Policy~Sentinel/ChargeOnlyFallback</LocURI>
+        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnectSentinel/EnforceStrictCdr</LocURI>
       </Target>
-      <Data>1</Data>
+      <Meta>
+        <Format xmlns="syncml:metinf">bool</Format>
+      </Meta>
+      <Data>true</Data>
     </Item>
+  </Replace>
+  <Replace>
+    <CmdID>4</CmdID>
     <Item>
       <Target>
-        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnect~Policy~Sentinel/MaxFileSizeMB</LocURI>
+        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnectSentinel/AllowedHardwareIds</LocURI>
       </Target>
-      <Data>250</Data>
+      <Meta>
+        <Format xmlns="syncml:metinf">chr</Format>
+      </Meta>
+      <Data>USB\VID_0781&amp;*;USB\VID_0951&amp;*</Data>
     </Item>
+  </Replace>
+  <Replace>
+    <CmdID>5</CmdID>
     <Item>
       <Target>
-        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnect~Policy~Sentinel/HardwareWhitelist</LocURI>
+        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnectSentinel/EnforcementMode</LocURI>
       </Target>
-      <Data>USB\VID_0781&*;USB\VID_0951&*</Data>
+      <Meta>
+        <Format xmlns="syncml:metinf">chr</Format>
+      </Meta>
+      <Data>ENFORCE_STRICT</Data>
     </Item>
-  </SyncBody>
-</SyncML>
+  </Replace>
+</SyncBody>
