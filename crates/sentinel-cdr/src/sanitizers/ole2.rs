@@ -49,8 +49,7 @@ impl Ole2Sanitizer {
         let sector_shift = u16::from_le_bytes([input[30], input[31]]) as usize;
         if sector_shift != 9 && sector_shift != 12 {
             return Err(CdrError::ParserCorruption(format!(
-                "Unsupported OLE2 sector shift: {}",
-                sector_shift
+                "Unsupported OLE2 sector shift: {sector_shift}"
             )));
         }
         let sector_size = 1usize << sector_shift;
@@ -110,15 +109,16 @@ impl Ole2Sanitizer {
 
             // Valid CFB directory entry types: 1 = Storage, 2 = Stream, 5 = Root
             if !matches!(obj_type, 1 | 2 | 5)
-                || name_len < 2
-                || name_len > 64
-                || (name_len % 2 != 0)
+                || !(2..=64).contains(&name_len)
+                || !name_len.is_multiple_of(2)
             {
                 continue;
             }
 
             let utf16_chars: Vec<u16> = entry[..name_len - 2]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             if utf16_chars.iter().any(|&c| c == 0 || c < 0x20) {
@@ -187,7 +187,7 @@ impl Ole2Sanitizer {
                     } else {
                         "OLE2_EMBEDDED_PACKAGE"
                     },
-                    format!("CFB_Directory/{}", name),
+                    format!("CFB_Directory/{name}"),
                     "WIPED_STREAM_SECTORS_AND_DIRECTORY",
                 ));
             }
@@ -231,14 +231,15 @@ impl Ole2Sanitizer {
             let name_len = u16::from_le_bytes([entry[64], entry[65]]) as usize;
             let obj_type = entry[66];
             if !matches!(obj_type, 1 | 2 | 5)
-                || name_len < 2
-                || name_len > 64
-                || (name_len % 2 != 0)
+                || !(2..=64).contains(&name_len)
+                || !name_len.is_multiple_of(2)
             {
                 continue;
             }
             let utf16_chars: Vec<u16> = entry[..name_len - 2]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             if utf16_chars.iter().any(|&c| c == 0 || c < 0x20) {

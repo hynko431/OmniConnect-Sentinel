@@ -67,7 +67,7 @@ impl VirtualFileSystemProvider for FuseVfsProvider {
 
         tokio::task::spawn_blocking(move || cache.ingest_volume_read_once(&raw_buf, &virt_buf))
             .await
-            .map_err(|e| format!("FUSE3 ingestion join error: {}", e))??;
+            .map_err(|e| format!("FUSE3 ingestion join error: {e}"))??;
 
         #[cfg(target_os = "linux")]
         {

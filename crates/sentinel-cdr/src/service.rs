@@ -231,8 +231,7 @@ impl CdrGrpcService {
                                         result: Some(disarm_response::Result::Error(DisarmError {
                                             code: "RESOURCE_LIMIT_EXCEEDED".to_string(),
                                             message: format!(
-                                                "Stream payload exceeds policy maximum of {} bytes",
-                                                max_stream_bytes
+                                                "Stream payload exceeds policy maximum of {max_stream_bytes} bytes"
                                             ),
                                             recoverable: false,
                                         })),
@@ -418,8 +417,8 @@ impl ContentDisarmService for CdrGrpcService {
             launcher.inspect_isolated(&req.header_bytes, &req.file_name)
         })
         .await
-        .map_err(|e| Status::internal(format!("Inspect worker join error: {}", e)))?
-        .map_err(|e| Status::internal(format!("Sandboxed inspect worker error: {}", e)))?;
+        .map_err(|e| Status::internal(format!("Inspect worker join error: {e}")))?
+        .map_err(|e| Status::internal(format!("Sandboxed inspect worker error: {e}")))?;
 
         let proto_format = Self::map_detected_format(assessment.detected_format);
 

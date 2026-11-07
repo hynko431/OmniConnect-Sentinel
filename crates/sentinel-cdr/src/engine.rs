@@ -437,17 +437,15 @@ impl CdrEngine {
                 )
                 .map_err(|e| {
                     CdrError::OutputRejected(format!(
-                        "CDR_OUTPUT_REJECTED: Sanitized PDF failed nesting depth precheck: {}",
-                        e
+                        "CDR_OUTPUT_REJECTED: Sanitized PDF failed nesting depth precheck: {e}"
                     ))
                 })?;
                 let doc = lopdf::Document::load_mem(clean_bytes).map_err(|e| {
                     CdrError::OutputRejected(format!(
-                        "CDR_OUTPUT_REJECTED: Sanitized PDF failed AST re-parse: {}",
-                        e
+                        "CDR_OUTPUT_REJECTED: Sanitized PDF failed AST re-parse: {e}"
                     ))
                 })?;
-                for (_, obj) in &doc.objects {
+                for obj in doc.objects.values() {
                     Self::verify_pdf_object_clean(obj, policy)?;
                 }
             }
@@ -467,8 +465,7 @@ impl CdrEngine {
                 }
                 let mut archive = ZipArchive::new(Cursor::new(clean_bytes)).map_err(|e| {
                     CdrError::OutputRejected(format!(
-                        "CDR_OUTPUT_REJECTED: Sanitized OOXML/ZIP is not a valid ZIP: {}",
-                        e
+                        "CDR_OUTPUT_REJECTED: Sanitized OOXML/ZIP is not a valid ZIP: {e}"
                     ))
                 })?;
                 if archive.len() > OpenXmlSanitizer::MAX_OOXML_ENTRIES {
@@ -481,16 +478,14 @@ impl CdrEngine {
                 for i in 0..archive.len() {
                     let mut entry = archive.by_index(i).map_err(|e| {
                         CdrError::OutputRejected(format!(
-                            "CDR_OUTPUT_REJECTED: Invalid ZIP entry {}: {}",
-                            i, e
+                            "CDR_OUTPUT_REJECTED: Invalid ZIP entry {i}: {e}"
                         ))
                     })?;
                     let raw_entry_name = entry
                         .name()
                         .map_err(|e| {
                             CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Invalid UTF-8 ZIP entry name in sanitized output: {}",
-                                e
+                                "CDR_OUTPUT_REJECTED: Invalid UTF-8 ZIP entry name in sanitized output: {e}"
                             ))
                         })?
                         .into_owned();
@@ -502,40 +497,36 @@ impl CdrEngine {
                         )
                         .map_err(|e| {
                             CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Unsafe ZIP entry in sanitized output: {}",
-                                e
+                                "CDR_OUTPUT_REJECTED: Unsafe ZIP entry in sanitized output: {e}"
                             ))
                         })?;
                     if had_suid_sgid || (entry.unix_mode().unwrap_or(0) & 0o7000) != 0 {
                         return Err(CdrError::OutputRejected(format!(
-                            "CDR_OUTPUT_REJECTED: Residual SUID/SGID/sticky mode bits on ZIP entry '{}'",
-                            normalized_name
+                            "CDR_OUTPUT_REJECTED: Residual SUID/SGID/sticky mode bits on ZIP entry '{normalized_name}'"
                         )));
                     }
                     let lower = normalized_name.to_ascii_lowercase();
-                    if !is_generic_zip && policy.strip_office_macros {
-                        if lower.ends_with("vbaproject.bin")
+                    if !is_generic_zip
+                        && policy.strip_office_macros
+                        && (lower.ends_with("vbaproject.bin")
                             || lower.ends_with("vbaprojectsignature.bin")
                             || lower.ends_with("xlmacrosheet.xml")
-                            || lower.contains("/macrosheets/")
-                        {
-                            return Err(CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Residual macro artifact '{}' in sanitized OOXML",
-                                lower
+                            || lower.contains("/macrosheets/"))
+                    {
+                        return Err(CdrError::OutputRejected(format!(
+                                "CDR_OUTPUT_REJECTED: Residual macro artifact '{lower}' in sanitized OOXML"
                             )));
-                        }
                     }
-                    if !is_generic_zip && policy.strip_office_ole_objects {
-                        if lower.contains("/embeddings/")
+                    if !is_generic_zip
+                        && policy.strip_office_ole_objects
+                        && (lower.contains("/embeddings/")
                             || lower.starts_with("embeddings/")
                             || lower.contains("/activex/")
-                            || lower.starts_with("activex/")
-                        {
-                            return Err(CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Residual OLE/ActiveX object '{}' in sanitized OOXML",
-                                lower
+                            || lower.starts_with("activex/"))
+                    {
+                        return Err(CdrError::OutputRejected(format!(
+                                "CDR_OUTPUT_REJECTED: Residual OLE/ActiveX object '{lower}' in sanitized OOXML"
                             )));
-                        }
                     }
                     if !is_generic_zip
                         && policy.sanitize_office_external_relationships
@@ -549,14 +540,12 @@ impl CdrEngine {
                         )
                         .map_err(|e| {
                             CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Failed reading .rels entry {}: {}",
-                                lower, e
+                                "CDR_OUTPUT_REJECTED: Failed reading .rels entry {lower}: {e}"
                             ))
                         })?;
                         if (rels_bytes.len() as u64) > MAX_VERIFY_XML_ENTRY_BYTES {
                             return Err(CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: .rels entry {} exceeds MAX_VERIFY_XML_ENTRY_BYTES",
-                                lower
+                                "CDR_OUTPUT_REJECTED: .rels entry {lower} exceeds MAX_VERIFY_XML_ENTRY_BYTES"
                             )));
                         }
                         Self::verify_rels_clean(&rels_bytes, policy)?;
@@ -570,20 +559,17 @@ impl CdrEngine {
                         )
                         .map_err(|e| {
                             CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Failed reading .xml entry {}: {}",
-                                lower, e
+                                "CDR_OUTPUT_REJECTED: Failed reading .xml entry {lower}: {e}"
                             ))
                         })?;
                         if (xml_bytes.len() as u64) > MAX_VERIFY_XML_ENTRY_BYTES {
                             return Err(CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: .xml entry {} exceeds MAX_VERIFY_XML_ENTRY_BYTES",
-                                lower
+                                "CDR_OUTPUT_REJECTED: .xml entry {lower} exceeds MAX_VERIFY_XML_ENTRY_BYTES"
                             )));
                         }
                         let xml_str = std::str::from_utf8(&xml_bytes).map_err(|e| {
                             CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Invalid UTF-8 in .xml entry {}: {}",
-                                lower, e
+                                "CDR_OUTPUT_REJECTED: Invalid UTF-8 in .xml entry {lower}: {e}"
                             ))
                         })?;
                         let xml_lower = xml_str.to_ascii_lowercase();
@@ -593,8 +579,7 @@ impl CdrEngine {
                             || xml_lower.contains("<!entity")
                         {
                             return Err(CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Residual DDE/ENTITY marker in OOXML entry {}",
-                                lower
+                                "CDR_OUTPUT_REJECTED: Residual DDE/ENTITY marker in OOXML entry {lower}"
                             )));
                         }
                     }
@@ -603,8 +588,7 @@ impl CdrEngine {
             DetectedFormat::Svg => {
                 let s = std::str::from_utf8(clean_bytes).map_err(|e| {
                     CdrError::OutputRejected(format!(
-                        "CDR_OUTPUT_REJECTED: Invalid UTF-8 in sanitized SVG: {}",
-                        e
+                        "CDR_OUTPUT_REJECTED: Invalid UTF-8 in sanitized SVG: {e}"
                     ))
                 })?;
                 let lower = s.to_ascii_lowercase();
@@ -651,16 +635,14 @@ impl CdrEngine {
                             let tag_lower = e.local_name().as_ref().to_ascii_lowercase();
                             if SvgSanitizer::is_forbidden_tag(&tag_lower) {
                                 return Err(CdrError::OutputRejected(format!(
-                                    "CDR_OUTPUT_REJECTED: Residual <{}> in sanitized SVG",
-                                    tag_lower
+                                    "CDR_OUTPUT_REJECTED: Residual <{tag_lower}> in sanitized SVG"
                                 )));
                             }
                             let validated_attrs =
                                 crate::sanitizers::collect_validated_xml_attributes(e).map_err(
                                     |err| {
                                         CdrError::OutputRejected(format!(
-                                            "CDR_OUTPUT_REJECTED: Malformed SVG attribute: {}",
-                                            err
+                                            "CDR_OUTPUT_REJECTED: Malformed SVG attribute: {err}"
                                         ))
                                     },
                                 )?;
@@ -669,14 +651,12 @@ impl CdrEngine {
                                 let v = attr.value.trim().to_ascii_lowercase();
                                 if k.starts_with("on") {
                                     return Err(CdrError::OutputRejected(format!(
-                                        "CDR_OUTPUT_REJECTED: Residual event handler '{}' in sanitized SVG",
-                                        k
+                                        "CDR_OUTPUT_REJECTED: Residual event handler '{k}' in sanitized SVG"
                                     )));
                                 }
                                 if (k == "href" || k.ends_with(":href")) && !v.starts_with('#') {
                                     return Err(CdrError::OutputRejected(format!(
-                                        "CDR_OUTPUT_REJECTED: Residual non-anchor href '{}' in sanitized SVG",
-                                        v
+                                        "CDR_OUTPUT_REJECTED: Residual non-anchor href '{v}' in sanitized SVG"
                                     )));
                                 }
                                 if k == "style" && SvgSanitizer::has_dangerous_css(&v) {
@@ -699,16 +679,14 @@ impl CdrEngine {
                             let tag_lower = e.local_name().as_ref().to_ascii_lowercase();
                             if SvgSanitizer::is_forbidden_tag(&tag_lower) {
                                 return Err(CdrError::OutputRejected(format!(
-                                    "CDR_OUTPUT_REJECTED: Residual <{}> in sanitized SVG",
-                                    tag_lower
+                                    "CDR_OUTPUT_REJECTED: Residual <{tag_lower}> in sanitized SVG"
                                 )));
                             }
                             let validated_attrs =
                                 crate::sanitizers::collect_validated_xml_attributes(e).map_err(
                                     |err| {
                                         CdrError::OutputRejected(format!(
-                                            "CDR_OUTPUT_REJECTED: Malformed SVG attribute: {}",
-                                            err
+                                            "CDR_OUTPUT_REJECTED: Malformed SVG attribute: {err}"
                                         ))
                                     },
                                 )?;
@@ -717,14 +695,12 @@ impl CdrEngine {
                                 let v = attr.value.trim().to_ascii_lowercase();
                                 if k.starts_with("on") {
                                     return Err(CdrError::OutputRejected(format!(
-                                        "CDR_OUTPUT_REJECTED: Residual event handler '{}' in sanitized SVG",
-                                        k
+                                        "CDR_OUTPUT_REJECTED: Residual event handler '{k}' in sanitized SVG"
                                     )));
                                 }
                                 if (k == "href" || k.ends_with(":href")) && !v.starts_with('#') {
                                     return Err(CdrError::OutputRejected(format!(
-                                        "CDR_OUTPUT_REJECTED: Residual non-anchor href '{}' in sanitized SVG",
-                                        v
+                                        "CDR_OUTPUT_REJECTED: Residual non-anchor href '{v}' in sanitized SVG"
                                     )));
                                 }
                                 if k == "style" && SvgSanitizer::has_dangerous_css(&v) {
@@ -741,8 +717,7 @@ impl CdrEngine {
                         Ok(_) => {}
                         Err(e) => {
                             return Err(CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Malformed sanitized SVG XML: {}",
-                                e
+                                "CDR_OUTPUT_REJECTED: Malformed sanitized SVG XML: {e}"
                             )));
                         }
                     }
@@ -752,8 +727,7 @@ impl CdrEngine {
             DetectedFormat::Jpeg => {
                 let scan = ImageSanitizer::scan_jpeg_structure(clean_bytes).map_err(|e| {
                     CdrError::OutputRejected(format!(
-                        "CDR_OUTPUT_REJECTED: Invalid sanitized JPEG structure: {}",
-                        e
+                        "CDR_OUTPUT_REJECTED: Invalid sanitized JPEG structure: {e}"
                     ))
                 })?;
                 if policy.truncate_image_overlays && scan.trailing_overlay_bytes > 0 {
@@ -772,8 +746,7 @@ impl CdrEngine {
             DetectedFormat::Png => {
                 let scan = ImageSanitizer::scan_png_structure(clean_bytes).map_err(|e| {
                     CdrError::OutputRejected(format!(
-                        "CDR_OUTPUT_REJECTED: Invalid sanitized PNG structure: {}",
-                        e
+                        "CDR_OUTPUT_REJECTED: Invalid sanitized PNG structure: {e}"
                     ))
                 })?;
                 if policy.truncate_image_overlays && scan.trailing_overlay_bytes > 0 {
@@ -792,8 +765,7 @@ impl CdrEngine {
             DetectedFormat::WebP => {
                 let scan = ImageSanitizer::scan_webp_structure(clean_bytes).map_err(|e| {
                     CdrError::OutputRejected(format!(
-                        "CDR_OUTPUT_REJECTED: Invalid sanitized WebP structure: {}",
-                        e
+                        "CDR_OUTPUT_REJECTED: Invalid sanitized WebP structure: {e}"
                     ))
                 })?;
                 if policy.truncate_image_overlays && scan.trailing_overlay_bytes > 0 {
@@ -820,8 +792,7 @@ impl CdrEngine {
             DetectedFormat::PlainText | DetectedFormat::Csv => {
                 let text = std::str::from_utf8(clean_bytes).map_err(|e| {
                     CdrError::OutputRejected(format!(
-                        "CDR_OUTPUT_REJECTED: Sanitized Text/CSV is not valid UTF-8: {}",
-                        e
+                        "CDR_OUTPUT_REJECTED: Sanitized Text/CSV is not valid UTF-8: {e}"
                     ))
                 })?;
                 if text.chars().any(TextCsvSanitizer::is_bidi_override_char) {
@@ -943,8 +914,7 @@ impl CdrEngine {
                     let validated_attrs = crate::sanitizers::collect_validated_xml_attributes(e)
                         .map_err(|err| {
                             CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Malformed .rels XML attribute: {}",
-                                err
+                                "CDR_OUTPUT_REJECTED: Malformed .rels XML attribute: {err}"
                             ))
                         })?;
                     let local = e.name().local_name().into_inner().to_ascii_lowercase();
@@ -978,8 +948,7 @@ impl CdrEngine {
                                 && !policy.strip_external_hyperlinks;
                         if has_dangerous_scheme || (is_external && !is_benign_hyperlink) {
                             return Err(CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Residual external/unsafe relationship targeting '{}'",
-                                target
+                                "CDR_OUTPUT_REJECTED: Residual external/unsafe relationship targeting '{target}'"
                             )));
                         }
                     }
@@ -994,8 +963,7 @@ impl CdrEngine {
                     let validated_attrs = crate::sanitizers::collect_validated_xml_attributes(e)
                         .map_err(|err| {
                             CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Malformed .rels XML attribute: {}",
-                                err
+                                "CDR_OUTPUT_REJECTED: Malformed .rels XML attribute: {err}"
                             ))
                         })?;
                     let local = e.name().local_name().into_inner().to_ascii_lowercase();
@@ -1029,8 +997,7 @@ impl CdrEngine {
                                 && !policy.strip_external_hyperlinks;
                         if has_dangerous_scheme || (is_external && !is_benign_hyperlink) {
                             return Err(CdrError::OutputRejected(format!(
-                                "CDR_OUTPUT_REJECTED: Residual external/unsafe relationship targeting '{}'",
-                                target
+                                "CDR_OUTPUT_REJECTED: Residual external/unsafe relationship targeting '{target}'"
                             )));
                         }
                     }
@@ -1041,8 +1008,7 @@ impl CdrEngine {
                 Ok(_) => {}
                 Err(e) => {
                     return Err(CdrError::OutputRejected(format!(
-                        "CDR_OUTPUT_REJECTED: Malformed .rels XML in output: {}",
-                        e
+                        "CDR_OUTPUT_REJECTED: Malformed .rels XML in output: {e}"
                     )));
                 }
             }
@@ -1104,17 +1070,15 @@ impl CdrEngine {
         let mut is_malicious_polyglot = false;
 
         let lower_name = file_name.to_ascii_lowercase();
-        if !lower_name.is_empty() {
-            if (lower_name.ends_with(".pdf") && detected_format != DetectedFormat::Pdf)
+        if !lower_name.is_empty()
+            && ((lower_name.ends_with(".pdf") && detected_format != DetectedFormat::Pdf)
                 || ((lower_name.ends_with(".jpg") || lower_name.ends_with(".jpeg"))
                     && detected_format != DetectedFormat::Jpeg)
-                || (lower_name.ends_with(".png") && detected_format != DetectedFormat::Png)
-            {
-                risk_tags.push(format!(
-                    "EXTENSION_MISMATCH: File '{}' has true format {:?}",
-                    file_name, detected_format
-                ));
-            }
+                || (lower_name.ends_with(".png") && detected_format != DetectedFormat::Png))
+        {
+            risk_tags.push(format!(
+                "EXTENSION_MISMATCH: File '{file_name}' has true format {detected_format:?}"
+            ));
         }
 
         // Check for polyglot / dual-signature markers (using structural bounds for images)
@@ -1165,7 +1129,7 @@ impl CdrEngine {
                 {
                     risk_tags.push("PDF_EXCESSIVE_NESTING_DEPTH".to_string());
                 } else if let Ok(doc) = lopdf::Document::load_mem(bytes) {
-                    for (_, obj) in &doc.objects {
+                    for obj in doc.objects.values() {
                         Self::inspect_pdf_object_risks(obj, &mut risk_tags);
                     }
                 }

@@ -69,7 +69,7 @@ impl NtfsAdsScanner {
 
             findings.push(AdsThreatFinding {
                 host_file_path: path.to_string_lossy().to_string(),
-                stream_name: format!(":{}", clean_name),
+                stream_name: format!(":{clean_name}"),
                 stream_size_bytes,
                 is_executable_payload: is_exec,
                 threat_summary: summary,
@@ -88,8 +88,7 @@ impl NtfsAdsScanner {
             return (
                 true,
                 format!(
-                    "Concealed Windows PE executable (MZ) in NTFS stream ':{}' ({} bytes)",
-                    stream_name, size_bytes
+                    "Concealed Windows PE executable (MZ) in NTFS stream ':{stream_name}' ({size_bytes} bytes)"
                 ),
             );
         }
@@ -97,8 +96,7 @@ impl NtfsAdsScanner {
             return (
                 true,
                 format!(
-                    "Concealed Linux ELF binary in NTFS stream ':{}' ({} bytes)",
-                    stream_name, size_bytes
+                    "Concealed Linux ELF binary in NTFS stream ':{stream_name}' ({size_bytes} bytes)"
                 ),
             );
         }
@@ -106,8 +104,7 @@ impl NtfsAdsScanner {
             return (
                 true,
                 format!(
-                    "Concealed ZIP/OOXML container in NTFS stream ':{}' ({} bytes)",
-                    stream_name, size_bytes
+                    "Concealed ZIP/OOXML container in NTFS stream ':{stream_name}' ({size_bytes} bytes)"
                 ),
             );
         }
@@ -126,8 +123,7 @@ impl NtfsAdsScanner {
             return (
                 true,
                 format!(
-                    "Executable or script extension in NTFS stream ':{}' ({} bytes)",
-                    stream_name, size_bytes
+                    "Executable or script extension in NTFS stream ':{stream_name}' ({size_bytes} bytes)"
                 ),
             );
         }
@@ -135,8 +131,7 @@ impl NtfsAdsScanner {
         (
             false,
             format!(
-                "Unrecognized NTFS Alternate Data Stream ':{}' ({} bytes)",
-                stream_name, size_bytes
+                "Unrecognized NTFS Alternate Data Stream ':{stream_name}' ({size_bytes} bytes)"
             ),
         )
     }

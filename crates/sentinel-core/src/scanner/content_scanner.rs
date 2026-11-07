@@ -273,10 +273,9 @@ impl ContentScanner {
             findings.push(ContentFinding {
                 category: "BLOCKED_CONTAINER_OR_SHORTCUT".to_string(),
                 severity: "CRITICAL".to_string(),
-                indicator: format!(".{}", ext),
+                indicator: format!(".{ext}"),
                 description: format!(
-                    "Default-deny format allowlist quarantined high-risk container/shortcut '{}' (.{} bypasses MOTW or executes host code)",
-                    file_name, ext
+                    "Default-deny format allowlist quarantined high-risk container/shortcut '{file_name}' (.{ext} bypasses MOTW or executes host code)"
                 ),
             });
         }
@@ -315,8 +314,7 @@ impl ContentScanner {
                     severity: "CRITICAL".to_string(),
                     indicator: ind.to_string(),
                     description: format!(
-                        "Default-deny format allowlist quarantined container '{}' matching {}",
-                        file_name, ind
+                        "Default-deny format allowlist quarantined container '{file_name}' matching {ind}"
                     ),
                 });
             }
@@ -332,8 +330,7 @@ impl ContentScanner {
                 severity: "HIGH".to_string(),
                 indicator: "Encrypted ZIP Archive".to_string(),
                 description: format!(
-                    "Password-protected/encrypted archive '{}' blocked by default-deny allowlist",
-                    file_name
+                    "Password-protected/encrypted archive '{file_name}' blocked by default-deny allowlist"
                 ),
             });
         }
@@ -450,10 +447,9 @@ impl ContentScanner {
                 findings.push(ContentFinding {
                     category: "RANSOMWARE_ENCRYPTED_ARTIFACT".to_string(),
                     severity: "CRITICAL".to_string(),
-                    indicator: format!(".{} (Entropy: {:.2} bits/byte)", ext, entropy),
+                    indicator: format!(".{ext} (Entropy: {entropy:.2} bits/byte)"),
                     description: format!(
-                        "High-entropy ({:.2} b/B) file with known ransomware extension '.{}'",
-                        entropy, ext
+                        "High-entropy ({entropy:.2} b/B) file with known ransomware extension '.{ext}'"
                     ),
                 });
             }
@@ -493,8 +489,7 @@ impl ContentScanner {
                     severity: "HIGH".to_string(),
                     indicator: file_name.to_string(),
                     description: format!(
-                        "Ransomware extortion note detected ({} ransom indicators in '{}')",
-                        matched_keywords, file_name
+                        "Ransomware extortion note detected ({matched_keywords} ransom indicators in '{file_name}')"
                     ),
                 });
             }
@@ -504,12 +499,14 @@ impl ContentScanner {
     fn scan_lnk_binary(bytes: &[u8], findings: &mut Vec<ContentFinding>) {
         let ascii_lower = String::from_utf8_lossy(bytes).to_ascii_lowercase();
         let utf16_units: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let utf16_lower = String::from_utf16_lossy(&utf16_units).to_ascii_lowercase();
 
-        let combined = format!("{} {}", ascii_lower, utf16_lower);
+        let combined = format!("{ascii_lower} {utf16_lower}");
         const LOLBINS: &[(&str, &str)] = &[
             ("powershell", "PowerShell execution via LNK shortcut"),
             ("pwsh", "PowerShell Core execution via LNK shortcut"),
@@ -783,7 +780,7 @@ impl ContentScanner {
                     category: "MALFORMED_OR_ENCRYPTED_ZIP".to_string(),
                     severity: "HIGH".to_string(),
                     indicator: "Corrupt or Encrypted ZIP Container".to_string(),
-                    description: format!("Failed parsing ZIP/OOXML container (fail-closed): {}", e),
+                    description: format!("Failed parsing ZIP/OOXML container (fail-closed): {e}"),
                 });
                 return;
             }
@@ -827,10 +824,7 @@ impl ContentScanner {
                         category: "MALFORMED_OR_ENCRYPTED_ZIP".to_string(),
                         severity: "HIGH".to_string(),
                         indicator: "Corrupt ZIP Entry".to_string(),
-                        description: format!(
-                            "Failed reading ZIP entry #{} (fail-closed): {}",
-                            i, e
-                        ),
+                        description: format!("Failed reading ZIP entry #{i} (fail-closed): {e}"),
                     });
                     continue;
                 }
@@ -850,8 +844,7 @@ impl ContentScanner {
                     severity: "CRITICAL".to_string(),
                     indicator: raw_name.clone(),
                     description: format!(
-                        "ZIP path traversal or invalid entry name '{}' detected (RUSTSEC-2026-0367)",
-                        raw_name
+                        "ZIP path traversal or invalid entry name '{raw_name}' detected (RUSTSEC-2026-0367)"
                     ),
                 });
             }
@@ -861,8 +854,7 @@ impl ContentScanner {
                     severity: "CRITICAL".to_string(),
                     indicator: raw_name.clone(),
                     description: format!(
-                        "Symbolic link entry '{}' detected inside ZIP/OOXML container (RUSTSEC-2026-0368)",
-                        raw_name
+                        "Symbolic link entry '{raw_name}' detected inside ZIP/OOXML container (RUSTSEC-2026-0368)"
                     ),
                 });
             }
@@ -874,8 +866,7 @@ impl ContentScanner {
                     severity: "HIGH".to_string(),
                     indicator: raw_name.clone(),
                     description: format!(
-                        "SUID/SGID/sticky unix permission bits (0o7000) set on ZIP entry '{}' (RUSTSEC-2026-0369)",
-                        raw_name
+                        "SUID/SGID/sticky unix permission bits (0o7000) set on ZIP entry '{raw_name}' (RUSTSEC-2026-0369)"
                     ),
                 });
             }
@@ -886,7 +877,7 @@ impl ContentScanner {
                     category: "OFFICE_VBA_MACRO".to_string(),
                     severity: "HIGH".to_string(),
                     indicator: name.clone(),
-                    description: format!("Embedded VBA Macro project detected at '{}'", name),
+                    description: format!("Embedded VBA Macro project detected at '{name}'"),
                 });
                 continue;
             }
@@ -896,10 +887,7 @@ impl ContentScanner {
                     category: "OFFICE_EMBEDDED_OLE".to_string(),
                     severity: "HIGH".to_string(),
                     indicator: name.clone(),
-                    description: format!(
-                        "Embedded OLE/ActiveX binary object detected at '{}'",
-                        name
-                    ),
+                    description: format!("Embedded OLE/ActiveX binary object detected at '{name}'"),
                 });
                 continue;
             }
@@ -926,8 +914,7 @@ impl ContentScanner {
                                 severity: "CRITICAL".to_string(),
                                 indicator: name.clone(),
                                 description: format!(
-                                    "External template/relationship target in '{}' (CVE-2022-30190 Follina vector)",
-                                    name
+                                    "External template/relationship target in '{name}' (CVE-2022-30190 Follina vector)"
                                 ),
                             });
                         }
@@ -942,8 +929,7 @@ impl ContentScanner {
                             severity: "CRITICAL".to_string(),
                             indicator: name.clone(),
                             description: format!(
-                                "Dynamic Data Exchange (DDE) or external field instruction in '{}'",
-                                name
+                                "Dynamic Data Exchange (DDE) or external field instruction in '{name}'"
                             ),
                         });
                     }
@@ -962,7 +948,9 @@ impl ContentScanner {
 
         let mut check_chunk = |bytes: &[u8]| {
             let utf16_units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             let utf16_lower = String::from_utf16_lossy(&utf16_units).to_ascii_lowercase();
@@ -1177,7 +1165,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_openxml_reader_detects_entry_count_symlink_suid_and_traversal() {
+    fn test_scan_openxml_reader_detects_entry_count_symlink_suid_and_traversal(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::Write;
         use zip::write::SimpleFileOptions;
         use zip::ZipWriter;
@@ -1187,18 +1176,12 @@ mod tests {
         {
             let mut writer = ZipWriter::new(Cursor::new(&mut malicious_zip));
             let opts = SimpleFileOptions::default();
-            writer
-                .start_file("word/../traversal.xml", opts)
-                .expect("start_file should succeed");
-            writer.write_all(b"<a/>").expect("write_all should succeed");
-            writer
-                .add_symlink("word/symlink.xml", "/etc/shadow", opts)
-                .expect("add_symlink should succeed");
-            writer
-                .start_file("word/suid.xml", opts.unix_permissions(0o755))
-                .expect("start_file should succeed");
-            writer.write_all(b"<b/>").expect("write_all should succeed");
-            writer.finish().expect("finish should succeed");
+            writer.start_file("word/../traversal.xml", opts)?;
+            writer.write_all(b"<a/>")?;
+            writer.add_symlink("word/symlink.xml", "/etc/shadow", opts)?;
+            writer.start_file("word/suid.xml", opts.unix_permissions(0o755))?;
+            writer.write_all(b"<b/>")?;
+            writer.finish()?;
         }
         if let Some(cd_pos) = malicious_zip
             .windows(4)
@@ -1231,11 +1214,9 @@ mod tests {
             let opts =
                 SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             for idx in 0..2050 {
-                writer
-                    .start_file(format!("part_{idx}.txt"), opts)
-                    .expect("start_file should succeed");
+                writer.start_file(format!("part_{idx}.txt"), opts)?;
             }
-            writer.finish().expect("finish should succeed");
+            writer.finish()?;
         }
         let many_findings = ContentScanner::scan(Path::new("evasion.docx"), &many_entries_zip);
         assert!(
@@ -1244,5 +1225,6 @@ mod tests {
                 .any(|f| f.category == "ARCHIVE_ENTRY_COUNT_EXCEEDED" && f.severity == "HIGH"),
             "Archive with > 2048 entries must emit ARCHIVE_ENTRY_COUNT_EXCEEDED, got: {many_findings:?}"
         );
+        Ok(())
     }
 }

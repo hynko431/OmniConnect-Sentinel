@@ -205,7 +205,7 @@ impl UniversalScanner {
                 risk_score: 99,
                 mitre_technique: "T1027 / T1204 (Malicious Binary Signature)".to_string(),
                 technical_details: yara_res
-                    .threat_Details
+                    .threat_details
                     .unwrap_or_else(|| "Matched Tier-0 signature rule".to_string()),
                 overlay_offset: None,
                 stream_name: None,
@@ -292,7 +292,7 @@ impl UniversalScanner {
                 risk_score: 99,
                 mitre_technique: "T1027 / T1204 (Malicious Binary Signature)".to_string(),
                 technical_details: yara_res
-                    .threat_Details
+                    .threat_details
                     .unwrap_or_else(|| "Matched Tier-0 signature rule".to_string()),
                 overlay_offset: None,
                 stream_name: None,

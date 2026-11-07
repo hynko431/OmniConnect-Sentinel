@@ -6,9 +6,6 @@ edition.workspace = true
 license.workspace = true
 description = "Protobuf definitions and generated gRPC clients/servers for OmniConnect Sentinel"
 
-[lints]
-workspace = true
-
 [dependencies]
 tonic.workspace = true
 prost.workspace = true

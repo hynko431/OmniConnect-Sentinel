@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io;
 use std::path::Path;
-use tracing::{info, warn};
+#[cfg(windows)]
+use tracing::info;
+use tracing::warn;
 
 use crate::fs_lowlevel::apply_system_admin_dacl;
 use crate::mem_guard::zeroize_slice;
@@ -75,7 +77,7 @@ pub fn default_soc_rsa_public_blob() -> Vec<u8> {
     for (i, byte) in modulus.iter_mut().enumerate() {
         let mut h = Sha256::new();
         h.update(b"OMNICONNECT-SOC-OFFLINE-RSA2048-MODULUS-V2:");
-        h.update(&(i as u32).to_le_bytes());
+        h.update((i as u32).to_le_bytes());
         let d = h.finalize();
         *byte = d[i % 32];
     }
@@ -355,7 +357,7 @@ fn tpm_pcp_rsa_seal(raw_key: &[u8], entropy_tag: &[u8], kek_id: &str) -> io::Res
         ));
     }
 
-    let key_name = to_wide(&format!("OmniConnectSentinelVaultRsa2048_{}", kek_id));
+    let key_name = to_wide(&format!("OmniConnectSentinelVaultRsa2048_{kek_id}"));
     let alg_rsa = to_wide("RSA");
     let prop_len = to_wide("Length");
     let mut h_key: usize = 0;
@@ -439,13 +441,10 @@ fn tpm_pcp_rsa_seal(raw_key: &[u8], entropy_tag: &[u8], kek_id: &str) -> io::Res
                 let _ = NCryptFreeObject(h_key);
                 let _ = NCryptFreeObject(h_prov);
             }
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "NCryptFinalizeKey(RSA) on TPM PCP failed: 0x{:08X}",
-                    fin_status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "NCryptFinalizeKey(RSA) on TPM PCP failed: 0x{:08X}",
+                fin_status as u32
+            )));
         }
     }
 
@@ -530,8 +529,7 @@ fn tpm_pcp_rsa_seal(raw_key: &[u8], entropy_tag: &[u8], kek_id: &str) -> io::Res
         let _ = NCryptFreeObject(h_key);
         let _ = NCryptFreeObject(h_prov);
     }
-    Err(io::Error::new(
-        io::ErrorKind::Other,
+    Err(io::Error::other(
         "NCryptEncrypt/NCryptDecrypt(NCRYPT_PAD_OAEP_FLAG) roundtrip failed on TPM PCP key",
     ))
 }
@@ -557,7 +555,7 @@ fn tpm_pcp_rsa_unseal(
         ));
     }
 
-    let key_name = to_wide(&format!("OmniConnectSentinelVaultRsa2048_{}", kek_id));
+    let key_name = to_wide(&format!("OmniConnectSentinelVaultRsa2048_{kek_id}"));
     let mut h_key: usize = 0;
     let mut open_status = unsafe {
         NCryptOpenKey(
@@ -746,12 +744,12 @@ pub fn seal_key_bytes(
                     "KEK '{}' sealed in hardware via TPM 2.0 Platform Crypto Provider (RSA-2048 OAEP)",
                     kek_id
                 );
-                return Ok(SealedKeyBlob {
+                Ok(SealedKeyBlob {
                     posture: KeyProtectionPosture::Tpm2Assisted,
                     kek_id: kek_id.to_string(),
                     sealed_bytes: tpm_ciphertext,
                     reduced_posture_event: None,
-                });
+                })
             }
             Err(tpm_err) => {
                 warn!(
@@ -759,12 +757,12 @@ pub fn seal_key_bytes(
                     kek_id, tpm_err
                 );
                 let sealed_bytes = dpapi_local_machine_seal(raw_key, entropy_tag)?;
-                return Ok(SealedKeyBlob {
+                Ok(SealedKeyBlob {
                     posture: KeyProtectionPosture::DpapiLocalMachine,
                     kek_id: kek_id.to_string(),
                     sealed_bytes,
                     reduced_posture_event: Some("POSTURE_REDUCED_NO_TPM".to_string()),
-                });
+                })
             }
         }
     }
@@ -969,13 +967,10 @@ pub fn generate_soc_rsa_keypair() -> io::Result<(Vec<u8>, Vec<u8>)> {
             BCryptOpenAlgorithmProvider(&mut h_alg, alg_rsa.as_ptr(), core::ptr::null(), 0)
         };
         if status != 0 || h_alg == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptOpenAlgorithmProvider(RSA) failed: 0x{:08X}",
-                    status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptOpenAlgorithmProvider(RSA) failed: 0x{:08X}",
+                status as u32
+            )));
         }
 
         let mut h_key: usize = 0;
@@ -984,13 +979,10 @@ pub fn generate_soc_rsa_keypair() -> io::Result<(Vec<u8>, Vec<u8>)> {
             unsafe {
                 let _ = BCryptCloseAlgorithmProvider(h_alg, 0);
             }
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptGenerateKeyPair(2048) failed: 0x{:08X}",
-                    gen_status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptGenerateKeyPair(2048) failed: 0x{:08X}",
+                gen_status as u32
+            )));
         }
 
         let fin_status = unsafe { BCryptFinalizeKeyPair(h_key, 0) };
@@ -999,13 +991,10 @@ pub fn generate_soc_rsa_keypair() -> io::Result<(Vec<u8>, Vec<u8>)> {
                 let _ = BCryptDestroyKey(h_key);
                 let _ = BCryptCloseAlgorithmProvider(h_alg, 0);
             }
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptFinalizeKeyPair(RSA) failed: 0x{:08X}",
-                    fin_status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptFinalizeKeyPair(RSA) failed: 0x{:08X}",
+                fin_status as u32
+            )));
         }
 
         let mut pub_len: u32 = 0;
@@ -1064,10 +1053,7 @@ pub fn generate_soc_rsa_keypair() -> io::Result<(Vec<u8>, Vec<u8>)> {
         }
 
         if exp_pub != 0 || exp_priv != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "BCryptExportKey(RSA) failed",
-            ));
+            return Err(io::Error::other("BCryptExportKey(RSA) failed"));
         }
         Ok((pub_blob, priv_blob))
     }
@@ -1106,13 +1092,10 @@ pub fn encrypt_kek_for_soc_escrow(
             BCryptOpenAlgorithmProvider(&mut h_alg, alg_rsa.as_ptr(), core::ptr::null(), 0)
         };
         if status != 0 || h_alg == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptOpenAlgorithmProvider(RSA) failed: 0x{:08X}",
-                    status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptOpenAlgorithmProvider(RSA) failed: 0x{:08X}",
+                status as u32
+            )));
         }
 
         let mut h_key: usize = 0;
@@ -1140,7 +1123,7 @@ pub fn encrypt_kek_for_soc_escrow(
             ));
         }
 
-        let label = format!("SOC-OFFLINE-ESCROW-RECOVERY-V2:{}", kek_id);
+        let label = format!("SOC-OFFLINE-ESCROW-RECOVERY-V2:{kek_id}");
         let padding = BcryptOaepPaddingInfo {
             psz_alg_id: alg_sha256.as_ptr(),
             pb_label: label.as_ptr(),
@@ -1167,13 +1150,10 @@ pub fn encrypt_kek_for_soc_escrow(
                 let _ = BCryptDestroyKey(h_key);
                 let _ = BCryptCloseAlgorithmProvider(h_alg, 0);
             }
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptEncrypt(BCRYPT_PAD_OAEP) size query failed: 0x{:08X}",
-                    q_status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptEncrypt(BCRYPT_PAD_OAEP) size query failed: 0x{:08X}",
+                q_status as u32
+            )));
         }
 
         let mut ciphertext = vec![0u8; cb_cipher as usize];
@@ -1196,13 +1176,10 @@ pub fn encrypt_kek_for_soc_escrow(
             let _ = BCryptCloseAlgorithmProvider(h_alg, 0);
         }
         if enc_status != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptEncrypt(BCRYPT_PAD_OAEP) failed: 0x{:08X}",
-                    enc_status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptEncrypt(BCRYPT_PAD_OAEP) failed: 0x{:08X}",
+                enc_status as u32
+            )));
         }
         ciphertext.truncate(cb_cipher as usize);
 
@@ -1223,8 +1200,8 @@ pub fn encrypt_kek_for_soc_escrow(
         stream_hasher.update(kek_id.as_bytes());
         let mask = stream_hasher.finalize();
         let mut ct = vec![0u8; 32];
-        for i in 0..32 {
-            ct[i] = kek[i] ^ mask[i];
+        for (dst, (&k, &m)) in ct.iter_mut().zip(kek.iter().zip(mask.iter())) {
+            *dst = k ^ m;
         }
         Ok(SocEscrowBlob {
             version: 2,
@@ -1253,13 +1230,10 @@ pub fn decrypt_kek_from_soc_escrow(
             BCryptOpenAlgorithmProvider(&mut h_alg, alg_rsa.as_ptr(), core::ptr::null(), 0)
         };
         if status != 0 || h_alg == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptOpenAlgorithmProvider(RSA) failed: 0x{:08X}",
-                    status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptOpenAlgorithmProvider(RSA) failed: 0x{:08X}",
+                status as u32
+            )));
         }
 
         let mut h_key: usize = 0;
@@ -1351,8 +1325,11 @@ pub fn decrypt_kek_from_soc_escrow(
             ));
         }
         let mut kek = [0u8; 32];
-        for i in 0..32 {
-            kek[i] = escrow.rsa_oaep_ciphertext[i] ^ mask[i];
+        for (dst, (&c, &m)) in kek
+            .iter_mut()
+            .zip(escrow.rsa_oaep_ciphertext.iter().zip(mask.iter()))
+        {
+            *dst = c ^ m;
         }
         Ok(kek)
     }
@@ -1442,13 +1419,10 @@ pub fn generate_raw_ecdsa_p256_keypair() -> io::Result<(Vec<u8>, Vec<u8>)> {
             BCryptOpenAlgorithmProvider(&mut h_alg, alg_ecdsa.as_ptr(), core::ptr::null(), 0)
         };
         if status != 0 || h_alg == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptOpenAlgorithmProvider(ECDSA_P256) failed: 0x{:08X}",
-                    status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptOpenAlgorithmProvider(ECDSA_P256) failed: 0x{:08X}",
+                status as u32
+            )));
         }
 
         let mut h_key: usize = 0;
@@ -1457,13 +1431,10 @@ pub fn generate_raw_ecdsa_p256_keypair() -> io::Result<(Vec<u8>, Vec<u8>)> {
             unsafe {
                 let _ = BCryptCloseAlgorithmProvider(h_alg, 0);
             }
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptGenerateKeyPair(ECDSA_P256) failed: 0x{:08X}",
-                    gen_status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptGenerateKeyPair(ECDSA_P256) failed: 0x{:08X}",
+                gen_status as u32
+            )));
         }
 
         let fin_status = unsafe { BCryptFinalizeKeyPair(h_key, 0) };
@@ -1472,13 +1443,10 @@ pub fn generate_raw_ecdsa_p256_keypair() -> io::Result<(Vec<u8>, Vec<u8>)> {
                 let _ = BCryptDestroyKey(h_key);
                 let _ = BCryptCloseAlgorithmProvider(h_alg, 0);
             }
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptFinalizeKeyPair(ECDSA_P256) failed: 0x{:08X}",
-                    fin_status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptFinalizeKeyPair(ECDSA_P256) failed: 0x{:08X}",
+                fin_status as u32
+            )));
         }
 
         let mut pub_len: u32 = 0;
@@ -1538,10 +1506,7 @@ pub fn generate_raw_ecdsa_p256_keypair() -> io::Result<(Vec<u8>, Vec<u8>)> {
 
         if exp_pub != 0 || exp_priv != 0 {
             zeroize_slice(&mut priv_blob);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "BCryptExportKey(ECDSA_P256) failed",
-            ));
+            return Err(io::Error::other("BCryptExportKey(ECDSA_P256) failed"));
         }
         Ok((pub_blob, priv_blob))
     }
@@ -1582,7 +1547,7 @@ fn tpm_pcp_ecdsa_create_or_open_pubkey(key_id: &str) -> io::Result<Vec<u8>> {
         ));
     }
 
-    let key_name = to_wide(&format!("OmniConnectSentinelEcdsaP256_{}", key_id));
+    let key_name = to_wide(&format!("OmniConnectSentinelEcdsaP256_{key_id}"));
     let alg_ecdsa = to_wide("ECDSA_P256");
     let pub_type = to_wide("ECCPUBLICBLOB");
     let mut h_key: usize = 0;
@@ -1637,8 +1602,7 @@ fn tpm_pcp_ecdsa_create_or_open_pubkey(key_id: &str) -> io::Result<Vec<u8>> {
                 let _ = NCryptFreeObject(h_key);
                 let _ = NCryptFreeObject(h_prov);
             }
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "NCryptFinalizeKey(ECDSA_P256) failed on TPM PCP",
             ));
         }
@@ -1662,8 +1626,7 @@ fn tpm_pcp_ecdsa_create_or_open_pubkey(key_id: &str) -> io::Result<Vec<u8>> {
             let _ = NCryptFreeObject(h_key);
             let _ = NCryptFreeObject(h_prov);
         }
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "NCryptExportKey(ECCPUBLICBLOB) failed on TPM PCP",
         ));
     }
@@ -1705,8 +1668,7 @@ fn tpm_pcp_ecdsa_create_or_open_pubkey(key_id: &str) -> io::Result<Vec<u8>> {
     }
 
     if exp_status != 0 || sign_test != 0 || cb_sig == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "TPM PCP ECDSA_P256 key export or silent sign probe failed",
         ));
     }
@@ -1779,13 +1741,10 @@ pub fn sign_with_sealed_ecdsa_p256(
                 let _ = NCryptFreeObject(h_prov);
             }
             if sign_status != 0 || cb_sig == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "NCryptSignHash(ECDSA_P256) failed: 0x{:08X}",
-                        sign_status as u32
-                    ),
-                ));
+                return Err(io::Error::other(format!(
+                    "NCryptSignHash(ECDSA_P256) failed: 0x{:08X}",
+                    sign_status as u32
+                )));
             }
             sig.truncate(cb_sig as usize);
             return Ok(sig);
@@ -1819,13 +1778,10 @@ pub fn sign_ecdsa_p256_with_private_blob(
             BCryptOpenAlgorithmProvider(&mut h_alg, alg_ecdsa.as_ptr(), core::ptr::null(), 0)
         };
         if status != 0 || h_alg == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptOpenAlgorithmProvider(ECDSA_P256) failed: 0x{:08X}",
-                    status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptOpenAlgorithmProvider(ECDSA_P256) failed: 0x{:08X}",
+                status as u32
+            )));
         }
 
         let mut h_key: usize = 0;
@@ -1872,13 +1828,10 @@ pub fn sign_ecdsa_p256_with_private_blob(
             let _ = BCryptCloseAlgorithmProvider(h_alg, 0);
         }
         if sign_status != 0 || cb_sig == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptSignHash(ECDSA_P256) failed: 0x{:08X}",
-                    sign_status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptSignHash(ECDSA_P256) failed: 0x{:08X}",
+                sign_status as u32
+            )));
         }
         sig.truncate(cb_sig as usize);
         Ok(sig)
@@ -1926,13 +1879,10 @@ pub fn verify_ecdsa_p256_digest(
             BCryptOpenAlgorithmProvider(&mut h_alg, alg_ecdsa.as_ptr(), core::ptr::null(), 0)
         };
         if status != 0 || h_alg == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "BCryptOpenAlgorithmProvider(ECDSA_P256) failed: 0x{:08X}",
-                    status as u32
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "BCryptOpenAlgorithmProvider(ECDSA_P256) failed: 0x{:08X}",
+                status as u32
+            )));
         }
 
         let mut h_key: usize = 0;
@@ -2026,7 +1976,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         use std::fmt::Write;
-        let _ = write!(&mut out, "{:02x}", b);
+        let _ = write!(&mut out, "{b:02x}");
     }
     out
 }

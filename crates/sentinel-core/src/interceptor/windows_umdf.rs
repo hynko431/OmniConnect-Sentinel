@@ -59,7 +59,7 @@ impl WindowsUmdfInterceptor {
         if let Some(tx) = sender_opt {
             tx.send(event)
                 .await
-                .map_err(|e| format!("Failed sending device event: {}", e))?;
+                .map_err(|e| format!("Failed sending device event: {e}"))?;
             Ok(())
         } else {
             Err("Interceptor listener has not been started".to_string())

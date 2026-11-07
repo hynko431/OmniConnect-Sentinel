@@ -101,7 +101,7 @@ impl VirtualFileSystemProvider for ProjFsProvider {
 
         tokio::task::spawn_blocking(move || cache.ingest_volume_read_once(&raw_buf, &virt_buf))
             .await
-            .map_err(|e| format!("ProjFS ingestion join error: {}", e))??;
+            .map_err(|e| format!("ProjFS ingestion join error: {e}"))??;
 
         match prj_start_virtualizing_root(virtual_mount_point) {
             Ok(handle) => {
@@ -131,7 +131,7 @@ impl VirtualFileSystemProvider for ProjFsProvider {
                 let mut ledger = AuditLedger::open(ledger_path);
                 let _ = ledger.append_event(
                     code,
-                    &format!("root={} reason={}", virtual_mount_point.display(), e),
+                    format!("root={} reason={}", virtual_mount_point.display(), e),
                 );
             }
         }

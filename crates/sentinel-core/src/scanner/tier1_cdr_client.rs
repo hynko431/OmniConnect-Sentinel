@@ -57,9 +57,9 @@ impl Tier1CdrClient {
         tokio::task::spawn_blocking(move || {
             let mut raw_bytes = Vec::new();
             File::open(&src)
-                .map_err(|e| format!("Failed opening source file for CDR inspect: {}", e))?
+                .map_err(|e| format!("Failed opening source file for CDR inspect: {e}"))?
                 .read_to_end(&mut raw_bytes)
-                .map_err(|e| format!("Failed reading source file for CDR inspect: {}", e))?;
+                .map_err(|e| format!("Failed reading source file for CDR inspect: {e}"))?;
 
             let file_name = src
                 .file_name()
@@ -70,10 +70,10 @@ impl Tier1CdrClient {
             let launcher = WorkerLauncher::new();
             launcher
                 .inspect_isolated(&raw_bytes, &file_name)
-                .map_err(|e| format!("Sandboxed CDR worker inspection failed: {}", e))
+                .map_err(|e| format!("Sandboxed CDR worker inspection failed: {e}"))
         })
         .await
-        .map_err(|e| format!("CDR inspect worker task join error: {}", e))?
+        .map_err(|e| format!("CDR inspect worker task join error: {e}"))?
     }
 
     async fn disarm_via_sandboxed_worker(
@@ -87,9 +87,9 @@ impl Tier1CdrClient {
         tokio::task::spawn_blocking(move || {
             let mut raw_bytes = Vec::new();
             File::open(&src)
-                .map_err(|e| format!("Failed opening source file for CDR: {}", e))?
+                .map_err(|e| format!("Failed opening source file for CDR: {e}"))?
                 .read_to_end(&mut raw_bytes)
-                .map_err(|e| format!("Failed reading source file for CDR: {}", e))?;
+                .map_err(|e| format!("Failed reading source file for CDR: {e}"))?;
 
             let original_size_bytes = raw_bytes.len() as u64;
             let file_name = src
@@ -105,30 +105,27 @@ impl Tier1CdrClient {
                     policy: SanitizationPolicy::default(),
                     raw_bytes,
                 })
-                .map_err(|e| format!("Sandboxed CDR worker rejected file: {}", e))?;
+                .map_err(|e| format!("Sandboxed CDR worker rejected file: {e}"))?;
 
             if let Some(parent) = dst.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        format!(
-                            "Failed creating destination parent directory for CDR output: {}",
-                            e
-                        )
+                        format!("Failed creating destination parent directory for CDR output: {e}")
                     })?;
                 }
             }
             let mut out_file = File::create(&dst)
-                .map_err(|e| format!("Failed creating destination file for CDR output: {}", e))?;
+                .map_err(|e| format!("Failed creating destination file for CDR output: {e}"))?;
             out_file
                 .write_all(&outcome.clean_bytes)
-                .map_err(|e| format!("Failed writing disarmed output: {}", e))?;
+                .map_err(|e| format!("Failed writing disarmed output: {e}"))?;
             out_file
                 .sync_all()
-                .map_err(|e| format!("Failed syncing disarmed output: {}", e))?;
+                .map_err(|e| format!("Failed syncing disarmed output: {e}"))?;
             drop(out_file);
 
             write_mark_of_the_web(&dst, 3)
-                .map_err(|e| format!("Failed applying Mark-of-the-Web to CDR output: {}", e))?;
+                .map_err(|e| format!("Failed applying Mark-of-the-Web to CDR output: {e}"))?;
 
             let orig_sha = hex::decode(&outcome.original_sha256).unwrap_or_default();
             let san_sha = hex::decode(&outcome.sanitized_sha256).unwrap_or_default();
@@ -158,6 +155,6 @@ impl Tier1CdrClient {
             })
         })
         .await
-        .map_err(|e| format!("CDR worker task join error: {}", e))?
+        .map_err(|e| format!("CDR worker task join error: {e}"))?
     }
 }

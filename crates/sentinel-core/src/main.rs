@@ -99,14 +99,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut audit_ledger = AuditLedger::open(ledger_path);
     let _ = audit_ledger.append_event(
         "AGENT_STARTUP",
-        &format!(
+        format!(
             "Node {} initialized with policy {}",
             config.node_id, intune_policy.policy_id
         ),
     );
     let _ = audit_ledger.append_event(
         "STARTUP_POSTURE_CHECK",
-        &format!(
+        format!(
             "compliant={} automount_disabled={} user_deny={} install_restricted={} write_protect={} autoplay_suppressed={} volumes_offline={:?}",
             posture.is_compliant(),
             posture.automount_disabled,
@@ -123,7 +123,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Active VFS Provider: {}", vfs_provider.provider_name());
 
     // 5. Initialize Tier 1 CDR Client (Sandboxed Pipe Worker default), Quarantine Vault, Confirmation Manager, Metrics, and Falcon SIEM Bridge
-    let _cdr_client = Arc::new(Tier1CdrClient::new(Default::default()));
+    let cdr_client = Arc::new(Tier1CdrClient::new(Default::default()));
+    info!(
+        "Tier-1 CDR Client initialized for endpoint: {}",
+        cdr_client.ipc_endpoint()
+    );
     let quarantine_vault = Arc::new(QuarantineVault::open(config.quarantine_vault_path.clone())?);
     if let Some(deg) = quarantine_vault.degradation_event() {
         let _ = audit_ledger.append_event("DEGRADATION_EVENT", deg.event_code());
@@ -165,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } => {
                         let has_hid = interfaces.iter().any(|i| i.interface_class == 0x03);
                         let has_storage = interfaces.iter().any(|i| i.interface_class == 0x08);
-                        let device_id = format!("USB\\VID_{:04X}&PID_{:04X}\\{}", vid, pid, serial);
+                        let device_id = format!("USB\\VID_{vid:04X}&PID_{pid:04X}\\{serial}");
 
                         // 1. Hardware ID Allowlist Enforcement (Row 141)
                         if !sentinel_sys::is_hardware_id_allowed(&device_id, &intune_policy.allowed_hardware_ids) {
@@ -179,7 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             let _ = audit_ledger.append_event(
                                 "HARDWARE_ID_BLOCKED",
-                                &format!("Blocked unapproved hardware ID {}", device_id),
+                                format!("Blocked unapproved hardware ID {device_id}"),
                             );
                             continue;
                         }
@@ -205,21 +209,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 severity: 10,
                                 signature_id: "BADUSB-COMPOSITE-001".to_string(),
                                 name: "Composite HID and Mass Storage BadUSB Blocked".to_string(),
-                                device_vendor_id: format!("0x{:04X}", vid),
-                                device_product_id: format!("0x{:04X}", pid),
+                                device_vendor_id: format!("0x{vid:04X}"),
+                                device_product_id: format!("0x{pid:04X}"),
                                 serial_number: serial.clone(),
                                 file_sha256: None,
                                 action_taken: "SEVER_DATA_LINES_AWAITING_CONFIRMATION".to_string(),
                                 details: format!(
-                                    "Blocked composite device {}; run 'sentinel confirm-device --device-id \"{}\" --challenge {}' to authorize",
-                                    device_id, device_id, challenge
+                                    "Blocked composite device {device_id}; run 'sentinel confirm-device --device-id \"{device_id}\" --challenge {challenge}' to authorize"
                                 ),
                             });
                             let _ = audit_ledger.append_event(
                                 "BADUSB_BLOCKED",
-                                &format!(
-                                    "Severed data lines for composite device {}; challenge={} issued",
-                                    device_id, challenge
+                                format!(
+                                    "Severed data lines for composite device {device_id}; challenge={challenge} issued"
                                 ),
                             );
                         } else if let Some(raw_mount) = &event.raw_mount_point {
@@ -287,7 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Ok(()) => {
                                     let _ = audit_ledger.append_event(
                                         "VOLUME_PROJECTED",
-                                        &format!(
+                                        format!(
                                             "Projected {} -> {} via {} (raw USB volume returned offline)",
                                             raw_mount.display(),
                                             virtual_mount.display(),
@@ -299,7 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     warn!("Projection aborted for {}: {}", raw_mount.display(), e);
                                     let _ = audit_ledger.append_event(
                                         "VOLUME_PROJECTION_ABORTED",
-                                        &format!("Aborted projection for {}: {}", raw_mount.display(), e),
+                                        format!("Aborted projection for {}: {}", raw_mount.display(), e),
                                     );
                                 }
                             }
@@ -308,7 +310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => {
                         let _ = audit_ledger.append_event(
                             "PERIPHERAL_OBSERVED",
-                            &format!("Observed connection {:?}", event.connection_id),
+                            format!("Observed connection {:?}", event.connection_id),
                         );
                     }
                 }
@@ -344,7 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let _ = audit_ledger.append_event(
                     "HEARTBEAT_BEACON",
-                    &format!("Node {} alive; posture_compliant={}", config.node_id, current_posture.is_compliant()),
+                    format!("Node {} alive; posture_compliant={}", config.node_id, current_posture.is_compliant()),
                 );
             }
         }
@@ -356,7 +358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     let _ = audit_ledger.append_event(
         "AGENT_SHUTDOWN",
-        &format!(
+        format!(
             "Node {} shutting down; session cache crypto-erased",
             config.node_id
         ),

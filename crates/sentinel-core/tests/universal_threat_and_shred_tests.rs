@@ -90,7 +90,7 @@ fn test_secure_shredder_readonly_bypass_and_honest_clear_receipt() {
 fn test_secure_shredder_reserved_dos_name_and_ads_surgical_shred() {
     // BUG-CORE-06 #1 & #3 (`T9`, `clear_reserved_name`):
     // 1. Reserved DOS filename `CON.txt` created via verbatim `\\?\` path can be shredded cleanly
-    //    using `ShredMethod::NistClearThreePass`.
+    //    using `ShredMethod::NIST_CLEAR_THREE_PASS`.
     // 2. `shred_ntfs_stream` strips leading `:` so it never constructs `file::stream`,
     //    and removes only the alternate stream while preserving the host file.
     let dir = tempdir().expect("Failed to create tempdir");
@@ -105,8 +105,8 @@ fn test_secure_shredder_reserved_dos_name_and_ads_surgical_shred() {
     );
     fs::write(&verbatim_con, b"RESERVED_DOS_DEVICE_PAYLOAD")
         .expect("Write CON.txt via verbatim path");
-    let con_receipt = SecureShredder::shred_file(&con_path, ShredMethod::NistClearThreePass)
-        .expect("Shredding CON.txt with NistClearThreePass must succeed");
+    let con_receipt = SecureShredder::shred_file(&con_path, ShredMethod::NIST_CLEAR_THREE_PASS)
+        .expect("Shredding CON.txt with NIST_CLEAR_THREE_PASS must succeed");
     assert!(con_receipt.verification_passed);
     assert_eq!(con_receipt.passes_completed, 3);
     assert!(!verbatim_con.exists());
@@ -984,8 +984,7 @@ async fn test_interceptor_retains_channel_sender_and_vfs_shadow_cache() {
         );
     assert!(
         quota_err.contains("CACHE_QUOTA_EXCEEDED") || quota_err.contains("SNTL-ERR-006"),
-        "Unexpected quota error: {}",
-        quota_err
+        "Unexpected quota error: {quota_err}"
     );
 }
 
@@ -1125,8 +1124,7 @@ fn large_jpeg_exif_thumbnail_clean() {
     let threats = UniversalScanner::scan_file(&large_jpeg_path).unwrap();
     assert!(
         threats.is_empty(),
-        ">4.5 MB JPEG with EXIF thumbnail must produce 0 threats in UniversalScanner: got {:?}",
-        threats
+        ">4.5 MB JPEG with EXIF thumbnail must produce 0 threats in UniversalScanner: got {threats:?}"
     );
 }
 
@@ -1520,8 +1518,8 @@ fn invariant_i4() {
         let len = 1 + ((raw[0] as usize) % (raw.len() - 1));
         let payload: Vec<u8> = raw[..len].to_vec();
 
-        let item_path = dir.path().join(format!("prop_sample_{}.bin", seed));
-        let restore_path = dir.path().join(format!("prop_restored_{}.bin", seed));
+        let item_path = dir.path().join(format!("prop_sample_{seed}.bin"));
+        let restore_path = dir.path().join(format!("prop_restored_{seed}.bin"));
         fs::write(&item_path, &payload).unwrap();
 
         let q_entry = vault
@@ -1534,8 +1532,7 @@ fn invariant_i4() {
         assert_eq!(
             fs::read(&restore_path).unwrap(),
             payload,
-            "Property restore(quarantine(x)) == x failed for seed {}",
-            seed
+            "Property restore(quarantine(x)) == x failed for seed {seed}"
         );
     }
 }
@@ -1562,13 +1559,12 @@ fn allowlist_blocks_containers() {
         "one",
     ];
     for ext in container_extensions {
-        let p = dir.path().join(format!("suspicious_carrier.{}", ext));
+        let p = dir.path().join(format!("suspicious_carrier.{ext}"));
         fs::write(&p, b"CONTAINER_TEST_PAYLOAD_BYTES").unwrap();
         let threats = UniversalScanner::scan_file(&p).unwrap();
         assert!(
             !threats.is_empty() && threats.iter().any(|t| !t.can_disarm_via_cdr),
-            "Container extension .{} must be blocked for quarantine by default-deny allowlist (`Row 76`)",
-            ext
+            "Container extension .{ext} must be blocked for quarantine by default-deny allowlist (`Row 76`)"
         );
     }
 
@@ -1590,8 +1586,7 @@ fn allowlist_blocks_containers() {
         let threats = UniversalScanner::scan_file(&p).unwrap();
         assert!(
             !threats.is_empty() && threats.iter().any(|t| !t.can_disarm_via_cdr),
-            "Magic-byte container '{}' disguised as .txt must be blocked (`Row 76`)",
-            name
+            "Magic-byte container '{name}' disguised as .txt must be blocked (`Row 76`)"
         );
     }
 
@@ -2053,8 +2048,7 @@ fn invariant_i5() {
         .expect_err("AuditLedger::verify_chain MUST detect tail truncation against ECDSA P-256 signed chain head (`Invariant I5`)");
     assert!(
         trunc_err.contains("LEDGER_CHAIN_BROKEN"),
-        "Tail truncation error must report LEDGER_CHAIN_BROKEN: got {}",
-        trunc_err
+        "Tail truncation error must report LEDGER_CHAIN_BROKEN: got {trunc_err}"
     );
 
     // Restore original content and verify chain is valid again

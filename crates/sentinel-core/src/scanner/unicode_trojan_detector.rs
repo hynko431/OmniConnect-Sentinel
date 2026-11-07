@@ -92,8 +92,7 @@ impl UnicodeTrojanDetector {
                 risk_score: 88,
                 mitre_technique: "T1564.001 (Hidden Files and Directories)".to_string(),
                 technical_details: format!(
-                    "Filename uses reserved device name '{}', causing standard OS deletion APIs to fail without extended UNC pathing.",
-                    stem
+                    "Filename uses reserved device name '{stem}', causing standard OS deletion APIs to fail without extended UNC pathing."
                 ),
                 overlay_offset: None,
                 stream_name: None,

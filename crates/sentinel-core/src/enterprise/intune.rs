@@ -60,7 +60,7 @@ impl SignedPolicyBundle {
     /// Computes the canonical 32-byte SHA-256 digest over `IntuneMdmPolicy`.
     pub fn signing_digest(policy: &IntuneMdmPolicy) -> Result<[u8; 32], String> {
         let canonical = serde_json::to_vec(policy)
-            .map_err(|e| format!("Failed serializing policy for digest: {}", e))?;
+            .map_err(|e| format!("Failed serializing policy for digest: {e}"))?;
         let mut hasher = Sha256::new();
         hasher.update(b"SENTINEL-MDM-POLICY-V2:");
         hasher.update(&canonical);
@@ -78,7 +78,7 @@ impl SignedPolicyBundle {
     ) -> Result<Self, String> {
         let digest = Self::signing_digest(&policy)?;
         let sig_bytes = sign_ecdsa_p256_with_private_blob(private_key_blob, &digest)
-            .map_err(|e| format!("Failed signing IntuneMdmPolicy with ECDSA P-256: {}", e))?;
+            .map_err(|e| format!("Failed signing IntuneMdmPolicy with ECDSA P-256: {e}"))?;
         Ok(Self {
             policy,
             signature_hex: hex::encode(sig_bytes),
@@ -92,15 +92,13 @@ impl SignedPolicyBundle {
             Self::signing_digest(&self.policy).map_err(SentinelError::PolicySignatureInvalid)?;
         let sig_bytes = hex::decode(&self.signature_hex).map_err(|e| {
             SentinelError::PolicySignatureInvalid(format!(
-                "Invalid policy signature hex encoding: {}",
-                e
+                "Invalid policy signature hex encoding: {e}"
             ))
         })?;
         let verified =
             verify_ecdsa_p256_digest(trusted_public_key, &digest, &sig_bytes).map_err(|e| {
                 SentinelError::PolicySignatureInvalid(format!(
-                    "ECDSA P-256 policy signature verification error: {}",
-                    e
+                    "ECDSA P-256 policy signature verification error: {e}"
                 ))
             })?;
         if !verified {

@@ -178,12 +178,11 @@ pub struct ElfStructureAnalysis {
     pub section_header_count: u16,
 }
 
-#[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct YaraScanResult {
     pub matched: bool,
     pub rule_name: Option<String>,
-    pub threat_Details: Option<String>,
+    pub threat_details: Option<String>,
     pub scan_duration_micros: u64,
 }
 
@@ -217,12 +216,12 @@ impl SignedRulePack {
         rules: &[DynamicYaraRule],
     ) -> Result<[u8; 32], String> {
         let rules_json = serde_json::to_vec(rules)
-            .map_err(|e| format!("Failed serializing YARA rules for digest: {}", e))?;
+            .map_err(|e| format!("Failed serializing YARA rules for digest: {e}"))?;
         let mut hasher = Sha256::new();
         hasher.update(b"SENTINEL-YARA-RULEPACK-V2:");
         hasher.update(pack_id.as_bytes());
         hasher.update(b"|");
-        hasher.update(&version.to_le_bytes());
+        hasher.update(version.to_le_bytes());
         hasher.update(b"|");
         hasher.update(&rules_json);
         let digest = hasher.finalize();
@@ -241,7 +240,7 @@ impl SignedRulePack {
         let pack_id = pack_id.into();
         let digest = Self::signing_digest(&pack_id, version, &rules)?;
         let sig_bytes = sign_ecdsa_p256_with_private_blob(private_key_blob, &digest)
-            .map_err(|e| format!("Failed signing YARA rule pack with ECDSA P-256: {}", e))?;
+            .map_err(|e| format!("Failed signing YARA rule pack with ECDSA P-256: {e}"))?;
         Ok(Self {
             pack_id,
             version,
@@ -256,15 +255,13 @@ impl SignedRulePack {
             .map_err(SentinelError::PolicySignatureInvalid)?;
         let sig_bytes = hex::decode(&self.signature_hex).map_err(|e| {
             SentinelError::PolicySignatureInvalid(format!(
-                "Invalid rule pack signature hex encoding: {}",
-                e
+                "Invalid rule pack signature hex encoding: {e}"
             ))
         })?;
         let verified =
             verify_ecdsa_p256_digest(trusted_public_key, &digest, &sig_bytes).map_err(|e| {
                 SentinelError::PolicySignatureInvalid(format!(
-                    "ECDSA P-256 rule pack signature verification error: {}",
-                    e
+                    "ECDSA P-256 rule pack signature verification error: {e}"
                 ))
             })?;
         if !verified {
@@ -296,7 +293,7 @@ pub fn compile_yara_source(yar_source: &str) -> Result<Vec<CompiledYaraRule>, St
         }
         let header_end = trimmed
             .find('{')
-            .ok_or_else(|| format!("Malformed YARA rule block missing '{{': {}", trimmed))?;
+            .ok_or_else(|| format!("Malformed YARA rule block missing '{{': {trimmed}"))?;
         let rule_id = trimmed[..header_end].trim().to_string();
         if rule_id.is_empty() {
             return Err("Empty YARA rule identifier".to_string());
@@ -349,10 +346,7 @@ pub fn compile_yara_source(yar_source: &str) -> Result<Vec<CompiledYaraRule>, St
         }
 
         if markers.is_empty() {
-            return Err(format!(
-                "YARA rule '{}' defines zero string markers",
-                rule_id
-            ));
+            return Err(format!("YARA rule '{rule_id}' defines zero string markers"));
         }
         compiled.push(CompiledYaraRule {
             id: rule_id,
@@ -517,7 +511,7 @@ impl Tier0YaraScanner {
             return YaraScanResult {
                 matched: false,
                 rule_name: None,
-                threat_Details: None,
+                threat_details: None,
                 scan_duration_micros: start.elapsed().as_micros() as u64,
             };
         }
@@ -573,7 +567,7 @@ impl Tier0YaraScanner {
             return YaraScanResult {
                 matched: true,
                 rule_name: Some(intel_id),
-                threat_Details: Some(intel_desc),
+                threat_details: Some(intel_desc),
                 scan_duration_micros: start.elapsed().as_micros() as u64,
             };
         }
@@ -589,7 +583,7 @@ impl Tier0YaraScanner {
                 return YaraScanResult {
                     matched: true,
                     rule_name: Some(rule.id.clone()),
-                    threat_Details: Some(rule.description.clone()),
+                    threat_details: Some(rule.description.clone()),
                     scan_duration_micros: start.elapsed().as_micros() as u64,
                 };
             }
@@ -603,7 +597,7 @@ impl Tier0YaraScanner {
                 return YaraScanResult {
                     matched: true,
                     rule_name: Some(rule_id),
-                    threat_Details: Some(details),
+                    threat_details: Some(details),
                     scan_duration_micros: start.elapsed().as_micros() as u64,
                 };
             }
@@ -615,7 +609,7 @@ impl Tier0YaraScanner {
                 return YaraScanResult {
                     matched: true,
                     rule_name: Some("YARA_ELF_RWX_LOAD_SEGMENT".to_string()),
-                    threat_Details: Some(
+                    threat_details: Some(
                         "ELF binary declares a writable + executable (PF_W | PF_X) PT_LOAD segment characteristic of packed/injected ELF payloads"
                             .to_string(),
                     ),
@@ -627,7 +621,7 @@ impl Tier0YaraScanner {
         YaraScanResult {
             matched: false,
             rule_name: None,
-            threat_Details: None,
+            threat_details: None,
             scan_duration_micros: start.elapsed().as_micros() as u64,
         }
     }

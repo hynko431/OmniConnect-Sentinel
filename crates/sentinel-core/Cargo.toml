@@ -10,9 +10,6 @@ description = "Core agent daemon for OmniConnect Sentinel: Userspace device inte
 name = "sentinel-agent"
 path = "src/main.rs"
 
-[lints]
-workspace = true
-
 [dependencies]
 sentinel-proto.workspace = true
 sentinel-cdr.workspace = true

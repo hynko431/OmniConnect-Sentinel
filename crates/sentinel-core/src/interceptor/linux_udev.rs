@@ -57,7 +57,7 @@ impl LinuxUdevInterceptor {
         if let Some(tx) = sender_opt {
             tx.send(event)
                 .await
-                .map_err(|e| format!("Failed sending device event: {}", e))?;
+                .map_err(|e| format!("Failed sending device event: {e}"))?;
             Ok(())
         } else {
             Err("Linux udev listener has not been started".to_string())
@@ -199,7 +199,7 @@ impl DeviceInterceptor for LinuxUdevInterceptor {
                         (
                             0x0000,
                             0x0000,
-                            format!("UDEV-{}", mount_path),
+                            format!("UDEV-{mount_path}"),
                             vec![UsbInterfaceDescriptor {
                                 interface_number: 0,
                                 interface_class: 0x08,

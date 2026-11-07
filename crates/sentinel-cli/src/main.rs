@@ -340,7 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("\n===========================================================");
                 println!("         OMNICONNECT SENTINEL: DEEP FILE INSPECTION        ");
                 println!("===========================================================");
-                println!("File Path:              {:?}", path);
+                println!("File Path:              {path:?}");
                 println!("File Size:              {} bytes", bytes.len());
                 println!(
                     "Detected Format:        {:?} ({})",
@@ -372,7 +372,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         format!(
                             "MATCHED [{}] ({})",
                             yara_res.rule_name.as_deref().unwrap_or("RULE"),
-                            yara_res.threat_Details.as_deref().unwrap_or("")
+                            yara_res.threat_details.as_deref().unwrap_or("")
                         )
                     } else {
                         "Clean".to_string()
@@ -431,8 +431,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("       OPENSANDBOX BEHAVIORAL DETONATION REPORT           ");
             println!("===========================================================");
             println!("Analysis ID:            {}", report.analysis_id);
-            println!("File Name:              {}", file_name);
-            println!("SHA256:                 {}", sha256_hex);
+            println!("File Name:              {file_name}");
+            println!("SHA256:                 {sha256_hex}");
             println!(
                 "Verdict:                {}",
                 if report.verdict_malicious {
@@ -446,7 +446,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "Threat Family:          {}",
                 report.threat_family.as_deref().unwrap_or("None")
             );
-            println!("VM Profile:             {}", vm);
+            println!("VM Profile:             {vm}");
             println!("Containment Mode:       Air-Gapped Network Sinkhole");
             println!(
                 "Engine Execution:       {}",
@@ -460,21 +460,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !report.mitre_attack_ttps.is_empty() {
                 println!("\n🎯 [MITRE ATT&CK TECHNIQUES IDENTIFIED]");
                 for t in &report.mitre_attack_ttps {
-                    println!("   • {}", t);
+                    println!("   • {t}");
                 }
             }
 
             if !report.behavioral_indicators.is_empty() {
                 println!("\n🌲 [BEHAVIORAL INDICATORS]");
                 for ind in &report.behavioral_indicators {
-                    println!("   • {}", ind);
+                    println!("   • {ind}");
                 }
             }
 
             if !report.network_iocs.is_empty() {
                 println!("\n🌐 [EXTRACTED NON-PKI NETWORK IOCS]");
                 for url in &report.network_iocs {
-                    println!("   • {}", url);
+                    println!("   • {url}");
                 }
             }
         }
@@ -546,11 +546,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("===========================================================");
             println!("      OMNICONNECT SENTINEL: ANTI-FORENSIC SECURE SHREDDER  ");
             println!("===========================================================");
-            println!("Target Path: {:?}", path);
+            println!("Target Path: {path:?}");
             println!("Standard:    NIST 800-88 Clear (logical)");
             println!(
-                "Overwrites:  {} Passes (0x00, 0xFF, CSPRNG + Read-Back Verification)\n",
-                passes
+                "Overwrites:  {passes} Passes (0x00, 0xFF, CSPRNG + Read-Back Verification)\n"
             );
 
             let parent_dir = path.parent().map(|p| p.to_path_buf());
@@ -578,16 +577,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(dir) = parent_dir {
                             if let Ok(filled) = SecureShredder::fill_free_space(&dir, 0) {
                                 println!(
-                                    "   Free-Space Fill:      {} bytes (best-effort logical fill)",
-                                    filled
+                                    "   Free-Space Fill:      {filled} bytes (best-effort logical fill)"
                                 );
                             }
                         }
                     }
-                    println!("\n✅ File {:?} overwritten, verified, and unlinked.", path);
+                    println!("\n✅ File {path:?} overwritten, verified, and unlinked.");
                 }
                 Err(e) => {
-                    println!("❌ Shredding failed: {}", e);
+                    println!("❌ Shredding failed: {e}");
                 }
             }
         }
@@ -596,8 +594,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("      OMNICONNECT SENTINEL: AUTONOMOUS DRIVE SENTRY        ");
             println!("===========================================================");
             println!(
-                "Actively monitoring for removable media insertions (Interval: {} ms)...",
-                interval_ms
+                "Actively monitoring for removable media insertions (Interval: {interval_ms} ms)..."
             );
             println!("Press Ctrl+C to terminate sentinel sentry.\n");
 
@@ -606,8 +603,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             watcher
                 .watch_loop(move |drive_root| {
                     println!(
-                        "\n🚨 [EXTERNAL DRIVE DETECTED]: Removable Media connected at {:?}",
-                        drive_root
+                        "\n🚨 [EXTERNAL DRIVE DETECTED]: Removable Media connected at {drive_root:?}"
                     );
                     let report = UniversalScanner::scan_directory_detailed(&drive_root, 2000);
                     if report.threats.is_empty() && report.complete {
@@ -624,7 +620,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         for threat in &report.threats {
                             if let Err(e) = prompt_remediation(threat, &vault) {
-                                eprintln!("❌ Remediation error: {}", e);
+                                eprintln!("❌ Remediation error: {e}");
                             }
                         }
                     }
@@ -668,10 +664,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(out_path) = export {
                 let xml = mgr.export_oma_uri_profile_xml();
                 fs::write(&out_path, &xml)?;
-                println!(
-                    "\n✅ Exported XML-escaped Intune OMA-URI profile to: {:?}",
-                    out_path
-                );
+                println!("\n✅ Exported XML-escaped Intune OMA-URI profile to: {out_path:?}");
             } else {
                 println!("\n💡 Tip: Use --export <PATH.xml> to save the deployment profile.");
             }
@@ -681,7 +674,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ev = FalconTelemetryEvent {
                 severity: 9,
                 signature_id: format!("SENTINEL-{}", event.to_uppercase()),
-                name: format!("OmniConnect Sentinel Peripheral Event ({})", event),
+                name: format!("OmniConnect Sentinel Peripheral Event ({event})"),
                 device_vendor_id: "0x0781".to_string(),
                 device_product_id: "0x5581".to_string(),
                 serial_number: "SN-EDGE-WIN11-01".to_string(),
@@ -723,18 +716,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rel_media_enc = PathBuf::from(&session_id).join("media_manifest.enc");
             let session_dir = kiosk.write_encrypted_session_file(
                 &rel_media_enc,
-                format!("MEDIA={} SESSION={}", media, session_id).as_bytes(),
+                format!("MEDIA={media} SESSION={session_id}").as_bytes(),
             )?;
             let _verified = kiosk.read_encrypted_session_file(&rel_media_enc)?;
 
-            println!("Session ID:                     {}", session_id);
-            println!("Ephemeral Session Workspace:    {:?}", session_dir);
+            println!("Session ID:                     {session_id}");
+            println!("Ephemeral Session Workspace:    {session_dir:?}");
             println!("Status:                         Executing Offline YARA & Deep CDR disarm...");
 
             let wiped_files = kiosk.end_session_and_shred()?;
             println!(
-                "NIST 800-88 Clear + Key Wipe:   COMPLETED ({} session files shredded)",
-                wiped_files
+                "NIST 800-88 Clear + Key Wipe:   COMPLETED ({wiped_files} session files shredded)"
             );
             println!("IEC 62443 Compliance State:     SL-3 ENFORCED\n");
         }
@@ -769,7 +761,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let vault = QuarantineVault::open(vault_dir)?;
                 let restored = vault.restore_file(&id, &output)?;
-                println!("✅ Restored quarantine entry '{}' to {:?}", id, restored);
+                println!("✅ Restored quarantine entry '{id}' to {restored:?}");
             }
             VaultAction::Migrate { vault_dir, action } => {
                 use sentinel_core::scanner::quarantine::LegacyMigrationAction;
@@ -790,8 +782,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let vault = QuarantineVault::open(vault_dir)?;
                 vault.purge(&id)?;
                 println!(
-                    "✅ Crypto-erased wrapped DEK and shredded quarantine entry '{}' from vault.",
-                    id
+                    "✅ Crypto-erased wrapped DEK and shredded quarantine entry '{id}' from vault."
                 );
             }
         },
@@ -800,9 +791,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ledger = AuditLedger::open_result(path.clone())?;
                 let verified_count = ledger.verify_chain()?;
                 println!(
-                    "✅ Audit ledger {:?} verified intact ({} hash-chained records + ECDSA-P256 signed chain head).",
-                    path,
-                    verified_count
+                    "✅ Audit ledger {path:?} verified intact ({verified_count} hash-chained records + ECDSA-P256 signed chain head)."
                 );
             }
         },
@@ -817,14 +806,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut ledger = AuditLedger::open(PathBuf::from(".sentinel_vault/audit.jsonl"));
             let _ = ledger.append_event(
                 "DEVICE_CONFIRMED_BY_USER",
-                &format!(
-                    "Device {} authorized via physical user-presence challenge",
-                    device_id
-                ),
+                format!("Device {device_id} authorized via physical user-presence challenge"),
             );
             println!(
-                "✅ Physical user-presence challenge verified. Re-enabled USB device node: {}",
-                device_id
+                "✅ Physical user-presence challenge verified. Re-enabled USB device node: {device_id}"
             );
         }
     }
@@ -842,7 +827,7 @@ fn prompt_remediation(threat: &UniversalThreat, vault: &QuarantineVault) -> Resu
     println!("\n================================================================================");
     println!("🚨 [THREAT IDENTIFIED]: {:?}", threat.file_path);
     if let Some(stream) = &threat.stream_name {
-        println!("   NTFS Stream:  {}", stream);
+        println!("   NTFS Stream:  {stream}");
     }
     println!("   Carrier:      {:?}", threat.carrier_category);
     println!("   Threat Name:  {}", threat.threat_name);
@@ -869,8 +854,7 @@ fn prompt_remediation(threat: &UniversalThreat, vault: &QuarantineVault) -> Resu
     if choice.is_empty() || choice == "1" {
         if let Some(stream_name) = &threat.stream_name {
             println!(
-                "⚡ Surgically shredding NTFS Alternate Data Stream '{}' while preserving host file...",
-                stream_name
+                "⚡ Surgically shredding NTFS Alternate Data Stream '{stream_name}' while preserving host file..."
             );
             let receipt = SecureShredder::shred_ntfs_stream(&threat.file_path, stream_name)?;
             println!(
@@ -974,8 +958,8 @@ pub fn is_valid_local_host_header(host: &str, port: u16) -> bool {
     }
     trimmed == "127.0.0.1"
         || trimmed == "localhost"
-        || trimmed == format!("127.0.0.1:{}", port)
-        || trimmed == format!("localhost:{}", port)
+        || trimmed == format!("127.0.0.1:{port}")
+        || trimmed == format!("localhost:{port}")
 }
 
 /// Validates that any present `Origin` header is an exact local origin (`http://127.0.0.1`,
@@ -988,8 +972,8 @@ pub fn is_valid_local_origin_header(origin: &str, port: u16) -> bool {
     }
     trimmed == "http://127.0.0.1"
         || trimmed == "http://localhost"
-        || trimmed == format!("http://127.0.0.1:{}", port)
-        || trimmed == format!("http://localhost:{}", port)
+        || trimmed == format!("http://127.0.0.1:{port}")
+        || trimmed == format!("http://localhost:{port}")
 }
 
 /// Constant-time validation of the `Authorization: Bearer <token>` header using `subtle::ConstantTimeEq` (`Row 173`).
@@ -1527,7 +1511,7 @@ async fn serve_dashboard_ui(port: u16, demo_mode: bool) -> Result<(), Box<dyn st
     let actual_port = std_listener.local_addr()?.port();
 
     let session_token = uuid::Uuid::new_v4().to_string();
-    let launch_url = format!("http://127.0.0.1:{}/", actual_port);
+    let launch_url = format!("http://127.0.0.1:{actual_port}/");
     if !is_valid_dashboard_launch_url(&launch_url) {
         return Err("Refusing to launch browser: URL failed strict ^http://127\\.0\\.0\\.1:\\d+/ validation".into());
     }
@@ -1536,7 +1520,7 @@ async fn serve_dashboard_ui(port: u16, demo_mode: bool) -> Result<(), Box<dyn st
     info!("   OmniConnect Sentinel - Localhost Web GUI Dashboard      ");
     info!("===========================================================");
     println!("\n🖥️ [SENTINEL DASHBOARD SERVER ACTIVE (AXUM)]");
-    println!("   Bound Address: {}", launch_url);
+    println!("   Bound Address: {launch_url}");
     println!("   Bearer Auth:   Required via Authorization: Bearer <token> header");
 
     #[cfg(target_os = "windows")]
@@ -1597,7 +1581,7 @@ mod tests {
         let req_rebind = Request::builder()
             .uri("/api/v1/status")
             .header(header::HOST, "127.0.0.1.attacker.tld")
-            .header(header::AUTHORIZATION, format!("Bearer {}", token))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap_or_else(|_| Request::new(Body::empty()));
         let resp_rebind = app
@@ -1609,7 +1593,7 @@ mod tests {
 
         // 2. Missing Authorization header on /api/v1/status MUST return 401 Unauthorized (even if token is in URL query)
         let req_unauth = Request::builder()
-            .uri(format!("/api/v1/status?token={}", token))
+            .uri(format!("/api/v1/status?token={token}"))
             .header(header::HOST, "127.0.0.1:8088")
             .body(Body::empty())
             .unwrap_or_else(|_| Request::new(Body::empty()));
@@ -1625,7 +1609,7 @@ mod tests {
             .uri("/api/v1/status")
             .header(header::HOST, "127.0.0.1:8088")
             .header(header::ORIGIN, "http://127.0.0.1:8088")
-            .header(header::AUTHORIZATION, format!("Bearer {}", token))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap_or_else(|_| Request::new(Body::empty()));
         let resp_ok = app
@@ -1647,7 +1631,7 @@ mod tests {
             .method("POST")
             .uri("/api/v1/shred")
             .header(header::HOST, "127.0.0.1:8088")
-            .header(header::AUTHORIZATION, format!("Bearer {}", token))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::from(r#"{"create_ephemeral_canary":true}"#))
             .unwrap_or_else(|_| Request::new(Body::empty()));
         let resp_no_csrf = app
@@ -1662,7 +1646,7 @@ mod tests {
             .method("POST")
             .uri("/api/v1/shred")
             .header(header::HOST, "127.0.0.1:8088")
-            .header(header::AUTHORIZATION, format!("Bearer {}", token))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .header("x-sentinel-csrf", &token)
             .body(Body::from(r#"{"create_ephemeral_canary":true}"#))
             .unwrap_or_else(|_| Request::new(Body::empty()));
@@ -1677,7 +1661,7 @@ mod tests {
         let req_metrics = Request::builder()
             .uri("/api/v1/metrics")
             .header(header::HOST, "127.0.0.1:8088")
-            .header(header::AUTHORIZATION, format!("Bearer {}", token))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap_or_else(|_| Request::new(Body::empty()));
         let resp_metrics = app

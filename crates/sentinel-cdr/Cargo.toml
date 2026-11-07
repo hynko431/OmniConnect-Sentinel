@@ -14,9 +14,6 @@ path = "src/main.rs"
 name = "sentinel-cdr-worker"
 path = "src/bin/sentinel_cdr_worker.rs"
 
-[lints]
-workspace = true
-
 [dependencies]
 sentinel-proto.workspace = true
 sentinel-sys.workspace = true

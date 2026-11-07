@@ -98,7 +98,7 @@ impl PendingDeviceConfirmationManager {
         let entry = map.get_mut(device_id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("No pending confirmation found for device '{}'", device_id),
+                format!("No pending confirmation found for device '{device_id}'"),
             )
         })?;
 

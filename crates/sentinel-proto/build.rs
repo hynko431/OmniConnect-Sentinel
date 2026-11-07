@@ -63,7 +63,7 @@ fn sanitize_generated_rust(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     for line in source.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("#[allow(") || trimmed.starts_with("#![allow(") {
+        if trimmed.starts_with("#[allow") || trimmed.starts_with("#![allow") {
             continue;
         }
         let cleaned = line.replace(".unwrap()", ".unwrap_or_default()");

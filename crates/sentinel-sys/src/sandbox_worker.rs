@@ -34,8 +34,8 @@ pub struct JobSandboxGuard {
 
 /// Handle to a sandboxed child worker spawned via `CreateProcessW` with `CREATE_SUSPENDED`
 /// + `EXTENDED_STARTUPINFO_PRESENT` (`PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`,
-/// `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`, `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`),
-/// assigned to a 256 MB Job Object BEFORE `ResumeThread` (`Critical #5`, Rows 88–97).
+///   `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`, `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`),
+///   assigned to a 256 MB Job Object BEFORE `ResumeThread` (`Critical #5`, Rows 88–97).
 pub struct SandboxedChildProcess {
     pub stdin: Option<File>,
     pub stdout: Option<File>,
@@ -819,10 +819,7 @@ pub fn spawn_sandboxed_worker_process(
                     drop(job_guard);
                     last_spawn_err = Some(io::Error::new(
                         io::ErrorKind::PermissionDenied,
-                        format!(
-                            "AppContainer/CIG loader init exited with 0x{:08X}",
-                            exit_code
-                        ),
+                        format!("AppContainer/CIG loader init exited with 0x{exit_code:08X}"),
                     ));
                     continue;
                 }
@@ -851,9 +848,8 @@ pub fn spawn_sandboxed_worker_process(
                     let _ = CloseHandle(stdin_write);
                     let _ = CloseHandle(stdout_read);
                 }
-                return Err(last_spawn_err.unwrap_or_else(|| {
-                    io::Error::new(io::ErrorKind::Other, "CreateProcessW failed for CDR worker")
-                }));
+                return Err(last_spawn_err
+                    .unwrap_or_else(|| io::Error::other("CreateProcessW failed for CDR worker")));
             }
         };
 
@@ -1298,7 +1294,7 @@ pub fn verify_named_pipe_client_pid(pipe_handle: isize) -> io::Result<u32> {
             if rc == 0 && cred.pid > 0 {
                 return Ok(cred.pid as u32);
             }
-            return Err(io::Error::last_os_error());
+            Err(io::Error::last_os_error())
         }
         #[cfg(not(target_os = "linux"))]
         {

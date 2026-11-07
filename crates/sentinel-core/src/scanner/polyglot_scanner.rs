@@ -124,12 +124,12 @@ impl PolyglotScanner {
 
         // 5. MP4 / MOV / ISOBMFF (`ftyp` at offset 4, or `.mp4`/`.mov`/`.m4a` extension)
         // Uses Seek::seek across all boxes regardless of >4 MB file size (`BUG-CORE-03`, `BUG-CORE-04` #3)
-        if (header.len() >= 8 && &header[4..8] == b"ftyp")
-            || matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "m4a")
+        if ((header.len() >= 8 && &header[4..8] == b"ftyp")
+            || matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "m4a"))
+            && header.len() >= 8
+            && &header[4..8] == b"ftyp"
         {
-            if header.len() >= 8 && &header[4..8] == b"ftyp" {
-                return Self::scan_mp4_seekable(reader, file_size);
-            }
+            return Self::scan_mp4_seekable(reader, file_size);
         }
 
         let _ = in_memory_slice;
@@ -208,8 +208,7 @@ impl PolyglotScanner {
                         if n == 0 {
                             break;
                         }
-                        for i in 0..n {
-                            let byte = scan_buf[i];
+                        for (i, &byte) in scan_buf[..n].iter().enumerate() {
                             let abs_idx = pos + (i as u64);
                             if !prev_ff {
                                 if byte == 0xFF {
@@ -290,8 +289,7 @@ impl PolyglotScanner {
                 eof_marker_offset: valid_end_offset as usize,
                 appended_bytes_size: trailing_overlay_bytes,
                 threat_summary: format!(
-                    "Polyglot JPEG detected: {} ({} bytes) appended after true EOI (0xFFD9) at offset {}",
-                    payload_type, trailing_overlay_bytes, valid_end_offset
+                    "Polyglot JPEG detected: {payload_type} ({trailing_overlay_bytes} bytes) appended after true EOI (0xFFD9) at offset {valid_end_offset}"
                 ),
             });
         }
@@ -448,8 +446,7 @@ impl PolyglotScanner {
                 eof_marker_offset: valid_end_offset as usize,
                 appended_bytes_size: trailing_overlay_bytes,
                 threat_summary: format!(
-                    "Polyglot PNG detected: {} ({} bytes) appended after IEND chunk at offset {}",
-                    payload_type, trailing_overlay_bytes, valid_end_offset
+                    "Polyglot PNG detected: {payload_type} ({trailing_overlay_bytes} bytes) appended after IEND chunk at offset {valid_end_offset}"
                 ),
             });
         }
@@ -478,8 +475,7 @@ impl PolyglotScanner {
                 eof_marker_offset: 0,
                 appended_bytes_size: file_size as usize,
                 threat_summary: format!(
-                    "Malformed or truncated WebP container: RIFF bound {} exceeds file size {} (fail-closed)",
-                    riff_total, file_size
+                    "Malformed or truncated WebP container: RIFF bound {riff_total} exceeds file size {file_size} (fail-closed)"
                 ),
             });
         }
@@ -502,8 +498,7 @@ impl PolyglotScanner {
                 eof_marker_offset: valid_end_offset as usize,
                 appended_bytes_size: trailing_overlay_bytes,
                 threat_summary: format!(
-                    "Polyglot WebP detected: {} ({} bytes) appended after RIFF bound at offset {}",
-                    payload_type, trailing_overlay_bytes, valid_end_offset
+                    "Polyglot WebP detected: {payload_type} ({trailing_overlay_bytes} bytes) appended after RIFF bound at offset {valid_end_offset}"
                 ),
             });
         }
@@ -526,8 +521,8 @@ impl PolyglotScanner {
             if n == 0 {
                 break;
             }
-            for i in 0..n {
-                if buf[i] == 0x3B {
+            for (i, &byte) in buf[..n].iter().enumerate() {
+                if byte == 0x3B {
                     let eof_offset = pos + (i as u64) + 1;
                     if eof_offset + 4 <= file_size {
                         let rem = (file_size - eof_offset) as usize;
@@ -541,8 +536,7 @@ impl PolyglotScanner {
                                 eof_marker_offset: eof_offset as usize,
                                 appended_bytes_size: rem,
                                 threat_summary: format!(
-                                    "Polyglot GIF detected: {} ({} bytes) appended after GIF trailer (0x3B) at offset {}",
-                                    sig, rem, eof_offset
+                                    "Polyglot GIF detected: {sig} ({rem} bytes) appended after GIF trailer (0x3B) at offset {eof_offset}"
                                 ),
                             });
                         }
@@ -590,8 +584,7 @@ impl PolyglotScanner {
                             eof_marker_offset: offset as usize,
                             appended_bytes_size: appended_size,
                             threat_summary: format!(
-                                "Polyglot MP4 detected: {} ({} bytes) appended after ISOBMFF boxes at offset {}",
-                                payload_type, appended_size, offset
+                                "Polyglot MP4 detected: {payload_type} ({appended_size} bytes) appended after ISOBMFF boxes at offset {offset}"
                             ),
                         });
                     }
@@ -632,8 +625,7 @@ impl PolyglotScanner {
                     eof_marker_offset: offset as usize,
                     appended_bytes_size: appended_size,
                     threat_summary: format!(
-                        "Polyglot MP4 detected: {} ({} bytes) appended after final ISOBMFF box at offset {}",
-                        payload_type, appended_size, offset
+                        "Polyglot MP4 detected: {payload_type} ({appended_size} bytes) appended after final ISOBMFF box at offset {offset}"
                     ),
                 });
             }

@@ -23,8 +23,7 @@ pub enum ShredMethod {
 }
 
 impl ShredMethod {
-    #[allow(non_upper_case_globals)]
-    pub const NistClearThreePass: Self = Self::ClearMultiPass { passes: 3 };
+    pub const NIST_CLEAR_THREE_PASS: Self = Self::ClearMultiPass { passes: 3 };
 
     pub const fn default_clear() -> Self {
         Self::ClearMultiPass { passes: 3 }
@@ -83,7 +82,7 @@ impl SecureShredder {
         };
 
         let sym_meta = fs::symlink_metadata(&target_path)
-            .map_err(|e| format!("Failed reading symlink_metadata: {}", e))?;
+            .map_err(|e| format!("Failed reading symlink_metadata: {e}"))?;
         if is_reparse_point_or_symlink(&sym_meta) {
             return Err(format!(
                 "Refusing to shred symlink or NTFS reparse point: {}",
@@ -95,10 +94,10 @@ impl SecureShredder {
 
         // 1. Clear READONLY / HIDDEN / SYSTEM attributes via safe FFI wrapper
         normalize_file_attributes(&target_path)
-            .map_err(|e| format!("Failed normalizing file attributes: {}", e))?;
+            .map_err(|e| format!("Failed normalizing file attributes: {e}"))?;
 
         let metadata = fs::symlink_metadata(&target_path)
-            .map_err(|e| format!("Failed reading file metadata: {}", e))?;
+            .map_err(|e| format!("Failed reading file metadata: {e}"))?;
         let file_size = metadata.len();
         let detected_media = query_media_type(&target_path);
         let sector_alignment = query_sector_alignment_for_path(&target_path, None).max(512);
@@ -122,15 +121,14 @@ impl SecureShredder {
         let padded_size = if file_size == 0 {
             0
         } else {
-            ((file_size + sector_u64 - 1) / sector_u64) * sector_u64
+            file_size.div_ceil(sector_u64) * sector_u64
         };
 
         let mut unbuffered_completed = false;
         if padded_size > 0 {
             if let Ok(mut nb_file) = open_no_buffering_write_through(&target_path) {
                 let actual_sector = query_sector_alignment(&nb_file).max(sector_alignment) as u64;
-                let nb_padded_size =
-                    ((file_size + actual_sector - 1) / actual_sector) * actual_sector;
+                let nb_padded_size = file_size.div_ceil(actual_sector) * actual_sector;
                 let mut nb_ok = true;
 
                 for pass in 1..=effective_passes {
@@ -209,15 +207,12 @@ impl SecureShredder {
             all_flushes_ok = true;
             verification_passed = true;
             let mut file = open_write_through(&target_path).map_err(|e| {
-                format!(
-                    "Failed opening file with write-through flags for shredding: {}",
-                    e
-                )
+                format!("Failed opening file with write-through flags for shredding: {e}")
             })?;
 
             for pass in 1..=effective_passes {
                 file.seek(SeekFrom::Start(0))
-                    .map_err(|e| format!("Seek failed on pass {}: {}", pass, e))?;
+                    .map_err(|e| format!("Seek failed on pass {pass}: {e}"))?;
 
                 let mut remaining = file_size;
                 let mut pass_hasher = Sha256::new();
@@ -234,7 +229,7 @@ impl SecureShredder {
                     }
 
                     file.write_all(&aligned_buf.data[..to_write])
-                        .map_err(|e| format!("Write failed on pass {}: {}", pass, e))?;
+                        .map_err(|e| format!("Write failed on pass {pass}: {e}"))?;
 
                     if pass == effective_passes {
                         pass_hasher.update(&aligned_buf.data[..to_write]);
@@ -253,7 +248,7 @@ impl SecureShredder {
 
             if file_size > 0 {
                 file.seek(SeekFrom::Start(0))
-                    .map_err(|e| format!("Verification seek failed: {}", e))?;
+                    .map_err(|e| format!("Verification seek failed: {e}"))?;
                 let mut verify_hasher = Sha256::new();
                 let mut verify_remaining = file_size;
                 while verify_remaining > 0 {
@@ -274,7 +269,7 @@ impl SecureShredder {
                     verification_passed = verify_hex == final_pass_sha256;
                 }
             } else {
-                let empty_hash = Sha256::digest(&[]);
+                let empty_hash = Sha256::digest([]);
                 final_pass_sha256 = hex::encode(empty_hash);
             }
 
@@ -284,17 +279,11 @@ impl SecureShredder {
         // Truncate cluster allocation to 0 bytes after hash verification, propagating errors (`Row 61`)
         {
             let trunc_file = open_write_through(&target_path).map_err(|e| {
-                format!(
-                    "Failed reopening '{}' for zero-length truncation: {}",
-                    original_path_str, e
-                )
+                format!("Failed reopening '{original_path_str}' for zero-length truncation: {e}")
             })?;
-            trunc_file.set_len(0).map_err(|e| {
-                format!(
-                    "Failed truncating '{}' to 0 bytes: {}",
-                    original_path_str, e
-                )
-            })?;
+            trunc_file
+                .set_len(0)
+                .map_err(|e| format!("Failed truncating '{original_path_str}' to 0 bytes: {e}"))?;
             let flushed_after_trunc = flush_hardware_buffers(&trunc_file);
             all_flushes_ok = all_flushes_ok && flushed_after_trunc;
         }
@@ -400,7 +389,7 @@ impl SecureShredder {
         ledger.append_event(
             event_type,
             serde_json::to_value(receipt)
-                .map_err(|e| format!("Failed serializing ShredReceipt for AuditLedger: {}", e))?,
+                .map_err(|e| format!("Failed serializing ShredReceipt for AuditLedger: {e}"))?,
         )?;
         Ok(())
     }
@@ -446,7 +435,7 @@ impl SecureShredder {
         let display_ads = format!("{}:{}", host_path.display(), clean_stream);
 
         let metadata = fs::metadata(ads_path)
-            .map_err(|e| format!("Failed querying NTFS ADS '{}': {}", display_ads, e))?;
+            .map_err(|e| format!("Failed querying NTFS ADS '{display_ads}': {e}"))?;
         let stream_size = metadata.len();
         let detected_media = query_media_type(&base_host);
         let sector_alignment = query_sector_alignment_for_path(&base_host, None).max(512);
@@ -458,10 +447,7 @@ impl SecureShredder {
 
         {
             let mut stream_file = open_write_through(ads_path).map_err(|e| {
-                format!(
-                    "Failed opening NTFS ADS '{}' for write-through shredding: {}",
-                    display_ads, e
-                )
+                format!("Failed opening NTFS ADS '{display_ads}' for write-through shredding: {e}")
             })?;
 
             let mut aligned_buf = Box::new(AlignedSectorBuffer::new());
@@ -470,7 +456,7 @@ impl SecureShredder {
             for pass in 1..=passes {
                 stream_file
                     .seek(SeekFrom::Start(0))
-                    .map_err(|e| format!("ADS seek error on pass {}: {}", pass, e))?;
+                    .map_err(|e| format!("ADS seek error on pass {pass}: {e}"))?;
 
                 let mut remaining = stream_size;
                 let mut hasher = Sha256::new();
@@ -484,7 +470,7 @@ impl SecureShredder {
                     }
                     stream_file
                         .write_all(&aligned_buf.data[..to_write])
-                        .map_err(|e| format!("ADS write error on pass {}: {}", pass, e))?;
+                        .map_err(|e| format!("ADS write error on pass {pass}: {e}"))?;
                     if pass == passes {
                         hasher.update(&aligned_buf.data[..to_write]);
                     }
@@ -502,7 +488,7 @@ impl SecureShredder {
             if stream_size > 0 {
                 stream_file
                     .seek(SeekFrom::Start(0))
-                    .map_err(|e| format!("ADS verification seek failed: {}", e))?;
+                    .map_err(|e| format!("ADS verification seek failed: {e}"))?;
                 let mut verify_hasher = Sha256::new();
                 let mut rem = stream_size;
                 while rem > 0 {
@@ -523,21 +509,18 @@ impl SecureShredder {
                         hex::encode(verify_hasher.finalize()) == final_pass_sha256;
                 }
             } else {
-                final_pass_sha256 = hex::encode(Sha256::digest(&[]));
+                final_pass_sha256 = hex::encode(Sha256::digest([]));
             }
 
             stream_file.set_len(0).map_err(|e| {
-                format!(
-                    "Failed truncating NTFS ADS '{}' to 0 bytes: {}",
-                    display_ads, e
-                )
+                format!("Failed truncating NTFS ADS '{display_ads}' to 0 bytes: {e}")
             })?;
             all_flushes_ok = all_flushes_ok && flush_hardware_buffers(&stream_file);
         }
 
         // Unlink only the Alternate Data Stream; host file remains untouched
         fs::remove_file(ads_path)
-            .map_err(|e| format!("Failed unlinking NTFS ADS '{}': {}", display_ads, e))?;
+            .map_err(|e| format!("Failed unlinking NTFS ADS '{display_ads}': {e}"))?;
 
         let media_type_label = format!("{:?} — {}", detected_media, detected_media.label());
 
@@ -596,7 +579,7 @@ impl SecureShredder {
         opts.create_new(true).read(true).write(true);
         let mut file = opts
             .open(to_verbatim_path(&balloon_path))
-            .map_err(|e| format!("Failed creating free-space balloon file: {}", e))?;
+            .map_err(|e| format!("Failed creating free-space balloon file: {e}"))?;
 
         let mut aligned_chunk = Box::new(AlignedSectorBuffer::new());
         rand::thread_rng().fill_bytes(&mut aligned_chunk.data);
@@ -612,7 +595,7 @@ impl SecureShredder {
         drop(file);
         fs::remove_file(to_verbatim_path(&balloon_path))
             .or_else(|_| fs::remove_file(&balloon_path))
-            .map_err(|e| format!("Failed removing free-space balloon file: {}", e))?;
+            .map_err(|e| format!("Failed removing free-space balloon file: {e}"))?;
         Ok(written)
     }
 }

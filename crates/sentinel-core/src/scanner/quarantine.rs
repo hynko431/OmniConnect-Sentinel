@@ -205,19 +205,12 @@ impl QuarantineVault {
                 e
             )
         })?;
-        let escrow_blob: SocEscrowBlob = serde_json::from_slice(&raw_escrow).map_err(|e| {
-            format!(
-                "VAULT_INTEGRITY_FAIL: Corrupted offline SOC escrow JSON: {}",
-                e
-            )
-        })?;
+        let escrow_blob: SocEscrowBlob = serde_json::from_slice(&raw_escrow)
+            .map_err(|e| format!("VAULT_INTEGRITY_FAIL: Corrupted offline SOC escrow JSON: {e}"))?;
 
         let mut recovered_kek = decrypt_kek_from_soc_escrow(&escrow_blob, soc_rsa_priv_blob)
             .map_err(|e| {
-                format!(
-                    "VAULT_INTEGRITY_FAIL: Offline SOC RSA-OAEP decryption failed: {}",
-                    e
-                )
+                format!("VAULT_INTEGRITY_FAIL: Offline SOC RSA-OAEP decryption failed: {e}")
             })?;
         let computed_id = Self::compute_kek_id(&recovered_kek);
         if computed_id != escrow_blob.kek_id {
@@ -233,7 +226,7 @@ impl QuarantineVault {
 
         let context = format!("OmniConnect-Sentinel-Vault:{}", vault_dir.display());
         let sealed_blob = seal_key_bytes(zeroizing.as_slice(), context.as_bytes(), &computed_id)
-            .map_err(|e| format!("Failed re-sealing recovered KEK: {}", e))?;
+            .map_err(|e| format!("Failed re-sealing recovered KEK: {e}"))?;
         let posture = sealed_blob.posture;
         let degradation_event = if posture == KeyProtectionPosture::Tpm2Assisted {
             None
@@ -242,10 +235,10 @@ impl QuarantineVault {
         };
 
         let serialized = serde_json::to_vec_pretty(&sealed_blob)
-            .map_err(|e| format!("Failed serializing re-sealed KEK: {}", e))?;
+            .map_err(|e| format!("Failed serializing re-sealed KEK: {e}"))?;
         let sealed_path = vault_dir.join(SEALED_KEK_FILENAME);
         write_protected_key_file(&sealed_path, &serialized)
-            .map_err(|e| format!("Failed persisting re-sealed KEK: {}", e))?;
+            .map_err(|e| format!("Failed persisting re-sealed KEK: {e}"))?;
 
         let vault = Self {
             vault_dir,
@@ -257,10 +250,7 @@ impl QuarantineVault {
         };
         vault.append_ledger_event(
             "VAULT_ESCROW_RECOVERED",
-            &format!(
-                "Recovered master KEK '{}' via offline SOC RSA-2048 OAEP escrow",
-                computed_id
-            ),
+            &format!("Recovered master KEK '{computed_id}' via offline SOC RSA-2048 OAEP escrow"),
         )?;
         Ok(vault)
     }
@@ -374,7 +364,7 @@ impl QuarantineVault {
         let kek_id = Self::compute_kek_id(zeroizing.as_slice());
 
         let blob = seal_key_bytes(zeroizing.as_slice(), context.as_bytes(), &kek_id)
-            .map_err(|e| format!("Failed sealing new Master KEK: {}", e))?;
+            .map_err(|e| format!("Failed sealing new Master KEK: {e}"))?;
         let posture = blob.posture;
         let degradation = if posture == KeyProtectionPosture::Tpm2Assisted {
             None
@@ -389,7 +379,7 @@ impl QuarantineVault {
         };
 
         let serialized = serde_json::to_vec_pretty(&blob)
-            .map_err(|e| format!("Failed serializing sealed KEK blob: {}", e))?;
+            .map_err(|e| format!("Failed serializing sealed KEK blob: {e}"))?;
         write_protected_key_file(&sealed_path, &serialized)
             .map_err(|e| format!("Failed writing {}: {}", sealed_path.display(), e))?;
 
@@ -400,9 +390,9 @@ impl QuarantineVault {
         let escrow_res = encrypt_kek_for_soc_escrow(&kek_arr, soc_rsa_pub_blob, &kek_id);
         zeroize_slice(&mut kek_arr);
         let escrow_blob = escrow_res
-            .map_err(|e| format!("Failed encrypting Master KEK for offline SOC escrow: {}", e))?;
+            .map_err(|e| format!("Failed encrypting Master KEK for offline SOC escrow: {e}"))?;
         let escrow_json = serde_json::to_vec_pretty(&escrow_blob)
-            .map_err(|e| format!("Failed serializing SOC escrow blob: {}", e))?;
+            .map_err(|e| format!("Failed serializing SOC escrow blob: {e}"))?;
         write_protected_key_file(&escrow_path, &escrow_json)
             .map_err(|e| format!("Failed writing {}: {}", escrow_path.display(), e))?;
 
@@ -448,21 +438,21 @@ impl QuarantineVault {
 
         let mut ipad = [0x36u8; BLOCK_SIZE];
         let mut opad = [0x5cu8; BLOCK_SIZE];
-        for i in 0..BLOCK_SIZE {
-            ipad[i] ^= key_block[i];
-            opad[i] ^= key_block[i];
+        for ((ip, op), &kb) in ipad.iter_mut().zip(opad.iter_mut()).zip(key_block.iter()) {
+            *ip ^= kb;
+            *op ^= kb;
         }
         zeroize_slice(&mut key_block);
 
         let mut inner = Sha256::new();
-        inner.update(&ipad);
+        inner.update(ipad);
         inner.update(message);
         let inner_hash = inner.finalize();
         zeroize_slice(&mut ipad);
 
         let mut outer = Sha256::new();
-        outer.update(&opad);
-        outer.update(&inner_hash);
+        outer.update(opad);
+        outer.update(inner_hash);
         let final_hash = outer.finalize();
         zeroize_slice(&mut opad);
 
@@ -495,13 +485,13 @@ impl QuarantineVault {
                     aad: entry_id.as_bytes(),
                 },
             )
-            .map_err(|e| format!("Failed wrapping per-entry DEK: {}", e))?;
+            .map_err(|e| format!("Failed wrapping per-entry DEK: {e}"))?;
 
         let mut dek_blob = Vec::with_capacity(12 + wrapped_ct.len());
         dek_blob.extend_from_slice(&wrap_nonce);
         dek_blob.extend_from_slice(&wrapped_ct);
 
-        let dek_path = self.vault_dir.join(format!("{}.dek", entry_id));
+        let dek_path = self.vault_dir.join(format!("{entry_id}.dek"));
         write_protected_key_file(&dek_path, &dek_blob).map_err(|e| {
             format!(
                 "Failed persisting wrapped DEK {}: {}",
@@ -517,7 +507,7 @@ impl QuarantineVault {
         entry_id: &str,
         file_salt: &[u8; 32],
     ) -> Result<ZeroizingBytes<32>, String> {
-        let dek_path = self.vault_dir.join(format!("{}.dek", entry_id));
+        let dek_path = self.vault_dir.join(format!("{entry_id}.dek"));
         let dek_blob = fs::read(&dek_path).map_err(|e| {
             format!(
                 "VAULT_INTEGRITY_FAIL: Wrapped DEK '{}' missing or crypto-erased: {}",
@@ -601,9 +591,9 @@ impl QuarantineVault {
         let mut raw_bytes = Vec::new();
         {
             let mut file = File::open(file_path)
-                .map_err(|e| format!("Failed to open source file for quarantine: {}", e))?;
+                .map_err(|e| format!("Failed to open source file for quarantine: {e}"))?;
             file.read_to_end(&mut raw_bytes)
-                .map_err(|e| format!("Failed reading file for quarantine: {}", e))?;
+                .map_err(|e| format!("Failed reading file for quarantine: {e}"))?;
         }
 
         let entry = self.seal_bytes_into_vault(
@@ -657,9 +647,9 @@ impl QuarantineVault {
         let mut raw_bytes = Vec::new();
         {
             let mut file = File::open(file_path)
-                .map_err(|e| format!("Failed to open source file for quarantine: {}", e))?;
+                .map_err(|e| format!("Failed to open source file for quarantine: {e}"))?;
             file.read_to_end(&mut raw_bytes)
-                .map_err(|e| format!("Failed reading file for quarantine: {}", e))?;
+                .map_err(|e| format!("Failed reading file for quarantine: {e}"))?;
         }
 
         let entry =
@@ -682,8 +672,7 @@ impl QuarantineVault {
             let _ = fs::remove_file(quar_path);
             let _ = fs::remove_file(self.vault_dir.join(format!("{}.dek", entry.entry_id)));
             return Err(format!(
-                "INVARIANT_I4_ABORT: Vault verification failed before source removal ({}); source file preserved intact",
-                verify_err
+                "INVARIANT_I4_ABORT: Vault verification failed before source removal ({verify_err}); source file preserved intact"
             ));
         }
 
@@ -721,14 +710,12 @@ impl QuarantineVault {
         {
             let mut file = File::open(&stream_full_path).map_err(|e| {
                 format!(
-                    "Failed opening NTFS Alternate Data Stream '{}' for quarantine: {}",
-                    logical_display_path, e
+                    "Failed opening NTFS Alternate Data Stream '{logical_display_path}' for quarantine: {e}"
                 )
             })?;
             file.read_to_end(&mut raw_bytes).map_err(|e| {
                 format!(
-                    "Failed reading NTFS Alternate Data Stream '{}' for quarantine: {}",
-                    logical_display_path, e
+                    "Failed reading NTFS Alternate Data Stream '{logical_display_path}' for quarantine: {e}"
                 )
             })?;
         }
@@ -811,7 +798,7 @@ impl QuarantineVault {
         };
 
         let header_json = serde_json::to_vec(&header)
-            .map_err(|e| format!("Failed serializing quarantine header: {}", e))?;
+            .map_err(|e| format!("Failed serializing quarantine header: {e}"))?;
 
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(entry_dek.as_slice()));
         let ciphertext = cipher
@@ -822,16 +809,16 @@ impl QuarantineVault {
                     aad: &header_json,
                 },
             )
-            .map_err(|e| format!("AES-256-GCM AEAD encryption failure: {}", e))?;
+            .map_err(|e| format!("AES-256-GCM AEAD encryption failure: {e}"))?;
 
-        let vault_file_name = format!("{}.quar", entry_id);
+        let vault_file_name = format!("{entry_id}.quar");
         let vault_file_path = self.vault_dir.join(&vault_file_name);
-        let tmp_file_path = self.vault_dir.join(format!("{}.quar.tmp", entry_id));
+        let tmp_file_path = self.vault_dir.join(format!("{entry_id}.quar.tmp"));
 
         // Exact layout (`Plan v2 §1.1 #4`): `[header_len: u32 LE][header JSON][ciphertext]`
         {
             let mut vault_file = File::create(&tmp_file_path)
-                .map_err(|e| format!("Failed creating temporary vault file: {}", e))?;
+                .map_err(|e| format!("Failed creating temporary vault file: {e}"))?;
             let header_len = header_json.len() as u32;
             vault_file
                 .write_all(&header_len.to_le_bytes())
@@ -846,7 +833,7 @@ impl QuarantineVault {
         }
 
         fs::rename(&tmp_file_path, &vault_file_path)
-            .map_err(|e| format!("Atomic rename into quarantine vault failed: {}", e))?;
+            .map_err(|e| format!("Atomic rename into quarantine vault failed: {e}"))?;
         apply_system_admin_dacl(&vault_file_path).map_err(|e| {
             format!(
                 "Failed applying SYSTEM/Admin DACL to {}: {}",
@@ -855,7 +842,7 @@ impl QuarantineVault {
             )
         })?;
         sync_directory(&self.vault_dir)
-            .map_err(|e| format!("Failed syncing quarantine vault directory: {}", e))?;
+            .map_err(|e| format!("Failed syncing quarantine vault directory: {e}"))?;
 
         info!(
             "Artifact quarantined into {} (ID: {}, SHA256: {})",
@@ -889,7 +876,7 @@ impl QuarantineVault {
             return Err("Invalid quarantine entry ID".to_string());
         }
 
-        let vault_file_path = self.vault_dir.join(format!("{}.quar", entry_id));
+        let vault_file_path = self.vault_dir.join(format!("{entry_id}.quar"));
         let envelope_bytes = fs::read(&vault_file_path).map_err(|e| {
             format!(
                 "VAULT_INTEGRITY_FAIL: Failed reading quarantine envelope {}: {}",
@@ -950,21 +937,21 @@ impl QuarantineVault {
         {
             let mut out = File::create(&tmp_restore).map_err(|e| {
                 zeroize_slice(&mut plaintext);
-                format!("Failed creating restore target: {}", e)
+                format!("Failed creating restore target: {e}")
             })?;
             if let Err(e) = out.write_all(&plaintext).and_then(|_| out.sync_all()) {
                 zeroize_slice(&mut plaintext);
-                return Err(format!("Failed writing restored file: {}", e));
+                return Err(format!("Failed writing restored file: {e}"));
             }
         }
         zeroize_slice(&mut plaintext);
 
         fs::rename(&tmp_restore, destination_path)
-            .map_err(|e| format!("Failed finalizing restored file: {}", e))?;
+            .map_err(|e| format!("Failed finalizing restored file: {e}"))?;
         if let Some(parent) = destination_path.parent() {
             if !parent.as_os_str().is_empty() {
                 sync_directory(parent)
-                    .map_err(|e| format!("Failed syncing restore parent directory: {}", e))?;
+                    .map_err(|e| format!("Failed syncing restore parent directory: {e}"))?;
             }
         }
 
@@ -994,7 +981,7 @@ impl QuarantineVault {
         if entry_id.contains('/') || entry_id.contains('\\') || entry_id.contains("..") {
             return Err("Invalid quarantine entry ID".to_string());
         }
-        let vault_file_path = self.vault_dir.join(format!("{}.quar", entry_id));
+        let vault_file_path = self.vault_dir.join(format!("{entry_id}.quar"));
         let envelope_bytes = fs::read(&vault_file_path).map_err(|e| {
             format!(
                 "VAULT_INTEGRITY_FAIL: Failed reading quarantine envelope {}: {}",
@@ -1035,13 +1022,13 @@ impl QuarantineVault {
         if entry_id.contains('/') || entry_id.contains('\\') || entry_id.contains("..") {
             return Err("Invalid quarantine entry ID".to_string());
         }
-        let vault_file_path = self.vault_dir.join(format!("{}.quar", entry_id));
+        let vault_file_path = self.vault_dir.join(format!("{entry_id}.quar"));
         if !vault_file_path.exists() {
-            return Err(format!("Quarantine entry '{}' not found", entry_id));
+            return Err(format!("Quarantine entry '{entry_id}' not found"));
         }
 
         // Step 1: True Cryptographic Erasure — overwrite and destroy the wrapped per-entry DEK (`<entry_id>.dek`)
-        let dek_path = self.vault_dir.join(format!("{}.dek", entry_id));
+        let dek_path = self.vault_dir.join(format!("{entry_id}.dek"));
         if dek_path.exists() {
             SecureShredder::shred_file(&dek_path, ShredMethod::ClearMultiPass { passes: 3 })?;
         }
@@ -1049,14 +1036,11 @@ impl QuarantineVault {
         // Step 2: Overwrite and unlink the `.quar` ciphertext envelope and sync the directory
         SecureShredder::shred_file(&vault_file_path, ShredMethod::CryptoErase)?;
         sync_directory(&self.vault_dir)
-            .map_err(|e| format!("Failed syncing quarantine directory after purge: {}", e))?;
+            .map_err(|e| format!("Failed syncing quarantine directory after purge: {e}"))?;
 
         self.append_ledger_event(
             "QUARANTINE_PURGED",
-            &format!(
-                "Crypto-erased DEK and shredded quarantine entry '{}'",
-                entry_id
-            ),
+            &format!("Crypto-erased DEK and shredded quarantine entry '{entry_id}'"),
         )?;
 
         Ok(())
@@ -1147,7 +1131,7 @@ impl QuarantineVault {
 
         let mut migrated_ids = Vec::new();
         let read_dir = fs::read_dir(&self.vault_dir)
-            .map_err(|e| format!("Failed reading vault directory for migration: {}", e))?;
+            .map_err(|e| format!("Failed reading vault directory for migration: {e}"))?;
 
         for dir_entry in read_dir.flatten() {
             let path = dir_entry.path();
@@ -1175,7 +1159,7 @@ impl QuarantineVault {
                             "migration_action": "KEEP_INERT_CIPHERTEXT"
                         });
                         let serialized = serde_json::to_vec_pretty(&marker)
-                            .map_err(|e| format!("Failed serializing legacy marker: {}", e))?;
+                            .map_err(|e| format!("Failed serializing legacy marker: {e}"))?;
                         write_protected_key_file(&json_sidecar, &serialized).map_err(|e| {
                             format!(
                                 "Failed writing legacy marker {}: {}",
@@ -1241,8 +1225,7 @@ impl QuarantineVault {
         let ciphertext = &bytes[4 + header_len..];
         let header: QuarantineEnvelopeHeader = serde_json::from_slice(header_json).map_err(|e| {
             format!(
-                "VAULT_INTEGRITY_FAIL: Malformed quarantine envelope header JSON (UNRECOVERABLE_LEGACY): {}",
-                e
+                "VAULT_INTEGRITY_FAIL: Malformed quarantine envelope header JSON (UNRECOVERABLE_LEGACY): {e}"
             )
         })?;
         if &header.magic != ENVELOPE_MAGIC_V2_FULL || header.version != ENVELOPE_VERSION {

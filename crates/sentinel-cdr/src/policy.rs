@@ -234,8 +234,7 @@ impl ResourceBudget {
         if bytes > self.bytes_remaining {
             self.bytes_remaining = 0;
             return Err(crate::error::CdrError::ResourceLimitExceeded(format!(
-                "Cumulative decompressed byte budget exceeded (requested {} bytes)",
-                bytes
+                "Cumulative decompressed byte budget exceeded (requested {bytes} bytes)"
             )));
         }
         self.bytes_remaining -= bytes;

@@ -225,8 +225,7 @@ impl SentinelMetrics {
             } else {
                 for ((fmt, status), val) in guard.iter() {
                     out.push_str(&format!(
-                        "sentinel_cdr_processed_total{{format=\"{}\",status=\"{}\"}} {}\n",
-                        fmt, status, val
+                        "sentinel_cdr_processed_total{{format=\"{fmt}\",status=\"{status}\"}} {val}\n"
                     ));
                 }
             }
@@ -244,8 +243,7 @@ impl SentinelMetrics {
             } else {
                 for (fmt, val) in guard.iter() {
                     out.push_str(&format!(
-                        "sentinel_cdr_duration_ms{{format=\"{}\"}} {}\n",
-                        fmt, val
+                        "sentinel_cdr_duration_ms{{format=\"{fmt}\"}} {val}\n"
                     ));
                 }
             }
@@ -265,8 +263,7 @@ impl SentinelMetrics {
             } else {
                 for ((cat, sev), val) in guard.iter() {
                     out.push_str(&format!(
-                        "sentinel_threats_total{{category=\"{}\",severity=\"{}\"}} {}\n",
-                        cat, sev, val
+                        "sentinel_threats_total{{category=\"{cat}\",severity=\"{sev}\"}} {val}\n"
                     ));
                 }
             }
@@ -286,8 +283,7 @@ impl SentinelMetrics {
             } else {
                 for ((op, status), val) in guard.iter() {
                     out.push_str(&format!(
-                        "sentinel_vault_ops_total{{op=\"{}\",status=\"{}\"}} {}\n",
-                        op, status, val
+                        "sentinel_vault_ops_total{{op=\"{op}\",status=\"{status}\"}} {val}\n"
                     ));
                 }
             }
@@ -383,7 +379,7 @@ impl BreakGlassToken {
         }
         let digest = Self::signing_digest(&token_id, &reason, expires_at_unix);
         let sig_bytes = sign_ecdsa_p256_with_private_blob(private_key_blob, &digest)
-            .map_err(|e| format!("Failed signing BreakGlassToken with ECDSA P-256: {}", e))?;
+            .map_err(|e| format!("Failed signing BreakGlassToken with ECDSA P-256: {e}"))?;
         Ok(Self {
             token_id,
             reason,
@@ -409,10 +405,10 @@ impl BreakGlassToken {
             ));
         }
         let sig_bytes = hex::decode(&self.signature_hex)
-            .map_err(|e| format!("Invalid BreakGlassToken signature hex: {}", e))?;
+            .map_err(|e| format!("Invalid BreakGlassToken signature hex: {e}"))?;
         let digest = Self::signing_digest(&self.token_id, &self.reason, self.expires_at_unix);
         let verified = verify_ecdsa_p256_digest(trusted_public_key, &digest, &sig_bytes)
-            .map_err(|e| format!("ECDSA P-256 break-glass verification error: {}", e))?;
+            .map_err(|e| format!("ECDSA P-256 break-glass verification error: {e}"))?;
         if !verified {
             return Err(format!(
                 "Break-glass token '{}' failed ECDSA P-256 cryptographic signature verification",

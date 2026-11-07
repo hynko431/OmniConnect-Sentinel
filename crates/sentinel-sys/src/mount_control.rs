@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use tracing::{debug, info};
 
 /// Exact `mountmgr.h` & `winioctl.h` IOCTL control codes:
@@ -261,7 +262,7 @@ pub fn resolve_physical_drive_path(volume_path: &Path) -> Option<String> {
         let device_path = if trimmed.starts_with(r"\\.\") || trimmed.starts_with(r"\\?\") {
             trimmed.to_string()
         } else {
-            format!(r"\\.\{}", trimmed)
+            format!(r"\\.\{trimmed}")
         };
         let wide: Vec<u16> = std::ffi::OsStr::new(&device_path)
             .encode_wide()
@@ -898,7 +899,7 @@ pub fn purge_stale_mounted_devices() -> io::Result<usize> {
 
         for i in 3..26u32 {
             let letter = (b'A' + i as u8) as char;
-            let root = format!("{}:\\", letter);
+            let root = format!("{letter}:\\");
             let root_wide: Vec<u16> = std::ffi::OsStr::new(&root)
                 .encode_wide()
                 .chain(Some(0))
@@ -912,7 +913,7 @@ pub fn purge_stale_mounted_devices() -> io::Result<usize> {
                     continue;
                 }
             }
-            let dos_dev = format!("\\DosDevices\\{}:", letter);
+            let dos_dev = format!("\\DosDevices\\{letter}:");
             let val_wide: Vec<u16> = std::ffi::OsStr::new(&dos_dev)
                 .encode_wide()
                 .chain(Some(0))
@@ -976,7 +977,7 @@ pub fn set_volume_offline(volume_path: &Path, offline: bool) -> io::Result<()> {
         let device_path = if trimmed.starts_with(r"\\.\") || trimmed.starts_with(r"\\?\") {
             trimmed.to_string()
         } else {
-            format!(r"\\.\{}", trimmed)
+            format!(r"\\.\{trimmed}")
         };
         let wide: Vec<u16> = std::ffi::OsStr::new(&device_path)
             .encode_wide()
@@ -1066,7 +1067,7 @@ pub fn set_volume_online_readonly(volume_path: &Path, readonly: bool) -> io::Res
             if trimmed.starts_with(r"\\.\") || trimmed.starts_with(r"\\?\") {
                 trimmed.to_string()
             } else {
-                format!(r"\\.\{}", trimmed)
+                format!(r"\\.\{trimmed}")
             }
         });
 
@@ -1192,7 +1193,7 @@ pub fn is_volume_readonly(volume_path: &Path) -> bool {
             if trimmed.starts_with(r"\\.\") || trimmed.starts_with(r"\\?\") {
                 trimmed.to_string()
             } else {
-                format!(r"\\.\{}", trimmed)
+                format!(r"\\.\{trimmed}")
             }
         });
         let wide: Vec<u16> = std::ffi::OsStr::new(&target)
@@ -1299,7 +1300,7 @@ pub fn is_volume_offline(volume_path: &Path) -> bool {
         let device_path = if trimmed.starts_with(r"\\.\") || trimmed.starts_with(r"\\?\") {
             trimmed.to_string()
         } else {
-            format!(r"\\.\{}", trimmed)
+            format!(r"\\.\{trimmed}")
         };
         let wide: Vec<u16> = std::ffi::OsStr::new(&device_path)
             .encode_wide()
@@ -1437,7 +1438,7 @@ pub fn delete_volume_mount_point(mount_point: &str) -> io::Result<()> {
         let normalized = if mount_point.ends_with('\\') {
             mount_point.to_string()
         } else {
-            format!("{}\\", mount_point)
+            format!("{mount_point}\\")
         };
         let wide: Vec<u16> = std::ffi::OsStr::new(&normalized)
             .encode_wide()
@@ -1543,6 +1544,7 @@ pub fn apply_usb_storage_and_install_policies(allowed_hardware_ids: &[String]) -
     Ok(())
 }
 
+#[cfg(windows)]
 fn parse_vid_pid_serial(instance_id: &str) -> Option<(u16, u16, String)> {
     let upper = instance_id.to_ascii_uppercase();
     let vid_pos = upper.find("VID_")?;
@@ -1763,7 +1765,7 @@ pub fn is_hardware_id_allowed(device_id: &str, allowed_hardware_ids: &[String]) 
             if candidate.starts_with(prefix) || candidate.contains(prefix) {
                 return true;
             }
-        } else if candidate == pat || candidate.starts_with(&format!("{}\\", pat)) {
+        } else if candidate == pat || candidate.starts_with(&format!("{pat}\\")) {
             return true;
         }
     }
@@ -1779,10 +1781,9 @@ pub fn cleanup_unapproved_usb_devices(allowed_hardware_ids: &[String]) -> io::Re
         if (dev.has_mass_storage || dev.is_composite_hid_storage)
             && !is_hardware_id_allowed(&hw_key, allowed_hardware_ids)
             && !is_hardware_id_allowed(&dev.instance_id, allowed_hardware_ids)
+            && disable_device_node(&dev.instance_id).is_ok()
         {
-            if disable_device_node(&dev.instance_id).is_ok() {
-                disabled.push(dev.instance_id);
-            }
+            disabled.push(dev.instance_id);
         }
     }
     for vol in enumerate_usb_volumes() {
@@ -1811,20 +1812,14 @@ pub fn disable_device_node(device_instance_id: &str) -> io::Result<()> {
         if cr_locate != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!(
-                    "CM_Locate_DevNodeW({}) returned CR={:#x}",
-                    device_instance_id, cr_locate
-                ),
+                format!("CM_Locate_DevNodeW({device_instance_id}) returned CR={cr_locate:#x}"),
             ));
         }
         let cr_disable = unsafe { CM_Disable_DevNode(dev_inst, 0) };
         if cr_disable != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!(
-                    "CM_Disable_DevNode({}) returned CR={:#x}",
-                    device_instance_id, cr_disable
-                ),
+                format!("CM_Disable_DevNode({device_instance_id}) returned CR={cr_disable:#x}"),
             ));
         }
         Ok(())
@@ -1880,20 +1875,14 @@ pub fn enable_device_node(device_instance_id: &str) -> io::Result<()> {
         if cr_locate != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!(
-                    "CM_Locate_DevNodeW({}) returned CR={:#x}",
-                    device_instance_id, cr_locate
-                ),
+                format!("CM_Locate_DevNodeW({device_instance_id}) returned CR={cr_locate:#x}"),
             ));
         }
         let cr_enable = unsafe { CM_Enable_DevNode(dev_inst, 0) };
         if cr_enable != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!(
-                    "CM_Enable_DevNode({}) returned CR={:#x}",
-                    device_instance_id, cr_enable
-                ),
+                format!("CM_Enable_DevNode({device_instance_id}) returned CR={cr_enable:#x}"),
             ));
         }
         Ok(())
@@ -1975,10 +1964,9 @@ where
             unsafe {
                 let _ = Box::from_raw(ctx_ptr);
             }
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("CM_Register_Notification failed with CR={:#x}", cr),
-            ));
+            return Err(io::Error::other(format!(
+                "CM_Register_Notification failed with CR={cr:#x}"
+            )));
         }
         debug!(
             "Registered CM_Register_Notification PnP handle {}",
@@ -2059,7 +2047,7 @@ impl Drop for PnpNotificationGuard {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(not(windows))]
 fn check_linux_usb_authorized_default() -> Option<bool> {
     let usb_dir = std::path::Path::new("/sys/bus/usb/devices");
     if !usb_dir.exists() {

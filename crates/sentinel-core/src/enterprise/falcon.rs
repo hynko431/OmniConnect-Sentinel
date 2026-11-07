@@ -172,17 +172,7 @@ impl CrowdStrikeFalconBridge {
         let safe_msg = Self::escape_cef_ext(&event.details);
 
         format!(
-            "CEF:0|OmniConnect|Sentinel|0.1.0|{}|{}|{}|rt={} cs1Label=VendorID cs1={} cs2Label=ProductID cs2={} cs3Label=SerialNumber cs3={} fileHash={} act={} msg={}",
-            safe_sig_id,
-            safe_name,
-            safe_sev,
-            timestamp,
-            safe_vid,
-            safe_pid,
-            safe_sn,
-            safe_sha,
-            safe_act,
-            safe_msg
+            "CEF:0|OmniConnect|Sentinel|0.1.0|{safe_sig_id}|{safe_name}|{safe_sev}|rt={timestamp} cs1Label=VendorID cs1={safe_vid} cs2Label=ProductID cs2={safe_pid} cs3Label=SerialNumber cs3={safe_sn} fileHash={safe_sha} act={safe_act} msg={safe_msg}"
         )
     }
 
@@ -254,7 +244,7 @@ impl CrowdStrikeFalconBridge {
                     )
                 })?;
                 apply_system_admin_dacl(parent).map_err(|e| {
-                    format!("Failed applying SYSTEM/Admin DACL to SIEM spool dir: {}", e)
+                    format!("Failed applying SYSTEM/Admin DACL to SIEM spool dir: {e}")
                 })?;
             }
         }
@@ -273,20 +263,17 @@ impl CrowdStrikeFalconBridge {
             })?;
         if is_new {
             apply_system_admin_dacl(&self.spool_path).map_err(|e| {
-                format!(
-                    "Failed applying SYSTEM/Admin DACL to SIEM spool file: {}",
-                    e
-                )
+                format!("Failed applying SYSTEM/Admin DACL to SIEM spool file: {e}")
             })?;
         }
 
         let mut line = serde_json::to_string(record)
-            .map_err(|e| format!("Failed serializing SIEM spool record: {}", e))?;
+            .map_err(|e| format!("Failed serializing SIEM spool record: {e}"))?;
         line.push('\n');
         file.write_all(line.as_bytes())
-            .map_err(|e| format!("Failed writing SIEM spool record: {}", e))?;
+            .map_err(|e| format!("Failed writing SIEM spool record: {e}"))?;
         file.sync_all()
-            .map_err(|e| format!("Failed fsyncing SIEM spool record: {}", e))?;
+            .map_err(|e| format!("Failed fsyncing SIEM spool record: {e}"))?;
         drop(file);
 
         if let Some(parent) = self.spool_path.parent() {
@@ -386,20 +373,20 @@ impl CrowdStrikeFalconBridge {
             })?;
             for rec in records {
                 let mut line = serde_json::to_string(rec)
-                    .map_err(|e| format!("Failed serializing SIEM spool record: {}", e))?;
+                    .map_err(|e| format!("Failed serializing SIEM spool record: {e}"))?;
                 line.push('\n');
                 tmp_file
                     .write_all(line.as_bytes())
-                    .map_err(|e| format!("Failed writing temp SIEM spool: {}", e))?;
+                    .map_err(|e| format!("Failed writing temp SIEM spool: {e}"))?;
             }
             tmp_file
                 .sync_all()
-                .map_err(|e| format!("Failed syncing temp SIEM spool: {}", e))?;
+                .map_err(|e| format!("Failed syncing temp SIEM spool: {e}"))?;
         }
         fs::rename(&tmp_path, &self.spool_path)
-            .map_err(|e| format!("Failed renaming temp SIEM spool: {}", e))?;
+            .map_err(|e| format!("Failed renaming temp SIEM spool: {e}"))?;
         apply_system_admin_dacl(&self.spool_path)
-            .map_err(|e| format!("Failed applying SYSTEM/Admin DACL to SIEM spool: {}", e))?;
+            .map_err(|e| format!("Failed applying SYSTEM/Admin DACL to SIEM spool: {e}"))?;
         if let Some(parent) = self.spool_path.parent() {
             if !parent.as_os_str().is_empty() {
                 let _ = sync_directory(parent);

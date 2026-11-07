@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(windows)]
 use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,9 +203,9 @@ pub fn to_verbatim_path(path: &Path) -> PathBuf {
         if s.starts_with(r"\\?\") {
             PathBuf::from(s)
         } else if let Some(stripped) = s.strip_prefix(r"\\") {
-            PathBuf::from(format!(r"\\?\UNC\{}", stripped))
+            PathBuf::from(format!(r"\\?\UNC\{stripped}"))
         } else {
-            PathBuf::from(format!(r"\\?\{}", s))
+            PathBuf::from(format!(r"\\?\{s}"))
         }
     }
     #[cfg(not(windows))]
@@ -263,8 +264,7 @@ pub fn ensure_not_symlink_or_reparse_point(path: &Path) -> io::Result<()> {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
-                            "Refusing operation: host path '{}' is a symlink or reparse point",
-                            host_str
+                            "Refusing operation: host path '{host_str}' is a symlink or reparse point"
                         ),
                     ));
                 }
@@ -494,7 +494,7 @@ pub fn query_sector_alignment_for_path(path: &Path, fallback_file: Option<&File>
                 } else {
                     desc.bytes_per_physical_sector
                 };
-                if ok != 0 && sector >= 512 && sector <= 4096 && sector.is_power_of_two() {
+                if ok != 0 && (512..=4096).contains(&sector) && sector.is_power_of_two() {
                     return sector;
                 }
             }
@@ -544,7 +544,7 @@ pub fn query_media_type(path: &Path) -> MediaType {
         let trimmed = s.strip_prefix(r"\\?\").unwrap_or(&s);
         if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
             let drive_prefix = &trimmed[..2];
-            let root = format!("{}\\", drive_prefix);
+            let root = format!("{drive_prefix}\\");
             let wide_root: Vec<u16> = std::ffi::OsStr::new(&root)
                 .encode_wide()
                 .chain(Some(0))
@@ -556,7 +556,7 @@ pub fn query_media_type(path: &Path) -> MediaType {
             }
 
             // Open volume device `\\.\X:` with dwDesiredAccess = 0 (FILE_ANY_ACCESS)
-            let vol_dev = format!(r"\\.\{}", drive_prefix);
+            let vol_dev = format!(r"\\.\{drive_prefix}");
             let wide_vol: Vec<u16> = std::ffi::OsStr::new(&vol_dev)
                 .encode_wide()
                 .chain(Some(0))
@@ -793,7 +793,7 @@ pub fn flush_hardware_buffers(file: &File) -> bool {
         use std::os::windows::io::AsRawHandle;
         let raw_handle = file.as_raw_handle() as isize;
         let ok = unsafe { FlushFileBuffers(raw_handle) };
-        return ok != 0;
+        ok != 0
     }
     #[cfg(not(windows))]
     {
@@ -832,7 +832,7 @@ pub fn issue_file_level_trim(file: &File, len: u64) -> bool {
                 core::ptr::null_mut(),
             )
         };
-        return ok != 0;
+        ok != 0
     }
     #[cfg(not(windows))]
     {
@@ -930,8 +930,7 @@ pub fn write_mark_of_the_web(path: &Path, zone_id: u8) -> io::Result<()> {
         let mut f = File::create(ads_path)?;
         write!(
             f,
-            "[ZoneTransfer]\r\nZoneId={}\r\nHostUrl=about:internet\r\n",
-            zone_id
+            "[ZoneTransfer]\r\nZoneId={zone_id}\r\nHostUrl=about:internet\r\n"
         )?;
         f.sync_all()?;
         Ok(())
@@ -965,6 +964,7 @@ pub fn write_mark_of_the_web(path: &Path, zone_id: u8) -> io::Result<()> {
 /// Handle to an active Windows Projected File System (`ProjectedFSLib.dll`) virtualization instance (`Row 148`).
 pub struct ProjFsInstanceHandle {
     namespace_ctx: isize,
+    #[cfg(windows)]
     lib_handle: isize,
 }
 
@@ -989,8 +989,10 @@ impl Drop for ProjFsInstanceHandle {
                 }
                 type PrjStopVirtualizingFn = unsafe extern "system" fn(isize);
                 unsafe {
-                    let proc_addr =
-                        GetProcAddress(self.lib_handle, b"PrjStopVirtualizing\0".as_ptr());
+                    let proc_addr = GetProcAddress(
+                        self.lib_handle,
+                        c"PrjStopVirtualizing".as_ptr().cast::<u8>(),
+                    );
                     if proc_addr != 0 {
                         let stop_fn: PrjStopVirtualizingFn = core::mem::transmute(proc_addr);
                         stop_fn(self.namespace_ctx);
@@ -1126,11 +1128,18 @@ pub fn is_projfs_available() -> bool {
         if h_lib == 0 {
             return false;
         }
-        let has_start = unsafe { GetProcAddress(h_lib, b"PrjStartVirtualizing\0".as_ptr()) != 0 };
-        let has_stop = unsafe { GetProcAddress(h_lib, b"PrjStopVirtualizing\0".as_ptr()) != 0 };
-        let has_write = unsafe { GetProcAddress(h_lib, b"PrjWriteFileData\0".as_ptr()) != 0 };
-        let has_mark =
-            unsafe { GetProcAddress(h_lib, b"PrjMarkDirectoryAsPlaceholder\0".as_ptr()) != 0 };
+        let has_start =
+            unsafe { GetProcAddress(h_lib, c"PrjStartVirtualizing".as_ptr().cast::<u8>()) != 0 };
+        let has_stop =
+            unsafe { GetProcAddress(h_lib, c"PrjStopVirtualizing".as_ptr().cast::<u8>()) != 0 };
+        let has_write =
+            unsafe { GetProcAddress(h_lib, c"PrjWriteFileData".as_ptr().cast::<u8>()) != 0 };
+        let has_mark = unsafe {
+            GetProcAddress(
+                h_lib,
+                c"PrjMarkDirectoryAsPlaceholder".as_ptr().cast::<u8>(),
+            ) != 0
+        };
         unsafe {
             let _ = FreeLibrary(h_lib);
         }
@@ -1181,9 +1190,14 @@ pub fn prj_start_virtualizing_root(root_path: &Path) -> io::Result<ProjFsInstanc
             ));
         }
 
-        let mark_addr =
-            unsafe { GetProcAddress(h_lib, b"PrjMarkDirectoryAsPlaceholder\0".as_ptr()) };
-        let start_addr = unsafe { GetProcAddress(h_lib, b"PrjStartVirtualizing\0".as_ptr()) };
+        let mark_addr = unsafe {
+            GetProcAddress(
+                h_lib,
+                c"PrjMarkDirectoryAsPlaceholder".as_ptr().cast::<u8>(),
+            )
+        };
+        let start_addr =
+            unsafe { GetProcAddress(h_lib, c"PrjStartVirtualizing".as_ptr().cast::<u8>()) };
         if mark_addr == 0 || start_addr == 0 {
             unsafe {
                 let _ = FreeLibrary(h_lib);
@@ -1314,9 +1328,12 @@ pub fn prj_write_file_data(
             ));
         }
 
-        let alloc_addr = unsafe { GetProcAddress(h_lib, b"PrjAllocateAlignedBuffer\0".as_ptr()) };
-        let free_addr = unsafe { GetProcAddress(h_lib, b"PrjFreeAlignedBuffer\0".as_ptr()) };
-        let write_addr = unsafe { GetProcAddress(h_lib, b"PrjWriteFileData\0".as_ptr()) };
+        let alloc_addr =
+            unsafe { GetProcAddress(h_lib, c"PrjAllocateAlignedBuffer".as_ptr().cast::<u8>()) };
+        let free_addr =
+            unsafe { GetProcAddress(h_lib, c"PrjFreeAlignedBuffer".as_ptr().cast::<u8>()) };
+        let write_addr =
+            unsafe { GetProcAddress(h_lib, c"PrjWriteFileData".as_ptr().cast::<u8>()) };
 
         if alloc_addr == 0 || free_addr == 0 || write_addr == 0 {
             unsafe {
@@ -1375,10 +1392,10 @@ pub fn prj_write_file_data(
         };
 
         if hr < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("PrjWriteFileData failed with HRESULT 0x{:08X}", hr as u32),
-            ));
+            return Err(io::Error::other(format!(
+                "PrjWriteFileData failed with HRESULT 0x{:08X}",
+                hr as u32
+            )));
         }
         Ok(())
     }

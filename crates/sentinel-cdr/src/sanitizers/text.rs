@@ -34,7 +34,7 @@ impl TextCsvSanitizer {
         budget.charge_bytes(input.len() as u64)?;
 
         let text = std::str::from_utf8(input)
-            .map_err(|e| CdrError::ParserCorruption(format!("Invalid UTF-8 text: {}", e)))?;
+            .map_err(|e| CdrError::ParserCorruption(format!("Invalid UTF-8 text: {e}")))?;
 
         let mut reports = Vec::new();
         let mut bidi_count = 0usize;
@@ -52,7 +52,7 @@ impl TextCsvSanitizer {
             reports.push(DisarmReportItem::new(
                 "UNICODE_BIDI_OVERRIDE",
                 "TextStream",
-                format!("STRIPPED_{}_CHARS", bidi_count),
+                format!("STRIPPED_{bidi_count}_CHARS"),
             ));
         }
 
@@ -68,7 +68,7 @@ impl TextCsvSanitizer {
                             format!("Row_{}", line_idx + 1),
                             "NEUTRALIZED",
                         ));
-                        cells.push(format!("'{}", cell));
+                        cells.push(format!("'{cell}"));
                     } else {
                         cells.push(cell.to_string());
                     }

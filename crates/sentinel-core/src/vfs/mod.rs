@@ -499,7 +499,7 @@ impl ShadowCacheManager {
                         aad: rel_str.as_bytes(),
                     },
                 )
-                .map_err(|e| format!("ShadowCache AES-256-GCM encryption failed: {}", e))?;
+                .map_err(|e| format!("ShadowCache AES-256-GCM encryption failed: {e}"))?;
 
             let entry_id_hash = hex::encode(Sha256::digest(rel_str.as_bytes()));
             let enc_path = shadow_cipher_dir.join(format!("{}.enc", &entry_id_hash[..32]));
@@ -798,7 +798,7 @@ impl ShadowCacheManager {
             })
             .map_err(|e| {
                 Self::cleanup_cipher_dir(&shadow_cipher_dir);
-                let msg = format!("CDR_WORKER_FAILED: {}", e);
+                let msg = format!("CDR_WORKER_FAILED: {e}");
                 self.append_ledger("CDR_WORKER_FAILED", &msg);
                 msg
             })?;
@@ -835,7 +835,7 @@ impl ShadowCacheManager {
                     aad: rel_str.as_bytes(),
                 },
             )
-            .map_err(|e| format!("ShadowCache AES-256-GCM encryption failed: {}", e))?;
+            .map_err(|e| format!("ShadowCache AES-256-GCM encryption failed: {e}"))?;
 
         let entry_id_hash = hex::encode(Sha256::digest(rel_str.as_bytes()));
         let enc_path = shadow_cipher_dir.join(format!("{}.enc", &entry_id_hash[..32]));

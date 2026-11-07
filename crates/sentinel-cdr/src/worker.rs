@@ -136,7 +136,7 @@ fn read_prost_frame<R: Read, M: Message + Default>(reader: &mut R) -> std::io::R
     if len > MAX_IPC_FRAME_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Incoming protobuf frame length {} exceeds cap", len),
+            format!("Incoming protobuf frame length {len} exceeds cap"),
         ));
     }
     let mut buf = vec![0u8; len];
@@ -187,7 +187,7 @@ impl WorkerCommand {
             }
             other => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Unknown worker protobuf frame tag: 0x{:02X}", other),
+                format!("Unknown worker protobuf frame tag: 0x{other:02X}"),
             )),
         }
     }
@@ -288,7 +288,7 @@ impl WorkerResponse {
                 let fmt_code = map_detected_format_to_proto(outcome.detected_format);
                 let summary_resp = DisarmResponse {
                     result: Some(disarm_response::Result::Summary(SanitizationSummary {
-                        session_id: format!("FMT:{}", fmt_code),
+                        session_id: format!("FMT:{fmt_code}"),
                         original_sha256: orig_sha,
                         sanitized_sha256: san_sha,
                         original_size_bytes: 0,
@@ -615,8 +615,7 @@ impl WorkerLauncher {
             spawn_sandboxed_worker_process(bin_path, &self.sandbox_config).map_err(|e| {
                 PROCESSED_TOTAL_ERR.fetch_add(1, Ordering::AcqRel);
                 CdrError::SandboxFailure(format!(
-                    "CDR_WORKER_FAILED: failed spawning sandboxed CDR worker: {}",
-                    e
+                    "CDR_WORKER_FAILED: failed spawning sandboxed CDR worker: {e}"
                 ))
             })?;
 
@@ -655,16 +654,14 @@ impl WorkerLauncher {
                 let exit_code = child.kill_and_wait().ok().flatten();
                 PROCESSED_TOTAL_ERR.fetch_add(1, Ordering::AcqRel);
                 return Err(CdrError::ResourceLimitExceeded(format!(
-                    "CDR_WORKER_FAILED: worker terminated during pipe I/O (exit={:?}, write_err={}, read_err={})",
-                    exit_code, we, re
+                    "CDR_WORKER_FAILED: worker terminated during pipe I/O (exit={exit_code:?}, write_err={we}, read_err={re})"
                 )));
             }
             Ok((Ok(()), Err(re))) => {
                 let exit_code = child.kill_and_wait().ok().flatten();
                 PROCESSED_TOTAL_ERR.fetch_add(1, Ordering::AcqRel);
                 return Err(CdrError::ResourceLimitExceeded(format!(
-                    "CDR_WORKER_FAILED: worker exited or exceeded 256 MB Job Object memory cap (exit={:?}, err={})",
-                    exit_code, re
+                    "CDR_WORKER_FAILED: worker exited or exceeded 256 MB Job Object memory cap (exit={exit_code:?}, err={re})"
                 )));
             }
             Err(_) => {
@@ -675,8 +672,7 @@ impl WorkerLauncher {
                 let _ = child.kill_and_wait();
                 PROCESSED_TOTAL_ERR.fetch_add(1, Ordering::AcqRel);
                 return Err(CdrError::WorkerTimeout(format!(
-                    "CDR_WORKER_FAILED: worker exceeded wall-clock timeout ({:?})",
-                    timeout
+                    "CDR_WORKER_FAILED: worker exceeded wall-clock timeout ({timeout:?})"
                 )));
             }
         };
@@ -725,8 +721,7 @@ impl WorkerLauncher {
             spawn_sandboxed_worker_process(bin_path, &self.sandbox_config).map_err(|e| {
                 PROCESSED_TOTAL_ERR.fetch_add(1, Ordering::AcqRel);
                 CdrError::SandboxFailure(format!(
-                    "CDR_WORKER_FAILED: failed spawning sandboxed CDR worker for inspect: {}",
-                    e
+                    "CDR_WORKER_FAILED: failed spawning sandboxed CDR worker for inspect: {e}"
                 ))
             })?;
 
@@ -779,8 +774,7 @@ impl WorkerLauncher {
                 let _ = child.kill_and_wait();
                 PROCESSED_TOTAL_ERR.fetch_add(1, Ordering::AcqRel);
                 Err(CdrError::WorkerTimeout(format!(
-                    "CDR_WORKER_FAILED: inspect worker exceeded wall-clock timeout ({:?})",
-                    timeout
+                    "CDR_WORKER_FAILED: inspect worker exceeded wall-clock timeout ({timeout:?})"
                 )))
             }
         }

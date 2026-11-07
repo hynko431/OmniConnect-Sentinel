@@ -111,7 +111,7 @@ impl OpenXmlSanitizer {
     ) -> Result<(Vec<u8>, Vec<DisarmReportItem>), CdrError> {
         let reader = Cursor::new(input_bytes);
         let mut archive = ZipArchive::new(reader).map_err(|e| {
-            CdrError::ParserCorruption(format!("ZIP central directory parse failure: {}", e))
+            CdrError::ParserCorruption(format!("ZIP central directory parse failure: {e}"))
         })?;
 
         if archive.len() > MAX_ZIP_ENTRIES {
@@ -132,7 +132,7 @@ impl OpenXmlSanitizer {
         // and identify macro / OLE / ActiveX parts to strip before rewriting .rels and [Content_Types].xml.
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).map_err(|e| {
-                CdrError::ParserCorruption(format!("ZIP entry index {} error: {}", i, e))
+                CdrError::ParserCorruption(format!("ZIP entry index {i} error: {e}"))
             })?;
 
             let raw_entry_name = file
@@ -183,13 +183,11 @@ impl OpenXmlSanitizer {
                 let err_str = e.to_string();
                 if err_str.contains("larger than its declared uncompressed size") {
                     CdrError::ResourceLimitExceeded(format!(
-                        "ZIP entry {} exceeded declared uncompressed size header (RUSTSEC-2026-0429 / BUG-CDR-04): {}",
-                        name, err_str
+                        "ZIP entry {name} exceeded declared uncompressed size header (RUSTSEC-2026-0429 / BUG-CDR-04): {err_str}"
                     ))
                 } else {
                     CdrError::ParserCorruption(format!(
-                        "Decompression stream error in {}: {}",
-                        name, err_str
+                        "Decompression stream error in {name}: {err_str}"
                     ))
                 }
             })?;
@@ -238,8 +236,7 @@ impl OpenXmlSanitizer {
                         .unix_permissions(0o755);
                     zip_writer.add_directory(&name, options).map_err(|e| {
                         CdrError::ReconstructionFailure(format!(
-                            "Failed adding ZIP directory {}: {}",
-                            name, e
+                            "Failed adding ZIP directory {name}: {e}"
                         ))
                     })?;
                     continue;
@@ -294,20 +291,16 @@ impl OpenXmlSanitizer {
                     .unix_permissions(0o644);
                 zip_writer.start_file(&name, options).map_err(|e| {
                     CdrError::ReconstructionFailure(format!(
-                        "Failed starting ZIP entry {}: {}",
-                        name, e
+                        "Failed starting ZIP entry {name}: {e}"
                     ))
                 })?;
                 zip_writer.write_all(&entry_bytes).map_err(|e| {
-                    CdrError::ReconstructionFailure(format!(
-                        "Failed writing ZIP entry {}: {}",
-                        name, e
-                    ))
+                    CdrError::ReconstructionFailure(format!("Failed writing ZIP entry {name}: {e}"))
                 })?;
             }
 
             zip_writer.finish().map_err(|e| {
-                CdrError::ReconstructionFailure(format!("Failed finalizing ZIP archive: {}", e))
+                CdrError::ReconstructionFailure(format!("Failed finalizing ZIP archive: {e}"))
             })?;
         }
 
@@ -323,34 +316,32 @@ impl OpenXmlSanitizer {
 
         // Notice: We intentionally do NOT strip arbitrary `.bin` files like
         // `word/printerSettings/printerSettings1.bin` (`BUG-CDR-04`).
-        if policy.strip_office_macros {
-            if file_name == "vbaproject.bin"
+        if policy.strip_office_macros
+            && (file_name == "vbaproject.bin"
                 || file_name == "vbaprojectsignature.bin"
                 || file_name == "vbadata.xml"
                 || file_name == "xlmacrosheet.xml"
                 || lower.contains("/macrosheets/")
                 || lower.starts_with("macrosheets/")
-                || lower.contains("/dialogsheets/")
-            {
-                return Some((
-                    "VBA_MACRO_PROJECT",
-                    "Removed executable VBA macro stream from OOXML container",
-                ));
-            }
+                || lower.contains("/dialogsheets/"))
+        {
+            return Some((
+                "VBA_MACRO_PROJECT",
+                "Removed executable VBA macro stream from OOXML container",
+            ));
         }
 
-        if policy.strip_office_ole_objects {
-            if lower.contains("/embeddings/")
+        if policy.strip_office_ole_objects
+            && (lower.contains("/embeddings/")
                 || lower.starts_with("embeddings/")
                 || lower.contains("/activex/")
                 || lower.starts_with("activex/")
-                || file_name.starts_with("oleobject")
-            {
-                return Some((
-                    "EMBEDDED_OLE_OBJECT",
-                    "Removed embedded OLE/ActiveX binary object from OOXML container",
-                ));
-            }
+                || file_name.starts_with("oleobject"))
+        {
+            return Some((
+                "EMBEDDED_OLE_OBJECT",
+                "Removed embedded OLE/ActiveX binary object from OOXML container",
+            ));
         }
 
         None
@@ -548,8 +539,7 @@ impl OpenXmlSanitizer {
                 }
                 Err(e) => {
                     return Err(CdrError::ParserCorruption(format!(
-                        "[Content_Types].xml parse error: {}",
-                        e
+                        "[Content_Types].xml parse error: {e}"
                     )));
                 }
             }
@@ -692,8 +682,7 @@ impl OpenXmlSanitizer {
                                         "DANGLING_MACRO_OR_OLE_REL",
                                         rels_path.to_string(),
                                         format!(
-                                            "Removed <Relationship> referencing stripped target '{}'",
-                                            target
+                                            "Removed <Relationship> referencing stripped target '{target}'"
                                         ),
                                     ));
                                     if !is_empty {
@@ -730,8 +719,7 @@ impl OpenXmlSanitizer {
                                         "EXTERNAL_RELATIONSHIP_INJECTION",
                                         rels_path.to_string(),
                                         format!(
-                                            "Removed external <Relationship> targeting '{}'",
-                                            target
+                                            "Removed external <Relationship> targeting '{target}'"
                                         ),
                                     ));
                                     if !is_empty {
@@ -1011,8 +999,7 @@ impl OpenXmlSanitizer {
                 }
                 Err(e) => {
                     return Err(CdrError::ParserCorruption(format!(
-                        "Malformed OOXML content in {}: {}",
-                        xml_path, e
+                        "Malformed OOXML content in {xml_path}: {e}"
                     )));
                 }
             }

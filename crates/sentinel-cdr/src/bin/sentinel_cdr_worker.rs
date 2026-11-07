@@ -17,7 +17,7 @@ use std::io;
 /// response to `stdout`, and immediately exits.
 fn main() {
     if let Err(e) = apply_worker_process_mitigations() {
-        eprintln!("FATAL: CDR worker process mitigations failed: {}", e);
+        eprintln!("FATAL: CDR worker process mitigations failed: {e}");
         std::process::exit(2);
     }
 
@@ -33,7 +33,7 @@ fn main() {
             let resp = WorkerResponse {
                 success: false,
                 outcome: None,
-                error: Some(format!("Invalid worker protobuf request frame: {}", e)),
+                error: Some(format!("Invalid worker protobuf request frame: {e}")),
             };
             let _ = resp.write_framed(stdout.lock());
             std::process::exit(1);
@@ -77,7 +77,7 @@ fn main() {
                         let resp = WorkerResponse {
                             success: false,
                             outcome: None,
-                            error: Some(format!("CHILD_PROCESS_CREATION_BLOCKED: {}", e)),
+                            error: Some(format!("CHILD_PROCESS_CREATION_BLOCKED: {e}")),
                         };
                         let _ = resp.write_framed(stdout.lock());
                         std::process::exit(1);

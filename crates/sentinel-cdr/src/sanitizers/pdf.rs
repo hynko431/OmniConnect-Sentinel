@@ -130,7 +130,7 @@ impl PdfSanitizer {
     ) -> Result<(Vec<u8>, Vec<DisarmReportItem>), CdrError> {
         Self::precheck_stream_nesting_and_counts(input_bytes, budget)?;
         let mut doc = Document::load_mem(input_bytes)
-            .map_err(|e| CdrError::ParserCorruption(format!("PDF AST parse error: {}", e)))?;
+            .map_err(|e| CdrError::ParserCorruption(format!("PDF AST parse error: {e}")))?;
 
         let mut disarm_report = Vec::new();
 
@@ -156,7 +156,7 @@ impl PdfSanitizer {
         // 3. Re-serialize clean AST into memory buffer
         let mut output_buffer = Cursor::new(Vec::with_capacity(input_bytes.len()));
         doc.save_to(&mut output_buffer).map_err(|e| {
-            CdrError::ReconstructionFailure(format!("Failed saving disarmed PDF AST: {}", e))
+            CdrError::ReconstructionFailure(format!("Failed saving disarmed PDF AST: {e}"))
         })?;
 
         Ok((output_buffer.into_inner(), disarm_report))
@@ -321,8 +321,7 @@ impl PdfSanitizer {
     ) -> Result<(), CdrError> {
         if depth > MAX_PDF_WALK_DEPTH {
             return Err(CdrError::ResourceLimitExceeded(format!(
-                "PDF nested object depth exceeded {} at {}",
-                MAX_PDF_WALK_DEPTH, location
+                "PDF nested object depth exceeded {MAX_PDF_WALK_DEPTH} at {location}"
             )));
         }
 
@@ -337,7 +336,7 @@ impl PdfSanitizer {
             Object::Array(arr) => {
                 for (idx, item) in arr.iter_mut().enumerate() {
                     budget.charge_object()?;
-                    let item_loc = format!("{}[{}]", location, idx);
+                    let item_loc = format!("{location}[{idx}]");
                     Self::sanitize_pdf_object(item, &item_loc, policy, budget, depth + 1, reports)?;
                 }
             }
@@ -415,7 +414,7 @@ impl PdfSanitizer {
                 neutralized_action_dict = !is_structural_node;
                 info!("Disarmed PDF /S /{} action at {}", subtype_name, location);
                 reports.push(DisarmReportItem::new(
-                    format!("PDF_ACTION_S_{}", subtype_name),
+                    format!("PDF_ACTION_S_{subtype_name}"),
                     location.to_string(),
                     "Neutralized active PDF action dictionary (replaced with null)",
                 ));

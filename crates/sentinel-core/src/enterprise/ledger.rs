@@ -186,8 +186,7 @@ impl AuditLedger {
             let valid = verify_ecdsa_p256_digest(&keypair.public_key_blob, &probe_digest, &probe_sig)
                 .map_err(|e| {
                     format!(
-                        "LEDGER_KEY_INTEGRITY_FAIL: Existing ledger ECDSA P-256 public key verification failed: {}",
-                        e
+                        "LEDGER_KEY_INTEGRITY_FAIL: Existing ledger ECDSA P-256 public key verification failed: {e}"
                     )
                 })?;
             if !valid {
@@ -205,9 +204,9 @@ impl AuditLedger {
             hex::encode(Sha256::digest(context.as_bytes()))[..16].to_ascii_uppercase()
         );
         let keypair = create_sealed_ecdsa_p256_keypair(context.as_bytes(), &unique_key_id)
-            .map_err(|e| format!("Failed creating ledger ECDSA P-256 keypair: {}", e))?;
+            .map_err(|e| format!("Failed creating ledger ECDSA P-256 keypair: {e}"))?;
         let json = serde_json::to_vec_pretty(&keypair)
-            .map_err(|e| format!("Failed serializing ledger ECDSA P-256 keypair: {}", e))?;
+            .map_err(|e| format!("Failed serializing ledger ECDSA P-256 keypair: {e}"))?;
         write_protected_key_file(&key_path, &json).map_err(|e| {
             format!(
                 "Failed persisting protected ledger key file {}: {}",
@@ -281,11 +280,11 @@ impl AuditLedger {
                 .create(true)
                 .append(true)
                 .open(&self.ledger_path)
-                .map_err(|e| format!("Failed opening audit ledger: {}", e))?;
+                .map_err(|e| format!("Failed opening audit ledger: {e}"))?;
             file.write_all(line.as_bytes())
-                .map_err(|e| format!("Failed appending to audit ledger: {}", e))?;
+                .map_err(|e| format!("Failed appending to audit ledger: {e}"))?;
             file.sync_all()
-                .map_err(|e| format!("Failed syncing audit ledger: {}", e))?;
+                .map_err(|e| format!("Failed syncing audit ledger: {e}"))?;
         }
         if is_new_file {
             apply_system_admin_dacl(&self.ledger_path).map_err(|e| {
@@ -298,7 +297,7 @@ impl AuditLedger {
             if let Some(parent) = self.ledger_path.parent() {
                 if !parent.as_os_str().is_empty() {
                     sync_directory(parent)
-                        .map_err(|e| format!("Failed syncing ledger parent directory: {}", e))?;
+                        .map_err(|e| format!("Failed syncing ledger parent directory: {e}"))?;
                 }
             }
         }
@@ -325,7 +324,7 @@ impl AuditLedger {
         let context = Self::context_string(&self.ledger_path);
 
         let sig_bytes = sign_with_sealed_ecdsa_p256(keypair, context.as_bytes(), &digest)
-            .map_err(|e| format!("ECDSA P-256 chain-head signing failed: {}", e))?;
+            .map_err(|e| format!("ECDSA P-256 chain-head signing failed: {e}"))?;
 
         let signed_head = SignedChainHead {
             head_seq,
@@ -339,7 +338,7 @@ impl AuditLedger {
 
         let head_path = Self::head_sig_path(&self.ledger_path);
         let head_json = serde_json::to_vec_pretty(&signed_head)
-            .map_err(|e| format!("Failed serializing signed chain head: {}", e))?;
+            .map_err(|e| format!("Failed serializing signed chain head: {e}"))?;
         write_protected_key_file(&head_path, &head_json).map_err(|e| {
             format!(
                 "Failed writing signed chain head {}: {}",
@@ -428,7 +427,7 @@ impl AuditLedger {
             )
         })?;
         let signed_head: SignedChainHead = serde_json::from_slice(&raw_head)
-            .map_err(|e| format!("Corrupted signed chain-head JSON: {}", e))?;
+            .map_err(|e| format!("Corrupted signed chain-head JSON: {e}"))?;
 
         if signed_head.head_seq != final_seq || signed_head.head_hash != final_hash {
             return Err(format!(
@@ -438,7 +437,7 @@ impl AuditLedger {
         }
 
         let pub_bytes = hex::decode(&signed_head.public_key_blob_hex)
-            .map_err(|e| format!("Invalid public key hex in signed chain head: {}", e))?;
+            .map_err(|e| format!("Invalid public key hex in signed chain head: {e}"))?;
         if pub_bytes != keypair.public_key_blob {
             return Err(
                 "Ledger public key mismatch between signed head and sealed keypair".to_string(),
@@ -446,11 +445,11 @@ impl AuditLedger {
         }
 
         let sig_bytes = hex::decode(&signed_head.ecdsa_p256_signature_hex)
-            .map_err(|e| format!("Invalid ECDSA signature hex in signed chain head: {}", e))?;
+            .map_err(|e| format!("Invalid ECDSA signature hex in signed chain head: {e}"))?;
         let digest = Self::compute_head_digest(signed_head.head_seq, &signed_head.head_hash);
 
         let sig_valid = verify_ecdsa_p256_digest(&pub_bytes, &digest, &sig_bytes)
-            .map_err(|e| format!("ECDSA P-256 verification error: {}", e))?;
+            .map_err(|e| format!("ECDSA P-256 verification error: {e}"))?;
         if !sig_valid {
             return Err(
                 "Ledger ECDSA P-256 chain-head signature verification failed (signature forged or tampered)"
@@ -463,16 +462,13 @@ impl AuditLedger {
 
     fn compute_record_hash(seq: u64, ts: &str, event: &str, data: &str, prev_hash: &str) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(format!("{}|{}|{}|{}|{}", seq, ts, event, data, prev_hash));
+        hasher.update(format!("{seq}|{ts}|{event}|{data}|{prev_hash}"));
         hex::encode(hasher.finalize())
     }
 
     fn compute_head_digest(head_seq: u64, head_hash: &str) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(format!(
-            "SENTINEL-LEDGER-HEAD-V2:{}|{}",
-            head_seq, head_hash
-        ));
+        hasher.update(format!("SENTINEL-LEDGER-HEAD-V2:{head_seq}|{head_hash}"));
         let final_hash = hasher.finalize();
         let mut out = [0u8; 32];
         out.copy_from_slice(&final_hash);

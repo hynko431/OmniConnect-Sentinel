@@ -232,7 +232,7 @@ impl KioskEnforcer {
                     aad: rel_str.as_bytes(),
                 },
             )
-            .map_err(|e| format!("Kiosk AES-256-GCM encryption failed: {}", e))?;
+            .map_err(|e| format!("Kiosk AES-256-GCM encryption failed: {e}"))?;
 
         let out_path = self.session_dir.join(relative_path);
         if let Some(parent) = out_path.parent() {
@@ -372,7 +372,7 @@ impl KioskEnforcer {
                 Ok(e) => e,
                 Err(err) => {
                     warn!("Kiosk session walk error: {}", err);
-                    wipe_errors.push(format!("Walk error: {}", err));
+                    wipe_errors.push(format!("Walk error: {err}"));
                     continue;
                 }
             };

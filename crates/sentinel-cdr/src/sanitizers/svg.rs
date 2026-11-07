@@ -212,8 +212,7 @@ impl SvgSanitizer {
                 }
                 Err(e) => {
                     return Err(CdrError::ParserCorruption(format!(
-                        "Malformed SVG XML: {}",
-                        e
+                        "Malformed SVG XML: {e}"
                     )));
                 }
             }
@@ -262,7 +261,7 @@ impl SvgSanitizer {
             if key_lower.starts_with("on") {
                 reports.push(DisarmReportItem::new(
                     "SVG_EVENT_HANDLER",
-                    format!("{}@{}", tag_lower, key_raw),
+                    format!("{tag_lower}@{key_raw}"),
                     "STRIPPED",
                 ));
                 continue;
@@ -274,7 +273,7 @@ impl SvgSanitizer {
             {
                 reports.push(DisarmReportItem::new(
                     "SVG_EXTERNAL_OR_SCRIPT_HREF",
-                    format!("{}@{}", tag_lower, key_raw),
+                    format!("{tag_lower}@{key_raw}"),
                     "STRIPPED",
                 ));
                 continue;
@@ -283,7 +282,7 @@ impl SvgSanitizer {
             if key_lower == "style" && Self::has_dangerous_css(&val_trimmed) {
                 reports.push(DisarmReportItem::new(
                     "SVG_DANGEROUS_STYLE",
-                    format!("{}@style", tag_lower),
+                    format!("{tag_lower}@style"),
                     "STRIPPED",
                 ));
                 continue;

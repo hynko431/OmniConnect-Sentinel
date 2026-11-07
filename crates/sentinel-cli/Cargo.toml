@@ -10,9 +10,6 @@ description = "Command-line interface for OmniConnect Sentinel (manual testing, 
 name = "sentinel"
 path = "src/main.rs"
 
-[lints]
-workspace = true
-
 [dependencies]
 sentinel-cdr.workspace = true
 sentinel-core.workspace = true

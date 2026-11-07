@@ -89,15 +89,12 @@ impl Tier3SandboxConnector {
             .ok_or_else(|| "Invalid remote sandbox endpoint URL".to_string())?;
 
         let addr: SocketAddr = host_port.parse().map_err(|e| {
-            format!(
-                "Unresolvable remote sandbox socket address '{}': {}",
-                host_port, e
-            )
+            format!("Unresolvable remote sandbox socket address '{host_port}': {e}")
         })?;
 
         let timeout = Duration::from_secs(request.timeout_seconds.clamp(1, 30) as u64);
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(750))
-            .map_err(|e| format!("Remote sandbox unreachable: {}", e))?;
+            .map_err(|e| format!("Remote sandbox unreachable: {e}"))?;
         let _ = stream.set_read_timeout(Some(timeout));
         let _ = stream.set_write_timeout(Some(timeout));
 
@@ -118,20 +115,20 @@ impl Tier3SandboxConnector {
         );
         stream
             .write_all(http_req.as_bytes())
-            .map_err(|e| format!("Failed submitting sample to remote sandbox: {}", e))?;
+            .map_err(|e| format!("Failed submitting sample to remote sandbox: {e}"))?;
 
         let mut resp_buf = Vec::new();
         stream
             .take(64 * 1024)
             .read_to_end(&mut resp_buf)
-            .map_err(|e| format!("Failed reading remote sandbox response: {}", e))?;
+            .map_err(|e| format!("Failed reading remote sandbox response: {e}"))?;
         let resp_str = String::from_utf8_lossy(&resp_buf);
         let body_start = resp_str
             .find("\r\n\r\n")
             .map(|i| i + 4)
             .ok_or_else(|| "Malformed HTTP response from remote sandbox".to_string())?;
         serde_json::from_str::<SandboxDetonationReport>(&resp_str[body_start..])
-            .map_err(|e| format!("Invalid JSON report from remote sandbox: {}", e))
+            .map_err(|e| format!("Invalid JSON report from remote sandbox: {e}"))
     }
 
     pub async fn detonate_sample(
@@ -302,7 +299,7 @@ impl Tier3SandboxConnector {
 
         BENIGN_DOMAINS
             .iter()
-            .any(|&domain| host == domain || host.ends_with(&format!(".{}", domain)))
+            .any(|&domain| host == domain || host.ends_with(&format!(".{domain}")))
     }
 
     /// Extracts real `http://` and `https://` URLs embedded in the sample while

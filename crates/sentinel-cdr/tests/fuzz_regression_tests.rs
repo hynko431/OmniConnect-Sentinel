@@ -350,8 +350,10 @@ fn test_svg_and_csv_and_text_sanitizers() {
     );
 
     // Enable `allow_svg = true` and verify full SVG sanitization (`Row 133`)
-    let mut svg_policy = SanitizationPolicy::default();
-    svg_policy.allow_svg = true;
+    let svg_policy = SanitizationPolicy {
+        allow_svg: true,
+        ..SanitizationPolicy::default()
+    };
     let svg_outcome = engine
         .sanitize_with_hint(dirty_svg, "diagram.svg", &svg_policy)
         .expect("SVG CDR with allow_svg=true should succeed");
@@ -407,8 +409,10 @@ fn test_svg_and_csv_and_text_sanitizers() {
     // Append 12 bytes of trailing overlay
     webp_riff.extend_from_slice(b"OVERLAY_JUNK");
 
-    let mut lossless_img_policy = SanitizationPolicy::default();
-    lossless_img_policy.reencode_images = false;
+    let lossless_img_policy = SanitizationPolicy {
+        reencode_images: false,
+        ..SanitizationPolicy::default()
+    };
     let webp_outcome = engine
         .sanitize_with_hint(&webp_riff, "photo.webp", &lossless_img_policy)
         .expect("Lossless WebP sanitization should strip EXIF/XMP and overlay");
@@ -463,8 +467,10 @@ fn test_svg_and_csv_and_text_sanitizers() {
             .is_err(),
         "Default policy must reject legacy OLE2 (`allow_legacy_ole2 = false`)"
     );
-    let mut ole_policy = SanitizationPolicy::default();
-    ole_policy.allow_legacy_ole2 = true;
+    let ole_policy = SanitizationPolicy {
+        allow_legacy_ole2: true,
+        ..SanitizationPolicy::default()
+    };
     let ole_outcome = engine
         .sanitize_with_hint(&cfb, "legacy.doc", &ole_policy)
         .expect("OLE2 sanitization with allow_legacy_ole2=true should succeed");
@@ -821,8 +827,7 @@ fn rels_quote_variants() {
             && !rels_xml.contains("rId3")
             && !rels_xml.contains("evil.example")
             && !rels_xml.contains("10.99.0.1"),
-        "All three external relationship quote/whitespace/case variants must be stripped: got {}",
-        rels_xml
+        "All three external relationship quote/whitespace/case variants must be stripped: got {rels_xml}"
     );
     assert!(
         rels_xml.contains("rId4") && rels_xml.contains("https://www.rust-lang.org"),
@@ -856,7 +861,7 @@ fn rels_quote_variants() {
             match reader.read_event_into(&mut buf) {
                 Ok(quick_xml::events::Event::Eof) => break,
                 Ok(_) => buf.clear(),
-                Err(e) => panic!("Sanitized XML failed quick-xml validation: {}", e),
+                Err(e) => panic!("Sanitized XML failed quick-xml validation: {e}"),
             }
         }
     }
@@ -889,14 +894,15 @@ fn zip_header_size_mismatch_aborts() {
         zip_bytes[cd_pos + 24..cd_pos + 28].copy_from_slice(&64u32.to_le_bytes());
     }
 
-    let mut tight_policy = SanitizationPolicy::default();
-    tight_policy.max_decompressed_bytes = 1024;
+    let tight_policy = SanitizationPolicy {
+        max_decompressed_bytes: 1024,
+        ..SanitizationPolicy::default()
+    };
     let res =
         sentinel_cdr::sanitizers::openxml::OpenXmlSanitizer::sanitize(&zip_bytes, &tight_policy);
     assert!(
         matches!(res, Err(sentinel_cdr::CdrError::ResourceLimitExceeded(_))),
-        "ZIP entry with spoofed 64-byte uncompressed_size header expanding past 1 KiB budget must abort with ResourceLimitExceeded: got {:?}",
-        res
+        "ZIP entry with spoofed 64-byte uncompressed_size header expanding past 1 KiB budget must abort with ResourceLimitExceeded: got {res:?}"
     );
 }
 
@@ -1018,8 +1024,7 @@ fn worker_memory_cap() {
     });
     assert!(
         matches!(res, Err(sentinel_cdr::CdrError::ResourceLimitExceeded(_))),
-        "Sandboxed CDR worker allocating 300 MB must be killed by the 256 MB Job Object memory cap and return ResourceLimitExceeded: got {:?}",
-        res
+        "Sandboxed CDR worker allocating 300 MB must be killed by the 256 MB Job Object memory cap and return ResourceLimitExceeded: got {res:?}"
     );
 
     // 3. Verify child-process creation inside the sandboxed worker is blocked by
@@ -1036,8 +1041,7 @@ fn worker_memory_cap() {
     let err_msg = child_res.unwrap_err().to_string();
     assert!(
         !err_msg.contains("UNEXPECTED_CHILD_SPAWN_SUCCEEDED"),
-        "Child process creation inside CDR worker must never succeed: {}",
-        err_msg
+        "Child process creation inside CDR worker must never succeed: {err_msg}"
     );
 }
 
@@ -1069,10 +1073,12 @@ fn proptest_forward_parsers_and_cdr_sanitizers_never_panic() {
         }
     }
 
-    let mut policy = SanitizationPolicy::default();
-    policy.max_decompressed_bytes = 2 * 1024 * 1024; // Tight 2 MiB ceiling per fuzz case (< 128 MB CI cap)
-    policy.allow_svg = true;
-    policy.allow_legacy_ole2 = true;
+    let policy = SanitizationPolicy {
+        max_decompressed_bytes: 2 * 1024 * 1024, // Tight 2 MiB ceiling per fuzz case (< 128 MB CI cap)
+        allow_svg: true,
+        allow_legacy_ole2: true,
+        ..SanitizationPolicy::default()
+    };
 
     // 1. Property: Forward image parsers (`scan_jpeg_structure`, `scan_png_structure`, `scan_webp_structure`)
     //    find the exact end boundary `valid_end_offset` for arbitrary trailing bytes (`Row 200` #1).
@@ -1109,8 +1115,7 @@ fn proptest_forward_parsers_and_cdr_sanitizers_never_panic() {
         assert_eq!(
             jpeg_scan.valid_end_offset,
             base_jpeg.len(),
-            "Forward JPEG parser must locate exact main-image EOI for arbitrary trailing payload (seed={})",
-            seed
+            "Forward JPEG parser must locate exact main-image EOI for arbitrary trailing payload (seed={seed})"
         );
         assert_eq!(
             jpeg_scan.trailing_overlay_bytes,
@@ -1124,8 +1129,7 @@ fn proptest_forward_parsers_and_cdr_sanitizers_never_panic() {
         assert_eq!(
             png_scan.valid_end_offset,
             base_png.len(),
-            "Forward PNG parser must locate exact IEND chunk boundary for arbitrary trailing payload (seed={})",
-            seed
+            "Forward PNG parser must locate exact IEND chunk boundary for arbitrary trailing payload (seed={seed})"
         );
 
         // Exercise all 6 sanitizers on structured mutated inputs (`Row 201`)
@@ -1281,8 +1285,10 @@ fn bug_cdr_10() {
 
 #[test]
 fn test_xml_duplicate_attribute_smuggling_and_excessive_attrs_rejected_rustsec_2026_0194() {
-    let mut policy = SanitizationPolicy::default();
-    policy.allow_svg = true;
+    let policy = SanitizationPolicy {
+        allow_svg: true,
+        ..SanitizationPolicy::default()
+    };
     let engine = CdrEngine::new(policy);
 
     // 1. Duplicate attribute smuggling in SVG (e.g. two `href` attributes on one element)
@@ -1355,8 +1361,10 @@ fn test_xml_duplicate_attribute_smuggling_and_excessive_attrs_rejected_rustsec_2
 
 #[test]
 fn test_xml_namespace_flood_and_element_depth_rejected_rustsec_2026_0195() {
-    let mut policy = SanitizationPolicy::default();
-    policy.allow_svg = true;
+    let policy = SanitizationPolicy {
+        allow_svg: true,
+        ..SanitizationPolicy::default()
+    };
     let engine = CdrEngine::new(policy);
 
     // 1. Namespace declaration flood (> MAX_XMLNS_DECLS_PER_ELEMENT = 32)
@@ -1775,8 +1783,7 @@ fn test_zip_symlink_suid_and_traversal_entries_rejected_rustsec_2026_0367_0368_0
             sentinel_cdr::CdrError::ResourceLimitExceeded(ref msg)
                 if msg.contains("declared uncompressed size") || msg.contains("budget")
         ),
-        "Expected ResourceLimitExceeded on spoofed ZIP size, got: {:?}",
-        spoof_err
+        "Expected ResourceLimitExceeded on spoofed ZIP size, got: {spoof_err:?}"
     );
 }
 
@@ -1820,10 +1827,7 @@ async fn test_grpc_stream_empty_chunk_flood_rejected_rustsec_2026_0258() {
             assert!(err.message.contains("RUSTSEC-2026-0258"));
             assert!(!err.recoverable);
         }
-        other => panic!(
-            "Expected DisarmError(EMPTY_DATA_FRAME_FLOOD), got: {:?}",
-            other
-        ),
+        other => panic!("Expected DisarmError(EMPTY_DATA_FRAME_FLOOD), got: {other:?}"),
     }
 
     // 2. Excessive total frames (> MAX_STREAM_FRAMES_PER_SESSION = 4096) with 1-byte chunks
@@ -1855,9 +1859,6 @@ async fn test_grpc_stream_empty_chunk_flood_rejected_rustsec_2026_0258() {
             assert!(err.message.contains("RUSTSEC-2026-0258"));
             assert!(!err.recoverable);
         }
-        other => panic!(
-            "Expected DisarmError(STREAM_FRAME_FLOOD_DETECTED), got: {:?}",
-            other
-        ),
+        other => panic!("Expected DisarmError(STREAM_FRAME_FLOOD_DETECTED), got: {other:?}"),
     }
 }
