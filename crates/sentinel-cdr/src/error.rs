@@ -5,6 +5,9 @@ pub enum CdrError {
     #[error("Unsupported file format: {0}")]
     UnsupportedFormat(String),
 
+    #[error("Invalid format structure: {0}")]
+    InvalidFormat(String),
+
     #[error("Parser error during deconstruction: {0}")]
     ParserCorruption(String),
 

@@ -701,6 +701,9 @@ impl WorkerLauncher {
         if err_msg.contains("Unsupported file format") {
             return Err(CdrError::UnsupportedFormat(err_msg));
         }
+        if err_msg.contains("Invalid format structure") {
+            return Err(CdrError::InvalidFormat(err_msg));
+        }
         if err_msg.contains("resource limit exceeded") || err_msg.contains("budget") {
             return Err(CdrError::ResourceLimitExceeded(err_msg));
         }

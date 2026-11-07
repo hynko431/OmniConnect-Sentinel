@@ -36,7 +36,7 @@ hex = "0.4"
 
 # Document & Media parsing crates
 lopdf = { version = "0.45", default-features = false }
-zip = { version = "2.1", default-features = false, features = ["deflate"] }
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 quick-xml = "0.42"
 

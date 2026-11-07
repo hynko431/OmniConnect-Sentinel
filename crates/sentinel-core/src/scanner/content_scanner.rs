@@ -56,7 +56,11 @@ impl ContentScanner {
                 "MALICIOUS_LNK_SHORTCUT"
                 | "BLOCKED_CONTAINER_OR_SHORTCUT"
                 | "ENCRYPTED_ARCHIVE_BLOCKED"
-                | "MALFORMED_OR_ENCRYPTED_ZIP" => (
+                | "MALFORMED_OR_ENCRYPTED_ZIP"
+                | "ARCHIVE_ENTRY_COUNT_EXCEEDED"
+                | "ZIP_SYMLINK_ATTACK"
+                | "ZIP_SUID_SGID_BIT_ATTACK"
+                | "ZIP_PATH_TRAVERSAL" => (
                     CarrierCategory::FilesystemHidden,
                     format!("Quarantined Container / Shortcut Vector ({})", f.indicator),
                     ThreatSeverity::Critical,
@@ -757,6 +761,20 @@ impl ContentScanner {
     /// Scans an OOXML / ZIP archive using a seekable reader so >4 MB archives are scanned
     /// without truncation (`BUG-CORE-03`, `Row 70`). Fails closed on corrupt/encrypted archives (`Row 74, 135`).
     pub fn scan_openxml_reader<R: Read + Seek>(reader: &mut R, findings: &mut Vec<ContentFinding>) {
+        let mut raw_suid_entries = std::collections::HashSet::new();
+        if reader.seek(std::io::SeekFrom::Start(0)).is_ok() {
+            let mut raw_zip = Vec::new();
+            if reader
+                .take(32 * 1024 * 1024)
+                .read_to_end(&mut raw_zip)
+                .is_ok()
+            {
+                raw_suid_entries =
+                    sentinel_cdr::sanitizers::openxml::OpenXmlSanitizer::collect_raw_cd_suid_sgid_entries(
+                        &raw_zip,
+                    );
+            }
+        }
         let _ = reader.seek(std::io::SeekFrom::Start(0));
         let mut archive = match ZipArchive::new(reader) {
             Ok(a) => a,
@@ -770,6 +788,18 @@ impl ContentScanner {
                 return;
             }
         };
+
+        if archive.len() > 2048 {
+            findings.push(ContentFinding {
+                category: "ARCHIVE_ENTRY_COUNT_EXCEEDED".to_string(),
+                severity: "HIGH".to_string(),
+                indicator: format!("{} ZIP entries (> 2048)", archive.len()),
+                description: format!(
+                    "ZIP/OOXML container has {} entries exceeding 2048 inspection window (evasion guard)",
+                    archive.len()
+                ),
+            });
+        }
 
         let mut reported_encrypted = false;
         for i in 0..archive.len().min(2048) {
@@ -805,7 +835,50 @@ impl ContentScanner {
                     continue;
                 }
             };
-            let name = file.name().replace('\\', "/");
+            let raw_name = String::from_utf8_lossy(file.name_raw()).into_owned();
+            let name = raw_name.replace('\\', "/");
+            if file.name().is_err()
+                || raw_name.is_empty()
+                || raw_name.len() > 1024
+                || raw_name.contains('\0')
+                || raw_name.contains(':')
+                || name.starts_with('/')
+                || name.split('/').any(|seg| seg == ".." || seg == ".")
+            {
+                findings.push(ContentFinding {
+                    category: "ZIP_PATH_TRAVERSAL".to_string(),
+                    severity: "CRITICAL".to_string(),
+                    indicator: raw_name.clone(),
+                    description: format!(
+                        "ZIP path traversal or invalid entry name '{}' detected (RUSTSEC-2026-0367)",
+                        raw_name
+                    ),
+                });
+            }
+            if file.is_symlink() || file.unix_mode().is_some_and(|m| (m & 0o170000) == 0o120000) {
+                findings.push(ContentFinding {
+                    category: "ZIP_SYMLINK_ATTACK".to_string(),
+                    severity: "CRITICAL".to_string(),
+                    indicator: raw_name.clone(),
+                    description: format!(
+                        "Symbolic link entry '{}' detected inside ZIP/OOXML container (RUSTSEC-2026-0368)",
+                        raw_name
+                    ),
+                });
+            }
+            if file.unix_mode().is_some_and(|m| (m & 0o7000) != 0)
+                || raw_suid_entries.contains(&name)
+            {
+                findings.push(ContentFinding {
+                    category: "ZIP_SUID_SGID_BIT_ATTACK".to_string(),
+                    severity: "HIGH".to_string(),
+                    indicator: raw_name.clone(),
+                    description: format!(
+                        "SUID/SGID/sticky unix permission bits (0o7000) set on ZIP entry '{}' (RUSTSEC-2026-0369)",
+                        raw_name
+                    ),
+                });
+            }
             let lower = name.to_ascii_lowercase();
 
             if lower.ends_with("vbaproject.bin") || lower.contains("/macrosheets/") {
@@ -1100,6 +1173,76 @@ mod tests {
                 .iter()
                 .any(|f| f.category == "PDF_DEEP_NESTING_ATTACK"),
             "Brackets inside PDF string literals must not trigger PDF_DEEP_NESTING_ATTACK"
+        );
+    }
+
+    #[test]
+    fn test_scan_openxml_reader_detects_entry_count_symlink_suid_and_traversal() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        // 1. Symlink, SUID, and path traversal inside a ZIP/OOXML container
+        let mut malicious_zip = Vec::new();
+        {
+            let mut writer = ZipWriter::new(Cursor::new(&mut malicious_zip));
+            let opts = SimpleFileOptions::default();
+            writer
+                .start_file("word/../traversal.xml", opts)
+                .expect("start_file should succeed");
+            writer.write_all(b"<a/>").expect("write_all should succeed");
+            writer
+                .add_symlink("word/symlink.xml", "/etc/shadow", opts)
+                .expect("add_symlink should succeed");
+            writer
+                .start_file("word/suid.xml", opts.unix_permissions(0o755))
+                .expect("start_file should succeed");
+            writer.write_all(b"<b/>").expect("write_all should succeed");
+            writer.finish().expect("finish should succeed");
+        }
+        if let Some(cd_pos) = malicious_zip
+            .windows(4)
+            .rposition(|w| w == [0x50, 0x4B, 0x01, 0x02])
+        {
+            let suid_mode: u16 = 0o104755;
+            malicious_zip[cd_pos + 5] = 3;
+            malicious_zip[cd_pos + 40..cd_pos + 42].copy_from_slice(&suid_mode.to_le_bytes());
+        }
+        let findings = ContentScanner::scan(Path::new("evil.docx"), &malicious_zip);
+        assert!(
+            findings.iter().any(|f| f.category == "ZIP_PATH_TRAVERSAL"),
+            "Must detect ZIP_PATH_TRAVERSAL, got: {findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f.category == "ZIP_SYMLINK_ATTACK"),
+            "Must detect ZIP_SYMLINK_ATTACK, got: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == "ZIP_SUID_SGID_BIT_ATTACK"),
+            "Must detect ZIP_SUID_SGID_BIT_ATTACK, got: {findings:?}"
+        );
+
+        // 2. Archive entry count > 2048 must emit ARCHIVE_ENTRY_COUNT_EXCEEDED
+        let mut many_entries_zip = Vec::new();
+        {
+            let mut writer = ZipWriter::new(Cursor::new(&mut many_entries_zip));
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            for idx in 0..2050 {
+                writer
+                    .start_file(format!("part_{idx}.txt"), opts)
+                    .expect("start_file should succeed");
+            }
+            writer.finish().expect("finish should succeed");
+        }
+        let many_findings = ContentScanner::scan(Path::new("evasion.docx"), &many_entries_zip);
+        assert!(
+            many_findings
+                .iter()
+                .any(|f| f.category == "ARCHIVE_ENTRY_COUNT_EXCEEDED" && f.severity == "HIGH"),
+            "Archive with > 2048 entries must emit ARCHIVE_ENTRY_COUNT_EXCEEDED, got: {many_findings:?}"
         );
     }
 }

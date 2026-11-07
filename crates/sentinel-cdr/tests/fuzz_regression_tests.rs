@@ -1554,3 +1554,227 @@ fn test_pdf_deep_array_nesting_rejected_before_lopdf_load_mem() {
         .expect("Valid PDF with '[' inside a string literal must not be falsely rejected");
     assert!(clean_pdf.starts_with(b"%PDF-"));
 }
+
+#[test]
+fn test_zip_symlink_suid_and_traversal_entries_rejected_rustsec_2026_0367_0368_0369_0429() {
+    let engine = CdrEngine::new(SanitizationPolicy::default());
+
+    // 1. RUSTSEC-2026-0367: Path traversal (`../`, leading `/`, `:`, `./`) rejected with CdrError::InvalidFormat
+    for bad_name in [
+        "word/../evil.xml",
+        "/word/document.xml",
+        "C:word/document.xml",
+        "./word/document.xml",
+    ] {
+        let res = sentinel_cdr::sanitizers::openxml::OpenXmlSanitizer::validate_zip_entry_security(
+            bad_name,
+            false,
+            Some(0o100644),
+        );
+        assert!(
+            matches!(
+                res,
+                Err(sentinel_cdr::CdrError::InvalidFormat(ref msg))
+                    if msg.contains("RUSTSEC-2026-0367")
+            ),
+            "Path traversal name '{bad_name}' must fail with InvalidFormat (RUSTSEC-2026-0367), got: {res:?}"
+        );
+    }
+
+    let mut traversal_zip = Vec::new();
+    {
+        let mut writer = ZipWriter::new(Cursor::new(&mut traversal_zip));
+        let opts = SimpleFileOptions::default();
+        writer
+            .start_file("[Content_Types].xml", opts)
+            .expect("start_file should succeed");
+        writer
+            .write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#,
+            )
+            .expect("write_all should succeed");
+        writer
+            .start_file("word/document.xml", opts)
+            .expect("start_file should succeed");
+        writer
+            .write_all(br#"<w:document><w:body><w:p><w:t>Safe</w:t></w:p></w:body></w:document>"#)
+            .expect("write_all should succeed");
+        writer
+            .start_file("word/../../evil.xml", opts)
+            .expect("start_file should succeed");
+        writer
+            .write_all(b"<evil/>")
+            .expect("write_all should succeed");
+        writer.finish().expect("finish should succeed");
+    }
+    let trav_res = engine.sanitize(&traversal_zip);
+    assert!(
+        matches!(
+            trav_res,
+            Err(sentinel_cdr::CdrError::InvalidFormat(ref msg))
+                if msg.contains("RUSTSEC-2026-0367")
+        ),
+        "OOXML containing '../' traversal entry must fail closed with InvalidFormat (RUSTSEC-2026-0367), got: {trav_res:?}"
+    );
+    let trav_inspect = CdrEngine::inspect_bytes(&traversal_zip, "traversal.docx");
+    assert!(
+        trav_inspect
+            .risk_tags
+            .iter()
+            .any(|t| t == "ZIP_PATH_TRAVERSAL"),
+        "inspect_bytes must flag ZIP_PATH_TRAVERSAL, got: {:?}",
+        trav_inspect.risk_tags
+    );
+
+    // 2. RUSTSEC-2026-0368: Symlink entry (0o120777) rejected with CdrError::InvalidFormat
+    let mut symlink_zip = Vec::new();
+    {
+        let mut writer = ZipWriter::new(Cursor::new(&mut symlink_zip));
+        let opts = SimpleFileOptions::default();
+        writer
+            .start_file("[Content_Types].xml", opts)
+            .expect("start_file should succeed");
+        writer
+            .write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#,
+            )
+            .expect("write_all should succeed");
+        writer
+            .add_symlink("word/document.xml", "/etc/passwd", opts)
+            .expect("add_symlink should succeed");
+        writer.finish().expect("finish should succeed");
+    }
+    let sym_res = engine.sanitize(&symlink_zip);
+    assert!(
+        matches!(
+            sym_res,
+            Err(sentinel_cdr::CdrError::InvalidFormat(ref msg))
+                if msg.contains("RUSTSEC-2026-0368")
+        ),
+        "OOXML containing symlink entry (0o120777) must fail closed with InvalidFormat (RUSTSEC-2026-0368), got: {sym_res:?}"
+    );
+    let sym_inspect = CdrEngine::inspect_bytes(&symlink_zip, "symlink.docx");
+    assert!(
+        sym_inspect
+            .risk_tags
+            .iter()
+            .any(|t| t == "ZIP_SYMLINK_ENTRY"),
+        "inspect_bytes must flag ZIP_SYMLINK_ENTRY, got: {:?}",
+        sym_inspect.risk_tags
+    );
+
+    // 3. RUSTSEC-2026-0369: SUID/SGID/sticky mode bits (0o104755) stripped and recorded in report
+    let mut suid_zip = Vec::new();
+    {
+        let mut writer = ZipWriter::new(Cursor::new(&mut suid_zip));
+        let opts = SimpleFileOptions::default();
+        writer
+            .start_file("[Content_Types].xml", opts)
+            .expect("start_file should succeed");
+        writer
+            .write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#,
+            )
+            .expect("write_all should succeed");
+        writer
+            .start_file("word/document.xml", opts.unix_permissions(0o755))
+            .expect("start_file should succeed");
+        writer
+            .write_all(br#"<w:document><w:body><w:p><w:t>Hello</w:t></w:p></w:body></w:document>"#)
+            .expect("write_all should succeed");
+        writer.finish().expect("finish should succeed");
+    }
+    // Patch the PK\x01\x02 central directory header for `word/document.xml` to set SUID mode 0o104755
+    // (since zip 9.x's SimpleFileOptions::unix_permissions masks out 0o7000 on write)
+    if let Some(cd_pos) = suid_zip
+        .windows(4)
+        .rposition(|w| w == [0x50, 0x4B, 0x01, 0x02])
+    {
+        let suid_mode: u16 = 0o104755;
+        suid_zip[cd_pos + 5] = 3; // version_made_by = Unix (3)
+        suid_zip[cd_pos + 40..cd_pos + 42].copy_from_slice(&suid_mode.to_le_bytes());
+    }
+    let suid_inspect = CdrEngine::inspect_bytes(&suid_zip, "suid.docx");
+    assert!(
+        suid_inspect
+            .risk_tags
+            .iter()
+            .any(|t| t == "ZIP_SUID_SGID_ENTRY"),
+        "inspect_bytes must flag ZIP_SUID_SGID_ENTRY, got: {:?}",
+        suid_inspect.risk_tags
+    );
+    let (clean_suid_docx, suid_report) = engine
+        .sanitize(&suid_zip)
+        .expect("OOXML with SUID bit should sanitize cleanly by stripping 0o7000 bits");
+    assert!(
+        suid_report
+            .stripped_elements
+            .iter()
+            .any(|item| item.element_type == "ZIP_SUID_SGID_MODE_BITS"
+                && item.location_path == "word/document.xml"),
+        "Report must record ZIP_SUID_SGID_MODE_BITS for word/document.xml, got: {:?}",
+        suid_report.stripped_elements
+    );
+    let mut clean_arch =
+        zip::ZipArchive::new(Cursor::new(&clean_suid_docx)).expect("Output must be valid ZIP");
+    let clean_entry = clean_arch
+        .by_name("word/document.xml")
+        .expect("word/document.xml must exist in sanitized output");
+    assert_eq!(
+        clean_entry.unix_mode().unwrap_or(0) & 0o7000,
+        0,
+        "Sanitized ZIP entry must have 0o7000 SUID/SGID/sticky bits cleared"
+    );
+    drop(clean_entry);
+
+    // 4. RUSTSEC-2026-0429: Spoofed uncompressed_size = 10 header mismatch in central directory
+    let mut spoof_buf = Vec::new();
+    let payload = format!(
+        "<?xml version=\"1.0\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:body></w:document>",
+        "A".repeat(4096)
+    );
+    {
+        let mut writer = zip::ZipWriter::new(Cursor::new(&mut spoof_buf));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer
+            .start_file("[Content_Types].xml", options)
+            .expect("start_file");
+        writer
+            .write_all(b"<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>")
+            .expect("write_all");
+        writer
+            .start_file("word/document.xml", options)
+            .expect("start_file");
+        writer.write_all(payload.as_bytes()).expect("write_all");
+        writer.finish().expect("finish");
+    }
+    let orig_len = payload.len() as u32;
+    let orig_bytes = orig_len.to_le_bytes();
+    let spoof_bytes = 10u32.to_le_bytes();
+    let mut patched_spoof = 0usize;
+    let mut idx = 0usize;
+    while idx + 4 <= spoof_buf.len() {
+        if spoof_buf[idx..idx + 4] == orig_bytes {
+            spoof_buf[idx..idx + 4].copy_from_slice(&spoof_bytes);
+            patched_spoof += 1;
+        }
+        idx += 1;
+    }
+    assert!(
+        patched_spoof >= 1,
+        "Must patch uncompressed_size in ZIP headers for RUSTSEC-2026-0429 test"
+    );
+    let spoof_err = engine
+        .sanitize(&spoof_buf)
+        .expect_err("Spoofed uncompressed_size ZIP entry must fail closed (RUSTSEC-2026-0429)");
+    assert!(
+        matches!(
+            spoof_err,
+            sentinel_cdr::CdrError::ResourceLimitExceeded(ref msg)
+                if msg.contains("declared uncompressed size") || msg.contains("budget")
+        ),
+        "Expected ResourceLimitExceeded on spoofed ZIP size, got: {:?}",
+        spoof_err
+    );
+}

@@ -9,7 +9,7 @@ use crate::error::CdrError;
 use crate::policy::{ResourceBudget, SanitizationPolicy};
 use crate::sanitizers::DisarmReportItem;
 
-const MAX_ZIP_ENTRIES: usize = 4_096;
+pub const MAX_ZIP_ENTRIES: usize = 4_096;
 
 /// OOXML & ZIP Container Sanitizer (`BUG-CDR-04`, `BUG-CDR-08`, `EV-04`, Phase 2.3)
 ///
@@ -19,6 +19,82 @@ const MAX_ZIP_ENTRIES: usize = 4_096;
 pub struct OpenXmlSanitizer;
 
 impl OpenXmlSanitizer {
+    pub const MAX_OOXML_ENTRIES: usize = MAX_ZIP_ENTRIES;
+    /// Validates a ZIP central-directory entry against path traversal (`RUSTSEC-2026-0367`),
+    /// symbolic link attacks (`RUSTSEC-2026-0368`), and SUID/SGID/sticky mode bits (`RUSTSEC-2026-0369`).
+    /// Returns `(normalized_entry_name, had_suid_sgid_sticky_bits)` on success.
+    pub fn validate_zip_entry_security(
+        raw_name: &str,
+        is_symlink: bool,
+        unix_mode: Option<u32>,
+    ) -> Result<(String, bool), CdrError> {
+        if raw_name.is_empty()
+            || raw_name.len() > 1024
+            || raw_name.contains('\0')
+            || raw_name.contains(':')
+        {
+            return Err(CdrError::InvalidFormat(
+                "ZIP path traversal or invalid entry name rejected (RUSTSEC-2026-0367)".to_string(),
+            ));
+        }
+
+        let normalized = raw_name.replace('\\', "/");
+        if normalized.starts_with('/') || normalized.split('/').any(|seg| seg == ".." || seg == ".")
+        {
+            return Err(CdrError::InvalidFormat(
+                "ZIP path traversal or relative segment rejected (RUSTSEC-2026-0367)".to_string(),
+            ));
+        }
+
+        if is_symlink || unix_mode.is_some_and(|m| (m & 0o170000) == 0o120000) {
+            return Err(CdrError::InvalidFormat(
+                "ZIP symlink entries are forbidden in OpenXML containers (RUSTSEC-2026-0368)"
+                    .to_string(),
+            ));
+        }
+
+        let had_suid_sgid = unix_mode.is_some_and(|m| (m & 0o7000) != 0);
+        Ok((normalized, had_suid_sgid))
+    }
+
+    /// Scans raw ZIP central-directory (`PK\x01\x02`) headers to detect entries whose raw
+    /// `external_file_attributes >> 16` carry SUID/SGID/sticky (`0o7000`) bits, even when
+    /// `zip 9.x`'s `unix_mode()` accessor clears those bits in memory (`RUSTSEC-2026-0369`).
+    pub fn collect_raw_cd_suid_sgid_entries(zip_bytes: &[u8]) -> HashSet<String> {
+        let mut flagged = HashSet::new();
+        let mut idx = 0usize;
+        while idx + 46 <= zip_bytes.len() {
+            if zip_bytes[idx..idx + 4] == [0x50, 0x4B, 0x01, 0x02] {
+                let name_len =
+                    u16::from_le_bytes([zip_bytes[idx + 28], zip_bytes[idx + 29]]) as usize;
+                let extra_len =
+                    u16::from_le_bytes([zip_bytes[idx + 30], zip_bytes[idx + 31]]) as usize;
+                let comment_len =
+                    u16::from_le_bytes([zip_bytes[idx + 32], zip_bytes[idx + 33]]) as usize;
+                let ext_attrs = u32::from_le_bytes([
+                    zip_bytes[idx + 38],
+                    zip_bytes[idx + 39],
+                    zip_bytes[idx + 40],
+                    zip_bytes[idx + 41],
+                ]);
+                let raw_unix_mode = ext_attrs >> 16;
+                if idx + 46 + name_len <= zip_bytes.len() && (raw_unix_mode & 0o7000) != 0 {
+                    let name = String::from_utf8_lossy(&zip_bytes[idx + 46..idx + 46 + name_len])
+                        .replace('\\', "/");
+                    flagged.insert(name);
+                }
+                let step = 46usize
+                    .saturating_add(name_len)
+                    .saturating_add(extra_len)
+                    .saturating_add(comment_len);
+                idx = idx.saturating_add(step.max(1));
+            } else {
+                idx += 1;
+            }
+        }
+        flagged
+    }
+
     pub fn sanitize(
         input_bytes: &[u8],
         policy: &SanitizationPolicy,
@@ -50,24 +126,35 @@ impl OpenXmlSanitizer {
         let mut stripped_parts: HashSet<String> = HashSet::new();
         let mut raw_entries: Vec<(String, CompressionMethod, Vec<u8>)> =
             Vec::with_capacity(archive.len());
+        let raw_suid_entries = Self::collect_raw_cd_suid_sgid_entries(input_bytes);
 
-        // Pass 1: Read entries with bounded Take reader (fixes BUG-CDR-04 header spoofing)
+        // Pass 1: Read entries with bounded Take reader (fixes BUG-CDR-04 / RUSTSEC-2026-0429 header spoofing)
         // and identify macro / OLE / ActiveX parts to strip before rewriting .rels and [Content_Types].xml.
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).map_err(|e| {
                 CdrError::ParserCorruption(format!("ZIP entry index {} error: {}", i, e))
             })?;
 
-            let name = file.name().replace('\\', "/");
+            let raw_entry_name = file
+                .name()
+                .map_err(|e| {
+                    CdrError::InvalidFormat(format!(
+                        "Invalid UTF-8 ZIP entry name rejected (RUSTSEC-2026-0367): {e}"
+                    ))
+                })?
+                .into_owned();
+            let (name, had_suid_sgid) = Self::validate_zip_entry_security(
+                &raw_entry_name,
+                file.is_symlink(),
+                file.unix_mode(),
+            )?;
 
-            // Reject path traversal inside archive
-            if name.contains("../") || name.starts_with('/') {
+            if had_suid_sgid || raw_suid_entries.contains(&name) {
                 report.push(DisarmReportItem::new(
-                    "Archive Path Traversal",
-                    name,
-                    "Dropped unsafe relative path entry",
+                    "ZIP_SUID_SGID_MODE_BITS",
+                    name.clone(),
+                    "Stripped SUID/SGID/sticky unix permission bits (0o7000) from ZIP entry (RUSTSEC-2026-0369)",
                 ));
-                continue;
             }
 
             if file.is_dir() {
@@ -86,12 +173,25 @@ impl OpenXmlSanitizer {
                 }
             }
 
-            // Read actual decompressed stream capped by remaining budget + 1 byte
+            // Read actual decompressed stream capped by remaining budget + 1 byte,
+            // pre-allocating at most 64 KiB rather than trusting central-directory file.size() (RUSTSEC-2026-0429)
+            let prealloc_cap = (file.size().min(64 * 1024)) as usize;
             let read_cap = budget.bytes_remaining.saturating_add(1);
             let mut bounded_reader = (&mut file).take(read_cap);
-            let mut entry_bytes = Vec::new();
+            let mut entry_bytes = Vec::with_capacity(prealloc_cap);
             bounded_reader.read_to_end(&mut entry_bytes).map_err(|e| {
-                CdrError::ParserCorruption(format!("Decompression stream error in {}: {}", name, e))
+                let err_str = e.to_string();
+                if err_str.contains("larger than its declared uncompressed size") {
+                    CdrError::ResourceLimitExceeded(format!(
+                        "ZIP entry {} exceeded declared uncompressed size header (RUSTSEC-2026-0429 / BUG-CDR-04): {}",
+                        name, err_str
+                    ))
+                } else {
+                    CdrError::ParserCorruption(format!(
+                        "Decompression stream error in {}: {}",
+                        name, err_str
+                    ))
+                }
             })?;
 
             budget.charge_bytes(entry_bytes.len() as u64)?;
@@ -133,9 +233,15 @@ impl OpenXmlSanitizer {
 
             for (name, method, mut entry_bytes) in raw_entries {
                 if name.ends_with('/') {
-                    let options =
-                        SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-                    let _ = zip_writer.add_directory(name, options);
+                    let options = SimpleFileOptions::default()
+                        .compression_method(CompressionMethod::Stored)
+                        .unix_permissions(0o755);
+                    zip_writer.add_directory(&name, options).map_err(|e| {
+                        CdrError::ReconstructionFailure(format!(
+                            "Failed adding ZIP directory {}: {}",
+                            name, e
+                        ))
+                    })?;
                     continue;
                 }
 

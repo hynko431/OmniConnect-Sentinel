@@ -154,7 +154,9 @@ impl CdrEngine {
 
                 for i in 0..archive.len().min(256) {
                     if let Ok(entry) = archive.by_index_raw(i) {
-                        let name = entry.name().replace('\\', "/").to_ascii_lowercase();
+                        let name = String::from_utf8_lossy(entry.name_raw())
+                            .replace('\\', "/")
+                            .to_ascii_lowercase();
                         if name == "[content_types].xml" {
                             has_content_types = true;
                         } else if name.starts_with("word/") {
@@ -453,13 +455,29 @@ impl CdrEngine {
             | DetectedFormat::Xlsx
             | DetectedFormat::Pptx
             | DetectedFormat::ArchiveZip => {
+                const MAX_VERIFY_XML_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
                 let is_generic_zip = format == DetectedFormat::ArchiveZip;
+                let raw_suid_entries =
+                    OpenXmlSanitizer::collect_raw_cd_suid_sgid_entries(clean_bytes);
+                if !raw_suid_entries.is_empty() {
+                    return Err(CdrError::OutputRejected(
+                        "CDR_OUTPUT_REJECTED: Residual SUID/SGID/sticky mode bits in sanitized ZIP central directory"
+                            .to_string(),
+                    ));
+                }
                 let mut archive = ZipArchive::new(Cursor::new(clean_bytes)).map_err(|e| {
                     CdrError::OutputRejected(format!(
                         "CDR_OUTPUT_REJECTED: Sanitized OOXML/ZIP is not a valid ZIP: {}",
                         e
                     ))
                 })?;
+                if archive.len() > OpenXmlSanitizer::MAX_OOXML_ENTRIES {
+                    return Err(CdrError::OutputRejected(format!(
+                        "CDR_OUTPUT_REJECTED: Sanitized ZIP entry count {} exceeds limit {}",
+                        archive.len(),
+                        OpenXmlSanitizer::MAX_OOXML_ENTRIES
+                    )));
+                }
                 for i in 0..archive.len() {
                     let mut entry = archive.by_index(i).map_err(|e| {
                         CdrError::OutputRejected(format!(
@@ -467,7 +485,34 @@ impl CdrEngine {
                             i, e
                         ))
                     })?;
-                    let lower = entry.name().replace('\\', "/").to_ascii_lowercase();
+                    let raw_entry_name = entry
+                        .name()
+                        .map_err(|e| {
+                            CdrError::OutputRejected(format!(
+                                "CDR_OUTPUT_REJECTED: Invalid UTF-8 ZIP entry name in sanitized output: {}",
+                                e
+                            ))
+                        })?
+                        .into_owned();
+                    let (normalized_name, had_suid_sgid) =
+                        OpenXmlSanitizer::validate_zip_entry_security(
+                            &raw_entry_name,
+                            entry.is_symlink(),
+                            entry.unix_mode(),
+                        )
+                        .map_err(|e| {
+                            CdrError::OutputRejected(format!(
+                                "CDR_OUTPUT_REJECTED: Unsafe ZIP entry in sanitized output: {}",
+                                e
+                            ))
+                        })?;
+                    if had_suid_sgid || (entry.unix_mode().unwrap_or(0) & 0o7000) != 0 {
+                        return Err(CdrError::OutputRejected(format!(
+                            "CDR_OUTPUT_REJECTED: Residual SUID/SGID/sticky mode bits on ZIP entry '{}'",
+                            normalized_name
+                        )));
+                    }
+                    let lower = normalized_name.to_ascii_lowercase();
                     if !is_generic_zip && policy.strip_office_macros {
                         if lower.ends_with("vbaproject.bin")
                             || lower.ends_with("vbaprojectsignature.bin")
@@ -496,23 +541,45 @@ impl CdrEngine {
                         && policy.sanitize_office_external_relationships
                         && lower.ends_with(".rels")
                     {
-                        let mut rels_bytes = Vec::new();
-                        std::io::Read::read_to_end(&mut entry, &mut rels_bytes).map_err(|e| {
+                        let mut rels_bytes =
+                            Vec::with_capacity((entry.size().min(64 * 1024)) as usize);
+                        std::io::Read::read_to_end(
+                            &mut std::io::Read::take(&mut entry, MAX_VERIFY_XML_ENTRY_BYTES + 1),
+                            &mut rels_bytes,
+                        )
+                        .map_err(|e| {
                             CdrError::OutputRejected(format!(
                                 "CDR_OUTPUT_REJECTED: Failed reading .rels entry {}: {}",
                                 lower, e
                             ))
                         })?;
+                        if (rels_bytes.len() as u64) > MAX_VERIFY_XML_ENTRY_BYTES {
+                            return Err(CdrError::OutputRejected(format!(
+                                "CDR_OUTPUT_REJECTED: .rels entry {} exceeds MAX_VERIFY_XML_ENTRY_BYTES",
+                                lower
+                            )));
+                        }
                         Self::verify_rels_clean(&rels_bytes, policy)?;
                     } else if !is_generic_zip && policy.strip_office_dde && lower.ends_with(".xml")
                     {
-                        let mut xml_bytes = Vec::new();
-                        std::io::Read::read_to_end(&mut entry, &mut xml_bytes).map_err(|e| {
+                        let mut xml_bytes =
+                            Vec::with_capacity((entry.size().min(64 * 1024)) as usize);
+                        std::io::Read::read_to_end(
+                            &mut std::io::Read::take(&mut entry, MAX_VERIFY_XML_ENTRY_BYTES + 1),
+                            &mut xml_bytes,
+                        )
+                        .map_err(|e| {
                             CdrError::OutputRejected(format!(
                                 "CDR_OUTPUT_REJECTED: Failed reading .xml entry {}: {}",
                                 lower, e
                             ))
                         })?;
+                        if (xml_bytes.len() as u64) > MAX_VERIFY_XML_ENTRY_BYTES {
+                            return Err(CdrError::OutputRejected(format!(
+                                "CDR_OUTPUT_REJECTED: .xml entry {} exceeds MAX_VERIFY_XML_ENTRY_BYTES",
+                                lower
+                            )));
+                        }
                         let xml_str = std::str::from_utf8(&xml_bytes).map_err(|e| {
                             CdrError::OutputRejected(format!(
                                 "CDR_OUTPUT_REJECTED: Invalid UTF-8 in .xml entry {}: {}",
@@ -1103,11 +1170,40 @@ impl CdrEngine {
                     }
                 }
             }
-            DetectedFormat::Docx | DetectedFormat::Xlsx | DetectedFormat::Pptx => {
+            DetectedFormat::Docx
+            | DetectedFormat::Xlsx
+            | DetectedFormat::Pptx
+            | DetectedFormat::ArchiveZip => {
+                if !OpenXmlSanitizer::collect_raw_cd_suid_sgid_entries(bytes).is_empty() {
+                    risk_tags.push("ZIP_SUID_SGID_ENTRY".to_string());
+                }
                 if let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) {
-                    for i in 0..archive.len() {
+                    if archive.len() > OpenXmlSanitizer::MAX_OOXML_ENTRIES {
+                        risk_tags.push("ZIP_BOMB_ENTRY_COUNT".to_string());
+                    }
+                    for i in 0..archive.len().min(OpenXmlSanitizer::MAX_OOXML_ENTRIES) {
                         if let Ok(file) = archive.by_index_raw(i) {
-                            let lower = file.name().to_ascii_lowercase();
+                            if file.is_symlink()
+                                || file.unix_mode().is_some_and(|m| (m & 0o170000) == 0o120000)
+                            {
+                                risk_tags.push("ZIP_SYMLINK_ENTRY".to_string());
+                            }
+                            if file.unix_mode().is_some_and(|m| (m & 0o7000) != 0) {
+                                risk_tags.push("ZIP_SUID_SGID_ENTRY".to_string());
+                            }
+                            let raw_entry_name =
+                                String::from_utf8_lossy(file.name_raw()).into_owned();
+                            if file.name().is_err()
+                                || OpenXmlSanitizer::validate_zip_entry_security(
+                                    &raw_entry_name,
+                                    false,
+                                    None,
+                                )
+                                .is_err()
+                            {
+                                risk_tags.push("ZIP_PATH_TRAVERSAL".to_string());
+                            }
+                            let lower = raw_entry_name.to_ascii_lowercase();
                             if lower.ends_with("vbaproject.bin") {
                                 risk_tags.push("OOXML_VBA_MACRO_PROJECT".to_string());
                             } else if lower.contains("embeddings/") || lower.contains("activex/") {
