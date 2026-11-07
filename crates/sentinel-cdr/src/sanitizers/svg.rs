@@ -44,6 +44,7 @@ impl SvgSanitizer {
         let mut reports = Vec::new();
         let mut skip_depth: usize = 0;
         let mut in_style_depth: usize = 0;
+        let mut xml_depth: usize = 0;
 
         if raw_lower.contains("<!entity") {
             reports.push(DisarmReportItem::new(
@@ -68,17 +69,23 @@ impl SvgSanitizer {
                 }
                 Ok(Event::Start(e)) => {
                     budget.charge_object()?;
+                    xml_depth += 1;
+                    if xml_depth > crate::sanitizers::MAX_XML_ELEMENT_DEPTH {
+                        return Err(CdrError::ResourceLimitExceeded(format!(
+                            "SVG XML element nesting depth exceeds maximum allowed ({}) (RUSTSEC-2026-0195 mitigation)",
+                            crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                        )));
+                    }
                     if skip_depth > 0 {
                         skip_depth += 1;
                         buf.clear();
                         continue;
                     }
-                    let tag_lower =
-                        String::from_utf8_lossy(e.local_name().as_ref()).to_ascii_lowercase();
+                    let tag_lower = e.local_name().as_ref().to_ascii_lowercase();
                     if Self::is_forbidden_tag(&tag_lower) {
                         reports.push(DisarmReportItem::new(
                             "SVG_ACTIVE_ELEMENT",
-                            format!("<{}>", tag_lower),
+                            format!("<{tag_lower}>"),
                             "REMOVED",
                         ));
                         skip_depth = 1;
@@ -95,16 +102,21 @@ impl SvgSanitizer {
                 }
                 Ok(Event::Empty(e)) => {
                     budget.charge_object()?;
+                    if xml_depth + 1 > crate::sanitizers::MAX_XML_ELEMENT_DEPTH {
+                        return Err(CdrError::ResourceLimitExceeded(format!(
+                            "SVG XML element nesting depth exceeds maximum allowed ({}) (RUSTSEC-2026-0195 mitigation)",
+                            crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                        )));
+                    }
                     if skip_depth > 0 {
                         buf.clear();
                         continue;
                     }
-                    let tag_lower =
-                        String::from_utf8_lossy(e.local_name().as_ref()).to_ascii_lowercase();
+                    let tag_lower = e.local_name().as_ref().to_ascii_lowercase();
                     if Self::is_forbidden_tag(&tag_lower) {
                         reports.push(DisarmReportItem::new(
                             "SVG_ACTIVE_ELEMENT",
-                            format!("<{}/>", tag_lower),
+                            format!("<{tag_lower}/>"),
                             "REMOVED",
                         ));
                         buf.clear();
@@ -116,18 +128,37 @@ impl SvgSanitizer {
                         .map_err(|err| CdrError::XmlError(err.to_string()))?;
                 }
                 Ok(Event::End(e)) => {
+                    xml_depth = xml_depth.saturating_sub(1);
                     if skip_depth > 0 {
                         skip_depth -= 1;
                         buf.clear();
                         continue;
                     }
-                    let tag_lower =
-                        String::from_utf8_lossy(e.local_name().as_ref()).to_ascii_lowercase();
+                    let tag_lower = e.local_name().as_ref().to_ascii_lowercase();
                     if tag_lower == "style" && in_style_depth > 0 {
                         in_style_depth -= 1;
                     }
                     writer
                         .write_event(Event::End(e))
+                        .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                }
+                Ok(Event::GeneralRef(e)) => {
+                    if skip_depth > 0 {
+                        buf.clear();
+                        continue;
+                    }
+                    if !crate::sanitizers::is_allowed_xml_general_ref(e.as_ref().as_bytes()) {
+                        let entity_name = e.as_ref();
+                        reports.push(DisarmReportItem::new(
+                            "SVG_XML_ENTITY",
+                            format!("&{entity_name};"),
+                            "REMOVED",
+                        ));
+                        buf.clear();
+                        continue;
+                    }
+                    writer
+                        .write_event(Event::GeneralRef(e))
                         .map_err(|err| CdrError::XmlError(err.to_string()))?;
                 }
                 Ok(Event::Text(t)) => {
@@ -136,7 +167,7 @@ impl SvgSanitizer {
                         continue;
                     }
                     if in_style_depth > 0 {
-                        let css_lower = String::from_utf8_lossy(t.as_ref()).to_ascii_lowercase();
+                        let css_lower = t.as_ref().to_ascii_lowercase();
                         if Self::has_dangerous_css(&css_lower) {
                             reports.push(DisarmReportItem::new(
                                 "SVG_STYLE_EXTERNAL_OR_SCRIPT",
@@ -157,7 +188,7 @@ impl SvgSanitizer {
                         continue;
                     }
                     if in_style_depth > 0 {
-                        let css_lower = String::from_utf8_lossy(c.as_ref()).to_ascii_lowercase();
+                        let css_lower = c.as_ref().to_ascii_lowercase();
                         if Self::has_dangerous_css(&css_lower) {
                             reports.push(DisarmReportItem::new(
                                 "SVG_STYLE_EXTERNAL_OR_SCRIPT",
@@ -219,14 +250,13 @@ impl SvgSanitizer {
         tag_lower: &str,
         reports: &mut Vec<DisarmReportItem>,
     ) -> Result<BytesStart<'static>> {
-        let name_str = String::from_utf8_lossy(elem.name().as_ref()).into_owned();
+        let name_str = elem.name().as_ref().to_string();
         let mut cleaned = BytesStart::new(name_str);
 
-        for attr_res in elem.attributes().with_checks(false) {
-            let attr = attr_res.map_err(|e| CdrError::XmlError(e.to_string()))?;
-            let key_raw = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+        for attr in crate::sanitizers::collect_validated_xml_attributes(elem)? {
+            let key_raw = attr.key.as_ref().to_string();
             let key_lower = key_raw.to_ascii_lowercase();
-            let val_str = String::from_utf8_lossy(&attr.value).into_owned();
+            let val_str = attr.value.into_owned();
             let val_trimmed = val_str.trim().to_ascii_lowercase();
 
             if key_lower.starts_with("on") {

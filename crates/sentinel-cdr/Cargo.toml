@@ -38,8 +38,5 @@ hex = "0.4"
 lopdf = "0.33"
 zip = { version = "2.1", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-quick-xml = "0.36"
+quick-xml = "0.42"
 
-[dev-dependencies]
-tempfile = "3.10"
-crc32fast.workspace = true

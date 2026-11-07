@@ -297,11 +297,41 @@ impl OpenXmlSanitizer {
         let mut writer = Writer::new(Vec::with_capacity(xml_bytes.len()));
         let mut buf = Vec::new();
         let mut skip_depth = 0usize;
+        let mut xml_depth = 0usize;
 
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Eof) => break,
+                Ok(Event::DocType(_)) => {
+                    return Err(CdrError::ParserCorruption(
+                        "DOCTYPE declaration forbidden in [Content_Types].xml".to_string(),
+                    ));
+                }
                 Ok(event) => {
+                    match event {
+                        Event::Start(_) => {
+                            xml_depth += 1;
+                            if xml_depth > crate::sanitizers::MAX_XML_ELEMENT_DEPTH {
+                                return Err(CdrError::ResourceLimitExceeded(format!(
+                                    "[Content_Types].xml element nesting depth exceeds maximum allowed ({}) (RUSTSEC-2026-0195 mitigation)",
+                                    crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                                )));
+                            }
+                        }
+                        Event::Empty(_) => {
+                            if xml_depth + 1 > crate::sanitizers::MAX_XML_ELEMENT_DEPTH {
+                                return Err(CdrError::ResourceLimitExceeded(format!(
+                                    "[Content_Types].xml element nesting depth exceeds maximum allowed ({}) (RUSTSEC-2026-0195 mitigation)",
+                                    crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                                )));
+                            }
+                        }
+                        Event::End(_) => {
+                            xml_depth = xml_depth.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+
                     if skip_depth > 0 {
                         match event {
                             Event::Start(_) => skip_depth += 1,
@@ -315,17 +345,16 @@ impl OpenXmlSanitizer {
                     match event {
                         Event::Start(ref e) | Event::Empty(ref e) => {
                             let is_empty = matches!(event, Event::Empty(_));
-                            let local_bytes = e.name().local_name().into_inner().to_vec();
-                            let local = String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
+                            let validated_attrs =
+                                crate::sanitizers::collect_validated_xml_attributes(e)?;
+                            let local = e.name().local_name().into_inner().to_ascii_lowercase();
 
                             if local == "override" {
                                 let mut part_name = String::new();
                                 let mut content_type = String::new();
-                                for attr in e.attributes().with_checks(false).flatten() {
-                                    let k =
-                                        String::from_utf8_lossy(attr.key.local_name().into_inner())
-                                            .to_ascii_lowercase();
-                                    let v = String::from_utf8_lossy(&attr.value).into_owned();
+                                for attr in &validated_attrs {
+                                    let k = attr.key.local_name().into_inner().to_ascii_lowercase();
+                                    let v = attr.value.as_ref().to_string();
                                     if k == "partname" {
                                         part_name = v;
                                     } else if k == "contenttype" {
@@ -354,34 +383,25 @@ impl OpenXmlSanitizer {
                                 };
 
                                 if let Some(replaced_ct) = new_ct {
-                                    let tag_name =
-                                        String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                                    let tag_name = e.name().as_ref().to_string();
                                     let mut clean_elem = BytesStart::new(tag_name);
-                                    for attr in e.attributes().with_checks(false).flatten() {
-                                        let key_str =
-                                            String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-                                        let local_k = String::from_utf8_lossy(
-                                            attr.key.local_name().into_inner(),
-                                        )
-                                        .to_ascii_lowercase();
+                                    for attr in &validated_attrs {
+                                        let key_str = attr.key.as_ref().to_string();
+                                        let local_k =
+                                            attr.key.local_name().into_inner().to_ascii_lowercase();
                                         if local_k == "contenttype" {
                                             clean_elem
                                                 .push_attribute((key_str.as_str(), replaced_ct));
                                         } else {
-                                            let val_str =
-                                                String::from_utf8_lossy(&attr.value).into_owned();
-                                            clean_elem.push_attribute((
-                                                key_str.as_str(),
-                                                val_str.as_str(),
-                                            ));
+                                            let val_str = attr.value.as_ref();
+                                            clean_elem.push_attribute((key_str.as_str(), val_str));
                                         }
                                     }
                                     report.push(DisarmReportItem::new(
                                         "MACRO_ENABLED_CONTENT_TYPE",
                                         location.to_string(),
                                         format!(
-                                            "Converted {} to standard document ContentType",
-                                            content_type
+                                            "Converted {content_type} to standard document ContentType"
                                         ),
                                     ));
                                     let write_ev = if is_empty {
@@ -397,6 +417,18 @@ impl OpenXmlSanitizer {
                                 }
                             }
 
+                            writer
+                                .write_event(event.into_owned())
+                                .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                        }
+                        Event::GeneralRef(ref e) => {
+                            if !crate::sanitizers::is_allowed_xml_general_ref(e.as_ref().as_bytes())
+                            {
+                                return Err(CdrError::ParserCorruption(
+                                    "Custom XML entity reference forbidden in [Content_Types].xml"
+                                        .to_string(),
+                                ));
+                            }
                             writer
                                 .write_event(event.into_owned())
                                 .map_err(|err| CdrError::XmlError(err.to_string()))?;
@@ -459,11 +491,41 @@ impl OpenXmlSanitizer {
         let mut writer = Writer::new(Vec::with_capacity(xml_bytes.len()));
         let mut buf = Vec::new();
         let mut skip_depth = 0usize;
+        let mut xml_depth = 0usize;
 
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Eof) => break,
+                Ok(Event::DocType(_)) => {
+                    return Err(CdrError::ParserCorruption(format!(
+                        "DOCTYPE declaration forbidden in {rels_path}"
+                    )));
+                }
                 Ok(event) => {
+                    match event {
+                        Event::Start(_) => {
+                            xml_depth += 1;
+                            if xml_depth > crate::sanitizers::MAX_XML_ELEMENT_DEPTH {
+                                return Err(CdrError::ResourceLimitExceeded(format!(
+                                    "Relationship XML nesting depth exceeds maximum allowed ({}) in {rels_path} (RUSTSEC-2026-0195 mitigation)",
+                                    crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                                )));
+                            }
+                        }
+                        Event::Empty(_) => {
+                            if xml_depth + 1 > crate::sanitizers::MAX_XML_ELEMENT_DEPTH {
+                                return Err(CdrError::ResourceLimitExceeded(format!(
+                                    "Relationship XML nesting depth exceeds maximum allowed ({}) in {rels_path} (RUSTSEC-2026-0195 mitigation)",
+                                    crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                                )));
+                            }
+                        }
+                        Event::End(_) => {
+                            xml_depth = xml_depth.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+
                     if skip_depth > 0 {
                         match event {
                             Event::Start(_) => skip_depth += 1,
@@ -477,8 +539,9 @@ impl OpenXmlSanitizer {
                     match event {
                         Event::Start(ref e) | Event::Empty(ref e) => {
                             let is_empty = matches!(event, Event::Empty(_));
-                            let local_bytes = e.name().local_name().into_inner().to_vec();
-                            let local = String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
+                            let validated_attrs =
+                                crate::sanitizers::collect_validated_xml_attributes(e)?;
+                            let local = e.name().local_name().into_inner().to_ascii_lowercase();
 
                             if local == "relationship" {
                                 let mut rel_id = String::new();
@@ -486,17 +549,9 @@ impl OpenXmlSanitizer {
                                 let mut target_mode = String::new();
                                 let mut rel_type = String::new();
 
-                                for attr_res in e.attributes().with_checks(false) {
-                                    let attr = attr_res.map_err(|err| {
-                                        CdrError::ParserCorruption(format!(
-                                            "Malformed Relationship attribute in {}: {}",
-                                            rels_path, err
-                                        ))
-                                    })?;
-                                    let k =
-                                        String::from_utf8_lossy(attr.key.local_name().into_inner())
-                                            .to_ascii_lowercase();
-                                    let v = String::from_utf8_lossy(&attr.value).into_owned();
+                                for attr in &validated_attrs {
+                                    let k = attr.key.local_name().into_inner().to_ascii_lowercase();
+                                    let v = attr.value.as_ref().to_string();
                                     if k == "id" {
                                         rel_id = v;
                                     } else if k == "target" {
@@ -585,6 +640,17 @@ impl OpenXmlSanitizer {
                                 .write_event(event.into_owned())
                                 .map_err(|err| CdrError::XmlError(err.to_string()))?;
                         }
+                        Event::GeneralRef(ref e) => {
+                            if !crate::sanitizers::is_allowed_xml_general_ref(e.as_ref().as_bytes())
+                            {
+                                return Err(CdrError::ParserCorruption(format!(
+                                    "Custom XML entity reference forbidden in {rels_path}"
+                                )));
+                            }
+                            writer
+                                .write_event(event.into_owned())
+                                .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                        }
                         other => {
                             writer
                                 .write_event(other.into_owned())
@@ -594,8 +660,7 @@ impl OpenXmlSanitizer {
                 }
                 Err(e) => {
                     return Err(CdrError::ParserCorruption(format!(
-                        "Relationship XML parse error in {}: {}",
-                        rels_path, e
+                        "Relationship XML parse error in {rels_path}: {e}"
                     )));
                 }
             }
@@ -646,13 +711,14 @@ impl OpenXmlSanitizer {
         report: &mut Vec<DisarmReportItem>,
     ) -> Result<Vec<u8>, CdrError> {
         let _xml_str = std::str::from_utf8(xml_bytes).map_err(|e| {
-            CdrError::ParserCorruption(format!("Invalid UTF-8 in OOXML part {}: {}", xml_path, e))
+            CdrError::ParserCorruption(format!("Invalid UTF-8 in OOXML part {xml_path}: {e}"))
         })?;
 
         let mut reader = Reader::from_reader(xml_bytes);
         let mut writer = Writer::new(Vec::with_capacity(xml_bytes.len()));
         let mut buf = Vec::new();
         let mut skip_depth = 0usize;
+        let mut xml_depth = 0usize;
 
         loop {
             match reader.read_event_into(&mut buf) {
@@ -667,6 +733,30 @@ impl OpenXmlSanitizer {
                     continue;
                 }
                 Ok(event) => {
+                    match event {
+                        Event::Start(_) => {
+                            xml_depth += 1;
+                            if xml_depth > crate::sanitizers::MAX_XML_ELEMENT_DEPTH {
+                                return Err(CdrError::ResourceLimitExceeded(format!(
+                                    "OOXML element nesting depth exceeds maximum allowed ({}) in {xml_path} (RUSTSEC-2026-0195 mitigation)",
+                                    crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                                )));
+                            }
+                        }
+                        Event::Empty(_) => {
+                            if xml_depth + 1 > crate::sanitizers::MAX_XML_ELEMENT_DEPTH {
+                                return Err(CdrError::ResourceLimitExceeded(format!(
+                                    "OOXML element nesting depth exceeds maximum allowed ({}) in {xml_path} (RUSTSEC-2026-0195 mitigation)",
+                                    crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                                )));
+                            }
+                        }
+                        Event::End(_) => {
+                            xml_depth = xml_depth.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+
                     if skip_depth > 0 {
                         match event {
                             Event::Start(_) => skip_depth += 1,
@@ -680,8 +770,9 @@ impl OpenXmlSanitizer {
                     match event {
                         Event::Start(ref e) | Event::Empty(ref e) => {
                             let is_empty = matches!(event, Event::Empty(_));
-                            let local_bytes = e.name().local_name().into_inner().to_vec();
-                            let local = String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
+                            let validated_attrs =
+                                crate::sanitizers::collect_validated_xml_attributes(e)?;
+                            let local = e.name().local_name().into_inner().to_ascii_lowercase();
 
                             if policy.strip_office_dde
                                 && (local == "ddelink" || local == "ddeitem" || local == "olelink")
@@ -699,23 +790,15 @@ impl OpenXmlSanitizer {
                             }
 
                             let mut neutralized_attr = false;
-                            let tag_name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                            let tag_name = e.name().as_ref().to_string();
                             let mut clean_elem = BytesStart::new(tag_name);
 
-                            for attr_res in e.attributes().with_checks(false) {
-                                let attr = attr_res.map_err(|err| {
-                                    CdrError::ParserCorruption(format!(
-                                        "Malformed XML attribute in {}: {}",
-                                        xml_path, err
-                                    ))
-                                })?;
-                                let key_str =
-                                    String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+                            for attr in validated_attrs {
+                                let key_str = attr.key.as_ref().to_string();
                                 let key_lower = key_str.to_ascii_lowercase();
                                 let local_key =
-                                    String::from_utf8_lossy(attr.key.local_name().into_inner())
-                                        .to_ascii_lowercase();
-                                let val_str = String::from_utf8_lossy(&attr.value).into_owned();
+                                    attr.key.local_name().into_inner().to_ascii_lowercase();
+                                let val_str = attr.value.into_owned();
                                 let val_upper = val_str.to_ascii_uppercase();
 
                                 // Strip dangling `r:id` / `r:embed` / `r:link` / `id` attributes whose
@@ -729,8 +812,7 @@ impl OpenXmlSanitizer {
                                         "DANGLING_RELATIONSHIP_ATTR",
                                         xml_path.to_string(),
                                         format!(
-                                            "Stripped dangling relationship attribute {}='{}'",
-                                            key_str, val_str
+                                            "Stripped dangling relationship attribute {key_str}='{val_str}'"
                                         ),
                                     ));
                                     continue;
@@ -769,7 +851,7 @@ impl OpenXmlSanitizer {
                                 .map_err(|err| CdrError::XmlError(err.to_string()))?;
                         }
                         Event::Text(ref t) => {
-                            let raw_text = String::from_utf8_lossy(t.as_ref()).into_owned();
+                            let raw_text = t.as_ref();
                             let upper = raw_text.to_ascii_uppercase();
                             if policy.strip_office_dde
                                 && (upper.contains("DDEAUTO")
@@ -792,8 +874,24 @@ impl OpenXmlSanitizer {
                                     .map_err(|err| CdrError::XmlError(err.to_string()))?;
                             }
                         }
+                        Event::GeneralRef(ref e) => {
+                            if !crate::sanitizers::is_allowed_xml_general_ref(e.as_ref().as_bytes())
+                            {
+                                let entity_name = e.as_ref();
+                                report.push(DisarmReportItem::new(
+                                    "OOXML_CUSTOM_ENTITY_REF",
+                                    xml_path.to_string(),
+                                    format!("Removed custom XML entity reference &{entity_name};"),
+                                ));
+                                buf.clear();
+                                continue;
+                            }
+                            writer
+                                .write_event(event.into_owned())
+                                .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                        }
                         Event::End(ref e) => {
-                            let tag_name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                            let tag_name = e.name().as_ref().to_string();
                             writer
                                 .write_event(Event::End(BytesEnd::new(tag_name)))
                                 .map_err(|err| CdrError::XmlError(err.to_string()))?;

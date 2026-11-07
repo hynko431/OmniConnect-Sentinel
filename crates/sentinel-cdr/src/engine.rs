@@ -543,6 +543,7 @@ impl CdrEngine {
                 }
                 let mut reader = quick_xml::Reader::from_str(s);
                 let mut buf = Vec::new();
+                let mut element_depth: usize = 0;
                 loop {
                     match reader.read_event_into(&mut buf) {
                         Ok(quick_xml::events::Event::Eof) => break,
@@ -552,28 +553,43 @@ impl CdrEngine {
                                     .to_string(),
                             ));
                         }
-                        Ok(quick_xml::events::Event::Start(ref e))
-                        | Ok(quick_xml::events::Event::Empty(ref e)) => {
-                            let tag_lower = String::from_utf8_lossy(e.local_name().as_ref())
-                                .to_ascii_lowercase();
+                        Ok(quick_xml::events::Event::GeneralRef(ref entity)) => {
+                            if !crate::sanitizers::is_allowed_xml_general_ref(
+                                entity.as_ref().as_bytes(),
+                            ) {
+                                return Err(CdrError::OutputRejected(format!(
+                                    "CDR_OUTPUT_REJECTED: Residual non-predefined XML entity '&{};' in sanitized SVG",
+                                    entity.as_ref()
+                                )));
+                            }
+                        }
+                        Ok(quick_xml::events::Event::Start(ref e)) => {
+                            element_depth = element_depth.saturating_add(1);
+                            if element_depth > crate::sanitizers::MAX_XML_ELEMENT_DEPTH {
+                                return Err(CdrError::OutputRejected(format!(
+                                    "CDR_OUTPUT_REJECTED: Sanitized SVG exceeds MAX_XML_ELEMENT_DEPTH ({})",
+                                    crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                                )));
+                            }
+                            let tag_lower = e.local_name().as_ref().to_ascii_lowercase();
                             if SvgSanitizer::is_forbidden_tag(&tag_lower) {
                                 return Err(CdrError::OutputRejected(format!(
                                     "CDR_OUTPUT_REJECTED: Residual <{}> in sanitized SVG",
                                     tag_lower
                                 )));
                             }
-                            for attr_res in e.attributes().with_checks(false) {
-                                let attr = attr_res.map_err(|err| {
-                                    CdrError::OutputRejected(format!(
-                                        "CDR_OUTPUT_REJECTED: Malformed SVG attribute: {}",
-                                        err
-                                    ))
-                                })?;
-                                let k =
-                                    String::from_utf8_lossy(attr.key.as_ref()).to_ascii_lowercase();
-                                let v = String::from_utf8_lossy(&attr.value)
-                                    .trim()
-                                    .to_ascii_lowercase();
+                            let validated_attrs =
+                                crate::sanitizers::collect_validated_xml_attributes(e).map_err(
+                                    |err| {
+                                        CdrError::OutputRejected(format!(
+                                            "CDR_OUTPUT_REJECTED: Malformed SVG attribute: {}",
+                                            err
+                                        ))
+                                    },
+                                )?;
+                            for attr in validated_attrs {
+                                let k = attr.key.as_ref().to_ascii_lowercase();
+                                let v = attr.value.trim().to_ascii_lowercase();
                                 if k.starts_with("on") {
                                     return Err(CdrError::OutputRejected(format!(
                                         "CDR_OUTPUT_REJECTED: Residual event handler '{}' in sanitized SVG",
@@ -593,6 +609,57 @@ impl CdrEngine {
                                     ));
                                 }
                             }
+                        }
+                        Ok(quick_xml::events::Event::Empty(ref e)) => {
+                            if element_depth.saturating_add(1)
+                                > crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                            {
+                                return Err(CdrError::OutputRejected(format!(
+                                    "CDR_OUTPUT_REJECTED: Sanitized SVG exceeds MAX_XML_ELEMENT_DEPTH ({})",
+                                    crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                                )));
+                            }
+                            let tag_lower = e.local_name().as_ref().to_ascii_lowercase();
+                            if SvgSanitizer::is_forbidden_tag(&tag_lower) {
+                                return Err(CdrError::OutputRejected(format!(
+                                    "CDR_OUTPUT_REJECTED: Residual <{}> in sanitized SVG",
+                                    tag_lower
+                                )));
+                            }
+                            let validated_attrs =
+                                crate::sanitizers::collect_validated_xml_attributes(e).map_err(
+                                    |err| {
+                                        CdrError::OutputRejected(format!(
+                                            "CDR_OUTPUT_REJECTED: Malformed SVG attribute: {}",
+                                            err
+                                        ))
+                                    },
+                                )?;
+                            for attr in validated_attrs {
+                                let k = attr.key.as_ref().to_ascii_lowercase();
+                                let v = attr.value.trim().to_ascii_lowercase();
+                                if k.starts_with("on") {
+                                    return Err(CdrError::OutputRejected(format!(
+                                        "CDR_OUTPUT_REJECTED: Residual event handler '{}' in sanitized SVG",
+                                        k
+                                    )));
+                                }
+                                if (k == "href" || k.ends_with(":href")) && !v.starts_with('#') {
+                                    return Err(CdrError::OutputRejected(format!(
+                                        "CDR_OUTPUT_REJECTED: Residual non-anchor href '{}' in sanitized SVG",
+                                        v
+                                    )));
+                                }
+                                if k == "style" && SvgSanitizer::has_dangerous_css(&v) {
+                                    return Err(CdrError::OutputRejected(
+                                        "CDR_OUTPUT_REJECTED: Residual dangerous style attribute in sanitized SVG"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(quick_xml::events::Event::End(_)) => {
+                            element_depth = element_depth.saturating_sub(1);
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -771,21 +838,46 @@ impl CdrEngine {
     fn verify_rels_clean(rels_bytes: &[u8], policy: &SanitizationPolicy) -> Result<()> {
         let mut reader = quick_xml::Reader::from_reader(rels_bytes);
         let mut buf = Vec::new();
+        let mut element_depth: usize = 0;
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(quick_xml::events::Event::Eof) => break,
-                Ok(quick_xml::events::Event::Start(ref e))
-                | Ok(quick_xml::events::Event::Empty(ref e)) => {
-                    let local_bytes = e.name().local_name().into_inner().to_vec();
-                    let local = String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
+                Ok(quick_xml::events::Event::DocType(_)) => {
+                    return Err(CdrError::OutputRejected(
+                        "CDR_OUTPUT_REJECTED: Residual DOCTYPE in sanitized .rels XML".to_string(),
+                    ));
+                }
+                Ok(quick_xml::events::Event::GeneralRef(ref entity)) => {
+                    if !crate::sanitizers::is_allowed_xml_general_ref(entity.as_ref().as_bytes()) {
+                        return Err(CdrError::OutputRejected(format!(
+                            "CDR_OUTPUT_REJECTED: Residual non-predefined XML entity '&{};' in sanitized .rels XML",
+                            entity.as_ref()
+                        )));
+                    }
+                }
+                Ok(quick_xml::events::Event::Start(ref e)) => {
+                    element_depth = element_depth.saturating_add(1);
+                    if element_depth > crate::sanitizers::MAX_XML_ELEMENT_DEPTH {
+                        return Err(CdrError::OutputRejected(format!(
+                            "CDR_OUTPUT_REJECTED: Sanitized .rels XML exceeds MAX_XML_ELEMENT_DEPTH ({})",
+                            crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                        )));
+                    }
+                    let validated_attrs = crate::sanitizers::collect_validated_xml_attributes(e)
+                        .map_err(|err| {
+                            CdrError::OutputRejected(format!(
+                                "CDR_OUTPUT_REJECTED: Malformed .rels XML attribute: {}",
+                                err
+                            ))
+                        })?;
+                    let local = e.name().local_name().into_inner().to_ascii_lowercase();
                     if local == "relationship" {
                         let mut target = String::new();
                         let mut target_mode = String::new();
                         let mut rel_type = String::new();
-                        for attr in e.attributes().with_checks(false).flatten() {
-                            let k = String::from_utf8_lossy(attr.key.local_name().into_inner())
-                                .to_ascii_lowercase();
-                            let v = String::from_utf8_lossy(&attr.value).into_owned();
+                        for attr in validated_attrs {
+                            let k = attr.key.local_name().into_inner().to_ascii_lowercase();
+                            let v = attr.value.into_owned();
                             if k == "target" {
                                 target = v;
                             } else if k == "targetmode" {
@@ -814,6 +906,60 @@ impl CdrEngine {
                             )));
                         }
                     }
+                }
+                Ok(quick_xml::events::Event::Empty(ref e)) => {
+                    if element_depth.saturating_add(1) > crate::sanitizers::MAX_XML_ELEMENT_DEPTH {
+                        return Err(CdrError::OutputRejected(format!(
+                            "CDR_OUTPUT_REJECTED: Sanitized .rels XML exceeds MAX_XML_ELEMENT_DEPTH ({})",
+                            crate::sanitizers::MAX_XML_ELEMENT_DEPTH
+                        )));
+                    }
+                    let validated_attrs = crate::sanitizers::collect_validated_xml_attributes(e)
+                        .map_err(|err| {
+                            CdrError::OutputRejected(format!(
+                                "CDR_OUTPUT_REJECTED: Malformed .rels XML attribute: {}",
+                                err
+                            ))
+                        })?;
+                    let local = e.name().local_name().into_inner().to_ascii_lowercase();
+                    if local == "relationship" {
+                        let mut target = String::new();
+                        let mut target_mode = String::new();
+                        let mut rel_type = String::new();
+                        for attr in validated_attrs {
+                            let k = attr.key.local_name().into_inner().to_ascii_lowercase();
+                            let v = attr.value.into_owned();
+                            if k == "target" {
+                                target = v;
+                            } else if k == "targetmode" {
+                                target_mode = v;
+                            } else if k == "type" {
+                                rel_type = v;
+                            }
+                        }
+                        let is_external = target_mode.trim().eq_ignore_ascii_case("external");
+                        let target_lower = target.trim().to_ascii_lowercase();
+                        let has_dangerous_scheme = target_lower.starts_with("ms-msdt:")
+                            || target_lower.starts_with("javascript:")
+                            || target_lower.starts_with("vbscript:")
+                            || target_lower.starts_with("mhtml:")
+                            || target_lower.starts_with("file:")
+                            || target_lower.starts_with("data:")
+                            || target_lower.starts_with("\\\\");
+                        let is_benign_hyperlink =
+                            rel_type.to_ascii_lowercase().ends_with("/hyperlink")
+                                && !has_dangerous_scheme
+                                && !policy.strip_external_hyperlinks;
+                        if has_dangerous_scheme || (is_external && !is_benign_hyperlink) {
+                            return Err(CdrError::OutputRejected(format!(
+                                "CDR_OUTPUT_REJECTED: Residual external/unsafe relationship targeting '{}'",
+                                target
+                            )));
+                        }
+                    }
+                }
+                Ok(quick_xml::events::Event::End(_)) => {
+                    element_depth = element_depth.saturating_sub(1);
                 }
                 Ok(_) => {}
                 Err(e) => {

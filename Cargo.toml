@@ -39,7 +39,6 @@ sha2 = "0.10"
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.21.7"
-crc32fast = "1.5.2"
 
 # Observability & Tracing
 tracing = "0.1"
