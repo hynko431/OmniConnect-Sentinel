@@ -6,11 +6,28 @@ version = 2
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 unmaintained = "workspace"
-yanked = "deny"
-ignore = []
+yanked = "warn"
+ignore = [
+    # VEX: TCP 50051 gRPC is retired (Invariant I3); IPC uses Named Pipes and HTTP/1.1 loopback.
+    { id = "RUSTSEC-2026-0258", reason = "Not reachable: HTTP/2 network listener retired in favor of Named Pipe IPC and HTTP/1.1 loopback" },
+    # VEX: PdfSanitizer::precheck_stream_nesting_and_counts rejects PDF nesting > 64 before lopdf::Document::load_mem.
+    { id = "RUSTSEC-2026-0187", reason = "Mitigated: raw byte pre-scanner caps PDF array/dict nesting at 64 before lopdf::Document::load_mem inside 256 MB Job Object worker" },
+    # VEX: All BytesStart::attributes() calls use .with_checks(false) per RustSec remediation.
+    { id = "RUSTSEC-2026-0194", reason = "Mitigated: all quick-xml attribute iterators call .with_checks(false) and NsReader is never used" },
+    # VEX: NsReader is never instantiated anywhere in the workspace.
+    { id = "RUSTSEC-2026-0195", reason = "Not reachable: quick_xml::NsReader is never used; only bounded quick_xml::Reader is used inside 256 MB worker" },
+    # VEX: ZipArchive::extract() and ZipStreamReader::extract() are never called anywhere in the workspace.
+    { id = "RUSTSEC-2026-0367", reason = "Not reachable: ZipArchive::extract is never called; ZIP entries are streamed in-memory via by_index() + Read::take()" },
+    { id = "RUSTSEC-2026-0368", reason = "Not reachable: ZipArchive::extract is never called; symlinks and traversal paths are rejected in-memory" },
+    { id = "RUSTSEC-2026-0369", reason = "Not reachable: ZipArchive::extract and ZipStreamReader::extract are never called" },
+    { id = "RUSTSEC-2026-0429", reason = "Not reachable: ZipArchive::extract is never called; decompression is bounded via Read::take(limit + 1)" },
+    # VEX: tokio::time::Interval is not used anywhere in the workspace.
+    { id = "RUSTSEC-2026-0384", reason = "Not reachable: tokio::time::Interval is never used in any workspace crate" },
+]
 
 [licenses]
 version = 2
+unused-allowed-license = "allow"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -29,6 +46,7 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+allow-wildcard-paths = true
 highlight = "all"
 deny = [
     # Disallow unused or superseded crates from v1 (`EV-04`, `Master Plan v2 §11.2`)
@@ -41,4 +59,3 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
-

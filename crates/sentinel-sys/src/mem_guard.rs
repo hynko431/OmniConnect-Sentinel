@@ -119,7 +119,10 @@ impl<const N: usize> Drop for ZeroizingBytes<N> {
 
 impl<const N: usize> std::fmt::Debug for ZeroizingBytes<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ZeroizingBytes<{}>([REDACTED, locked={}])", N, self.locked)
+        write!(
+            f,
+            "ZeroizingBytes<{}>([REDACTED, locked={}])",
+            N, self.locked
+        )
     }
 }
-

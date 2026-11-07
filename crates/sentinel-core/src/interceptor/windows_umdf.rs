@@ -1,8 +1,8 @@
+use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use async_trait::async_trait;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{info, warn};
 
@@ -66,7 +66,10 @@ impl WindowsUmdfInterceptor {
         }
     }
 
-    fn build_interfaces_for_pnp(dev: &UsbPnpDeviceInfo, fallback_desc: &str) -> Vec<UsbInterfaceDescriptor> {
+    fn build_interfaces_for_pnp(
+        dev: &UsbPnpDeviceInfo,
+        fallback_desc: &str,
+    ) -> Vec<UsbInterfaceDescriptor> {
         if dev.interface_classes.is_empty() {
             return vec![UsbInterfaceDescriptor {
                 interface_number: 0,
@@ -107,7 +110,10 @@ impl DeviceInterceptor for WindowsUmdfInterceptor {
 
         // Enforce fail-closed automount & AutoPlay suppression at startup, logging any permission error
         if let Err(e) = set_automount_disabled(true) {
-            warn!("MountMgr set_automount_disabled(true) returned error: {}", e);
+            warn!(
+                "MountMgr set_automount_disabled(true) returned error: {}",
+                e
+            );
         }
         if let Err(e) = apply_autoplay_suppression_policy() {
             warn!("apply_autoplay_suppression_policy returned error: {}", e);
@@ -157,8 +163,10 @@ impl DeviceInterceptor for WindowsUmdfInterceptor {
 
                 // 2. Check newly arrived USB Volume GUIDs (`\\?\Volume{GUID}\` with `BusTypeUsb`)
                 let usb_volumes = enumerate_usb_volumes();
-                let current_vol_ids: HashSet<String> =
-                    usb_volumes.iter().map(|v| v.volume_guid_path.clone()).collect();
+                let current_vol_ids: HashSet<String> = usb_volumes
+                    .iter()
+                    .map(|v| v.volume_guid_path.clone())
+                    .collect();
                 let mut new_vols = Vec::new();
                 if let Ok(mut known) = known_volumes.lock() {
                     for vol in &usb_volumes {

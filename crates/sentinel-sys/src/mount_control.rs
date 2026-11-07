@@ -139,11 +139,7 @@ extern "system" {
         lpData: *const core::ffi::c_void,
         cbData: u32,
     ) -> i32;
-    fn RegDeleteKeyValueW(
-        hKey: isize,
-        lpSubKey: *const u16,
-        lpValueName: *const u16,
-    ) -> i32;
+    fn RegDeleteKeyValueW(hKey: isize, lpSubKey: *const u16, lpValueName: *const u16) -> i32;
 }
 
 #[cfg(windows)]
@@ -152,11 +148,7 @@ extern "system" {
     fn CM_Locate_DevNodeW(pdnDevInst: *mut u32, pDeviceID: *const u16, ulFlags: u32) -> u32;
     fn CM_Disable_DevNode(dnDevInst: u32, ulFlags: u32) -> u32;
     fn CM_Enable_DevNode(dnDevInst: u32, ulFlags: u32) -> u32;
-    fn CM_Get_Device_ID_List_SizeW(
-        pulLen: *mut u32,
-        pszFilter: *const u16,
-        ulFlags: u32,
-    ) -> u32;
+    fn CM_Get_Device_ID_List_SizeW(pulLen: *mut u32, pszFilter: *const u16, ulFlags: u32) -> u32;
     fn CM_Get_Device_ID_ListW(
         pszFilter: *const u16,
         Buffer: *mut u16,
@@ -260,7 +252,10 @@ pub fn resolve_physical_drive_path(volume_path: &Path) -> Option<String> {
 
         let raw = volume_path.to_string_lossy();
         let trimmed = raw.trim_end_matches('\\');
-        if trimmed.to_ascii_lowercase().starts_with(r"\\.\physicaldrive") {
+        if trimmed
+            .to_ascii_lowercase()
+            .starts_with(r"\\.\physicaldrive")
+        {
             return Some(trimmed.to_string());
         }
         let device_path = if trimmed.starts_with(r"\\.\") || trimmed.starts_with(r"\\?\") {
@@ -311,7 +306,10 @@ pub fn resolve_physical_drive_path(volume_path: &Path) -> Option<String> {
             let _ = CloseHandle(handle);
         }
         if ok != 0 && extents.number_of_disk_extents > 0 {
-            return Some(format!(r"\\.\PhysicalDrive{}", extents.extents[0].disk_number));
+            return Some(format!(
+                r"\\.\PhysicalDrive{}",
+                extents.extents[0].disk_number
+            ));
         }
         None
     }
@@ -585,9 +583,19 @@ pub fn read_registry_dword(use_hkcu: bool, subkey: &str, value_name: &str) -> Op
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        let hive = if use_hkcu { HKEY_CURRENT_USER } else { HKEY_LOCAL_MACHINE };
-        let wide_subkey: Vec<u16> = std::ffi::OsStr::new(subkey).encode_wide().chain(Some(0)).collect();
-        let wide_val: Vec<u16> = std::ffi::OsStr::new(value_name).encode_wide().chain(Some(0)).collect();
+        let hive = if use_hkcu {
+            HKEY_CURRENT_USER
+        } else {
+            HKEY_LOCAL_MACHINE
+        };
+        let wide_subkey: Vec<u16> = std::ffi::OsStr::new(subkey)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let wide_val: Vec<u16> = std::ffi::OsStr::new(value_name)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
         let mut data: u32 = 0;
         let mut cb_data: u32 = core::mem::size_of::<u32>() as u32;
         let status = unsafe {
@@ -618,8 +626,14 @@ pub fn read_registry_string(subkey: &str, value_name: &str) -> Option<String> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        let wide_subkey: Vec<u16> = std::ffi::OsStr::new(subkey).encode_wide().chain(Some(0)).collect();
-        let wide_val: Vec<u16> = std::ffi::OsStr::new(value_name).encode_wide().chain(Some(0)).collect();
+        let wide_subkey: Vec<u16> = std::ffi::OsStr::new(subkey)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let wide_val: Vec<u16> = std::ffi::OsStr::new(value_name)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
         let mut buf = vec![0u16; 1024];
         let mut cb_data: u32 = (buf.len() * 2) as u32;
         let status = unsafe {
@@ -647,11 +661,26 @@ pub fn read_registry_string(subkey: &str, value_name: &str) -> Option<String> {
 }
 
 #[cfg(windows)]
-fn write_registry_dword(use_hkcu: bool, subkey: &str, value_name: &str, val: u32) -> io::Result<()> {
+fn write_registry_dword(
+    use_hkcu: bool,
+    subkey: &str,
+    value_name: &str,
+    val: u32,
+) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    let hive = if use_hkcu { HKEY_CURRENT_USER } else { HKEY_LOCAL_MACHINE };
-    let wide_subkey: Vec<u16> = std::ffi::OsStr::new(subkey).encode_wide().chain(Some(0)).collect();
-    let wide_val: Vec<u16> = std::ffi::OsStr::new(value_name).encode_wide().chain(Some(0)).collect();
+    let hive = if use_hkcu {
+        HKEY_CURRENT_USER
+    } else {
+        HKEY_LOCAL_MACHINE
+    };
+    let wide_subkey: Vec<u16> = std::ffi::OsStr::new(subkey)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let wide_val: Vec<u16> = std::ffi::OsStr::new(value_name)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     let status = unsafe {
         RegSetKeyValueW(
             hive,
@@ -671,9 +700,18 @@ fn write_registry_dword(use_hkcu: bool, subkey: &str, value_name: &str, val: u32
 #[cfg(windows)]
 fn write_registry_sz(subkey: &str, value_name: &str, val: &str) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    let wide_subkey: Vec<u16> = std::ffi::OsStr::new(subkey).encode_wide().chain(Some(0)).collect();
-    let wide_val: Vec<u16> = std::ffi::OsStr::new(value_name).encode_wide().chain(Some(0)).collect();
-    let wide_data: Vec<u16> = std::ffi::OsStr::new(val).encode_wide().chain(Some(0)).collect();
+    let wide_subkey: Vec<u16> = std::ffi::OsStr::new(subkey)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let wide_val: Vec<u16> = std::ffi::OsStr::new(value_name)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let wide_data: Vec<u16> = std::ffi::OsStr::new(val)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     let status = unsafe {
         RegSetKeyValueW(
             HKEY_LOCAL_MACHINE,
@@ -1055,7 +1093,11 @@ pub fn set_volume_online_readonly(volume_path: &Path, readonly: bool) -> io::Res
             persist: 0,
             relinquish_ownership: 0,
             reserved1: [0; 2],
-            attributes: if readonly { DISK_ATTRIBUTE_READ_ONLY } else { 0 },
+            attributes: if readonly {
+                DISK_ATTRIBUTE_READ_ONLY
+            } else {
+                0
+            },
             attributes_mask: DISK_ATTRIBUTE_OFFLINE | DISK_ATTRIBUTE_READ_ONLY,
             caller: [0; 16],
         };
@@ -1221,10 +1263,9 @@ pub fn is_volume_readonly(volume_path: &Path) -> bool {
                 let mnt = parts.next().unwrap_or("");
                 let _fstype = parts.next().unwrap_or("");
                 let opts = parts.next().unwrap_or("");
-                let dev_matches = dev == trimmed
-                    || (trimmed.starts_with("/dev/") && dev.starts_with(trimmed));
-                let mnt_matches =
-                    mnt == trimmed || mnt.starts_with(&format!("{}/", trimmed));
+                let dev_matches =
+                    dev == trimmed || (trimmed.starts_with("/dev/") && dev.starts_with(trimmed));
+                let mnt_matches = mnt == trimmed || mnt.starts_with(&format!("{}/", trimmed));
                 if dev_matches || mnt_matches {
                     return opts.split(',').any(|o| o == "ro");
                 }
@@ -1608,17 +1649,19 @@ pub fn enumerate_usb_pnp_devices() -> Vec<UsbPnpDeviceInfo> {
                         }
                     }
 
-                    let entry = grouped.entry((vid, pid)).or_insert_with(|| UsbPnpDeviceInfo {
-                        instance_id: id_str.clone(),
-                        vid,
-                        pid,
-                        serial: serial.clone(),
-                        interface_classes: Vec::new(),
-                        child_instance_ids: Vec::new(),
-                        has_mass_storage: false,
-                        has_hid_input: false,
-                        is_composite_hid_storage: false,
-                    });
+                    let entry = grouped
+                        .entry((vid, pid))
+                        .or_insert_with(|| UsbPnpDeviceInfo {
+                            instance_id: id_str.clone(),
+                            vid,
+                            pid,
+                            serial: serial.clone(),
+                            interface_classes: Vec::new(),
+                            child_instance_ids: Vec::new(),
+                            has_mass_storage: false,
+                            has_hid_input: false,
+                            is_composite_hid_storage: false,
+                        });
                     if !id_str.to_ascii_uppercase().contains("&MI_") {
                         entry.instance_id = id_str.clone();
                         entry.serial = serial;
@@ -1637,8 +1680,7 @@ pub fn enumerate_usb_pnp_devices() -> Vec<UsbPnpDeviceInfo> {
                             entry.interface_classes.push(0x03);
                         }
                     }
-                    entry.is_composite_hid_storage =
-                        entry.has_mass_storage && entry.has_hid_input;
+                    entry.is_composite_hid_storage = entry.has_mass_storage && entry.has_hid_input;
                 }
             }
         }
@@ -1938,7 +1980,10 @@ where
                 format!("CM_Register_Notification failed with CR={:#x}", cr),
             ));
         }
-        debug!("Registered CM_Register_Notification PnP handle {}", notify_handle);
+        debug!(
+            "Registered CM_Register_Notification PnP handle {}",
+            notify_handle
+        );
         Ok(PnpNotificationGuard {
             notify_handle,
             context_ptr: ctx_ptr,
@@ -1969,7 +2014,12 @@ where
                         let mut buf = [0u8; 4096];
                         loop {
                             let n = unsafe {
-                                libc::recv(sock, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+                                libc::recv(
+                                    sock,
+                                    buf.as_mut_ptr() as *mut libc::c_void,
+                                    buf.len(),
+                                    0,
+                                )
                             };
                             if n <= 0 {
                                 break;
@@ -2057,12 +2107,8 @@ pub fn verify_system_posture() -> PostureReport {
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer",
         "NoDriveTypeAutoRun",
     ) == Some(0xFF)
-        && read_registry_dword(
-            false,
-            r"SYSTEM\CurrentControlSet\Services\cdrom",
-            "AutoRun",
-        )
-        .unwrap_or(0)
+        && read_registry_dword(false, r"SYSTEM\CurrentControlSet\Services\cdrom", "AutoRun")
+            .unwrap_or(0)
             == 0;
 
     let usb_volumes = enumerate_usb_volumes();

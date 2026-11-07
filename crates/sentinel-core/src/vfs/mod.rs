@@ -7,11 +7,6 @@ pub use fuse::FuseVfsProvider as FuseProvider;
 pub use projfs::ProjFsProvider;
 pub type VfsProvider = dyn VirtualFileSystemProvider;
 
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Key, Nonce,
@@ -19,6 +14,11 @@ use aes_gcm::{
 use async_trait::async_trait;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -155,7 +155,8 @@ impl ShadowCacheManager {
     fn default_ledger_path() -> PathBuf {
         #[cfg(windows)]
         {
-            let p = PathBuf::from(r"C:\ProgramData\OmniConnect\AuditLedger\shadow_cache_audit.jsonl");
+            let p =
+                PathBuf::from(r"C:\ProgramData\OmniConnect\AuditLedger\shadow_cache_audit.jsonl");
             if let Some(parent) = p.parent() {
                 if fs::create_dir_all(parent).is_ok() {
                     return p;
@@ -177,9 +178,7 @@ impl ShadowCacheManager {
                 if fs::create_dir_all(&prog_data).is_ok() {
                     prog_data
                 } else {
-                    std::env::temp_dir()
-                        .join("OmniConnect")
-                        .join("ShadowCache")
+                    std::env::temp_dir().join("OmniConnect").join("ShadowCache")
                 }
             }
             #[cfg(not(windows))]
@@ -280,8 +279,8 @@ impl ShadowCacheManager {
 
         // If `raw_volume_path` is a volume device path, open the controlled read-only window (`Row 16, 146`)
         let raw_str = raw_volume_path.to_string_lossy();
-        let is_volume_device = raw_str.starts_with(r"\\?\Volume{")
-            || (raw_str.len() <= 3 && raw_str.ends_with('\\'));
+        let is_volume_device =
+            raw_str.starts_with(r"\\?\Volume{") || (raw_str.len() <= 3 && raw_str.ends_with('\\'));
         if is_volume_device {
             let _ = set_volume_online_readonly(raw_volume_path, true);
         }

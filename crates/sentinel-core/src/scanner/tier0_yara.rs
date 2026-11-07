@@ -1,9 +1,9 @@
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Instant;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use sentinel_sys::{sign_ecdsa_p256_with_private_blob, verify_ecdsa_p256_digest};
 
@@ -68,18 +68,16 @@ rule YARA_REFLECTIVE_DLL_LOADER {
 "#;
 
 /// Known-threat SHA-256 intelligence table (`Rows 156, 229`).
-pub const KNOWN_THREAT_SHA256_TABLE: &[([u8; 32], &str, &str)] = &[
-    (
-        // SHA-256 of standard 68-byte EICAR test string
-        [
-            0x27, 0x5a, 0x02, 0x1b, 0xbf, 0xb6, 0x48, 0x9e, 0x54, 0xd4, 0x71, 0x89, 0x9f, 0x7d,
-            0xb9, 0xd1, 0x66, 0x3f, 0xc6, 0x95, 0xec, 0x2f, 0xe2, 0xa2, 0xc4, 0x53, 0x8a, 0xab,
-            0xf6, 0x51, 0xfd, 0x0f,
-        ],
-        "INTEL_SHA256_EICAR_TEST_PAYLOAD",
-        "Known SHA-256 threat intelligence match: EICAR test signature",
-    ),
-];
+pub const KNOWN_THREAT_SHA256_TABLE: &[([u8; 32], &str, &str)] = &[(
+    // SHA-256 of standard 68-byte EICAR test string
+    [
+        0x27, 0x5a, 0x02, 0x1b, 0xbf, 0xb6, 0x48, 0x9e, 0x54, 0xd4, 0x71, 0x89, 0x9f, 0x7d, 0xb9,
+        0xd1, 0x66, 0x3f, 0xc6, 0x95, 0xec, 0x2f, 0xe2, 0xa2, 0xc4, 0x53, 0x8a, 0xab, 0xf6, 0x51,
+        0xfd, 0x0f,
+    ],
+    "INTEL_SHA256_EICAR_TEST_PAYLOAD",
+    "Known SHA-256 threat intelligence match: EICAR test signature",
+)];
 
 /// Fast 2048-bit (32 x u64) Bloom Filter for O(1) SHA-256 threat-intelligence pre-screening (`Row 229`).
 #[derive(Debug, Clone)]
@@ -351,7 +349,10 @@ pub fn compile_yara_source(yar_source: &str) -> Result<Vec<CompiledYaraRule>, St
         }
 
         if markers.is_empty() {
-            return Err(format!("YARA rule '{}' defines zero string markers", rule_id));
+            return Err(format!(
+                "YARA rule '{}' defines zero string markers",
+                rule_id
+            ));
         }
         compiled.push(CompiledYaraRule {
             id: rule_id,
@@ -506,7 +507,11 @@ impl Tier0YaraScanner {
     /// computing the full-file SHA-256 digest for Bloom-filtered threat intelligence lookup, evaluating
     /// multi-condition YARA rules across the entire stream, and running structural PE32/PE32+ (and ELF)
     /// section, entropy, and Import Address Table (IAT) analysis.
-    pub fn scan_reader<R: Read + Seek>(&self, reader: &mut R, _context_name: &str) -> YaraScanResult {
+    pub fn scan_reader<R: Read + Seek>(
+        &self,
+        reader: &mut R,
+        _context_name: &str,
+    ) -> YaraScanResult {
         let start = Instant::now();
         if reader.seek(SeekFrom::Start(0)).is_err() {
             return YaraScanResult {
@@ -525,8 +530,7 @@ impl Tier0YaraScanner {
         let mut first_window = Vec::new();
         let mut hasher = Sha256::new();
 
-        let mut rule_matched_markers: Vec<HashSet<usize>> =
-            vec![HashSet::new(); self.rules.len()];
+        let mut rule_matched_markers: Vec<HashSet<usize>> = vec![HashSet::new(); self.rules.len()];
 
         loop {
             let n = match reader.read(&mut chunk) {
@@ -765,10 +769,7 @@ impl Tier0YaraScanner {
             if raw_data_ptr > 0 && raw_data_size > 0 {
                 let sample_len = (raw_data_size as usize).min(64 * 1024);
                 let mut sec_buf = vec![0u8; sample_len];
-                if reader
-                    .seek(SeekFrom::Start(raw_data_ptr as u64))
-                    .is_ok()
-                {
+                if reader.seek(SeekFrom::Start(raw_data_ptr as u64)).is_ok() {
                     if let Ok(n) = reader.read(&mut sec_buf) {
                         if n > 0 {
                             entropy = ContentScanner::shannon_entropy(&sec_buf[..n]);
@@ -822,8 +823,7 @@ impl Tier0YaraScanner {
                     if desc.iter().all(|&b| b == 0) {
                         break;
                     }
-                    let orig_first_thunk =
-                        u32::from_le_bytes([desc[0], desc[1], desc[2], desc[3]]);
+                    let orig_first_thunk = u32::from_le_bytes([desc[0], desc[1], desc[2], desc[3]]);
                     let name_rva = u32::from_le_bytes([desc[12], desc[13], desc[14], desc[15]]);
                     let first_thunk = u32::from_le_bytes([desc[16], desc[17], desc[18], desc[19]]);
 

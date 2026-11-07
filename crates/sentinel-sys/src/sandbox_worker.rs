@@ -378,11 +378,7 @@ extern "system" {
 #[cfg(windows)]
 #[link(name = "wintrust")]
 extern "system" {
-    fn WinVerifyTrust(
-        hwnd: isize,
-        pgActionID: *const Guid,
-        pWVTData: *mut WinTrustData,
-    ) -> i32;
+    fn WinVerifyTrust(hwnd: isize, pgActionID: *const Guid, pWVTData: *mut WinTrustData) -> i32;
 }
 
 /// Internal helper that creates a 256 MB Job Object (`ACTIVE_PROCESS=1`, `KILL_ON_JOB_CLOSE`,
@@ -615,7 +611,10 @@ pub fn spawn_sandboxed_worker_process(
         // Tier 2 (when binary resides in a developer profile dir where S-1-15-2-1 lacks traverse ACL):
         //         ACG + ExtensionPointDisable + ImageLoadNoRemote/NoLowLabel + ChildProcessRestricted
         let tiers: [(bool, bool); 2] = [
-            (appcontainer_sid.is_some(), config.enforce_microsoft_signed_dlls),
+            (
+                appcontainer_sid.is_some(),
+                config.enforce_microsoft_signed_dlls,
+            ),
             (false, false),
         ];
 
@@ -624,8 +623,10 @@ pub fn spawn_sandboxed_worker_process(
         const WAIT_TIMEOUT: u32 = 0x0000_0102;
 
         for (use_appcontainer, use_cig) in tiers {
-            let mut cmd_wide: Vec<u16> =
-                std::ffi::OsStr::new(&cmd_str).encode_wide().chain(Some(0)).collect();
+            let mut cmd_wide: Vec<u16> = std::ffi::OsStr::new(&cmd_str)
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
 
             let attr_count: u32 = if use_appcontainer { 3 } else { 2 };
             let mut attr_list_size: usize = 0;
@@ -977,6 +978,12 @@ pub fn apply_worker_process_mitigations() -> io::Result<()> {
         if unsafe { libc::setrlimit(libc::RLIMIT_AS, &rlim) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        let zero_rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let _ = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero_rlim) };
+        let _ = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &zero_rlim) };
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1071,7 +1078,10 @@ pub fn verify_binary_authenticode_signature(exe_path: &Path) -> io::Result<bool>
     if !exe_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("Binary not found for signature check: {}", exe_path.display()),
+            format!(
+                "Binary not found for signature check: {}",
+                exe_path.display()
+            ),
         ));
     }
     #[cfg(windows)]

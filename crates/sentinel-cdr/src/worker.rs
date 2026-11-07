@@ -1,10 +1,10 @@
+use prost::Message;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
-use prost::Message;
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use sentinel_proto::{
@@ -611,15 +611,14 @@ impl WorkerLauncher {
     ) -> Result<SanitizationOutcome, CdrError> {
         let _permit = WorkerConcurrencyLimiter::global().acquire();
 
-        let mut child = spawn_sandboxed_worker_process(bin_path, &self.sandbox_config).map_err(
-            |e| {
+        let mut child =
+            spawn_sandboxed_worker_process(bin_path, &self.sandbox_config).map_err(|e| {
                 PROCESSED_TOTAL_ERR.fetch_add(1, Ordering::AcqRel);
                 CdrError::SandboxFailure(format!(
                     "CDR_WORKER_FAILED: failed spawning sandboxed CDR worker: {}",
                     e
                 ))
-            },
-        )?;
+            })?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
             let _ = child.kill_and_wait();
@@ -719,15 +718,14 @@ impl WorkerLauncher {
     ) -> Result<InspectionAssessment, CdrError> {
         let _permit = WorkerConcurrencyLimiter::global().acquire();
 
-        let mut child = spawn_sandboxed_worker_process(bin_path, &self.sandbox_config).map_err(
-            |e| {
+        let mut child =
+            spawn_sandboxed_worker_process(bin_path, &self.sandbox_config).map_err(|e| {
                 PROCESSED_TOTAL_ERR.fetch_add(1, Ordering::AcqRel);
                 CdrError::SandboxFailure(format!(
                     "CDR_WORKER_FAILED: failed spawning sandboxed CDR worker for inspect: {}",
                     e
                 ))
-            },
-        )?;
+            })?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
             let _ = child.kill_and_wait();

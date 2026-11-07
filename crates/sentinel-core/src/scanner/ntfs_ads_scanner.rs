@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use sentinel_sys::enumerate_ntfs_ads;

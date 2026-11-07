@@ -107,7 +107,8 @@ impl SanitizationPolicy {
                 let max_depth = if p.max_recursion_depth == 0 {
                     server_ceiling.max_recursion_depth
                 } else {
-                    p.max_recursion_depth.min(server_ceiling.max_recursion_depth)
+                    p.max_recursion_depth
+                        .min(server_ceiling.max_recursion_depth)
                 };
                 let max_bytes = if p.max_decompressed_bytes == 0 {
                     server_ceiling.max_decompressed_bytes

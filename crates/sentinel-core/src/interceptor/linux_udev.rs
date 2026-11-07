@@ -1,8 +1,8 @@
+use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use async_trait::async_trait;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{info, warn};
 
@@ -65,11 +65,18 @@ impl LinuxUdevInterceptor {
     }
 
     /// Deauthorizes a specific USB interface (`/sys/bus/usb/devices/<bus-port>:<cfg>.<if>/authorized = 0`).
-    pub fn deauthorize_interface(&self, device_id: &str, interface_id: &str) -> std::io::Result<()> {
+    pub fn deauthorize_interface(
+        &self,
+        device_id: &str,
+        interface_id: &str,
+    ) -> std::io::Result<()> {
         disable_usb_interface(device_id, interface_id)
     }
 
-    fn build_interfaces(dev: &UsbPnpDeviceInfo, fallback_desc: &str) -> Vec<UsbInterfaceDescriptor> {
+    fn build_interfaces(
+        dev: &UsbPnpDeviceInfo,
+        fallback_desc: &str,
+    ) -> Vec<UsbInterfaceDescriptor> {
         if dev.interface_classes.is_empty() {
             return vec![UsbInterfaceDescriptor {
                 interface_number: 0,

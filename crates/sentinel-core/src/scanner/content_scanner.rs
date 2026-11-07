@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
-use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
 use crate::scanner::universal_scanner::{CarrierCategory, ThreatSeverity, UniversalThreat};
@@ -53,12 +53,16 @@ impl ContentScanner {
                     "T1486 (Data Encrypted for Impact)".to_string(),
                     false,
                 ),
-                "MALICIOUS_LNK_SHORTCUT" | "BLOCKED_CONTAINER_OR_SHORTCUT" | "ENCRYPTED_ARCHIVE_BLOCKED" | "MALFORMED_OR_ENCRYPTED_ZIP" => (
+                "MALICIOUS_LNK_SHORTCUT"
+                | "BLOCKED_CONTAINER_OR_SHORTCUT"
+                | "ENCRYPTED_ARCHIVE_BLOCKED"
+                | "MALFORMED_OR_ENCRYPTED_ZIP" => (
                     CarrierCategory::FilesystemHidden,
                     format!("Quarantined Container / Shortcut Vector ({})", f.indicator),
                     ThreatSeverity::Critical,
                     96,
-                    "T1204.002 / T1553.005 (Container / Shortcut Mark-of-the-Web Bypass)".to_string(),
+                    "T1204.002 / T1553.005 (Container / Shortcut Mark-of-the-Web Bypass)"
+                        .to_string(),
                     false,
                 ),
                 "PDF_LAUNCH_ACTION" => (
@@ -111,7 +115,10 @@ impl ContentScanner {
                 ),
                 _ => (
                     CarrierCategory::ScriptCode,
-                    format!("Malicious Script Execution Cradle ({}) - {}", f.indicator, f.description),
+                    format!(
+                        "Malicious Script Execution Cradle ({}) - {}",
+                        f.indicator, f.description
+                    ),
                     ThreatSeverity::Critical,
                     96,
                     "T1059.001 / T1562.001 (Defense Evasion / Script Execution)".to_string(),
@@ -264,7 +271,9 @@ impl ContentScanner {
 
         // Magic-byte inspection for disguised containers (`.lnk`, `.chm`, `.vhd`, `.vhdx`, `.iso`, `.one`, `.7z`, `.rar`, `.cab`)
         if !blocked_container_matched {
-            let magic_indicator = if head_bytes.starts_with(&[0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00]) {
+            let magic_indicator = if head_bytes
+                .starts_with(&[0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00])
+            {
                 Some("Windows Shell Link (.lnk magic)")
             } else if head_bytes.starts_with(b"ITSF") {
                 Some("Compiled HTML Help (.chm ITSF magic)")
@@ -273,7 +282,9 @@ impl ContentScanner {
                 || Self::has_vhd_footer_magic(seekable_reader)
             {
                 Some("Virtual Hard Disk (.vhd/.vhdx magic)")
-            } else if head_bytes.starts_with(b"ISO9660") || Self::has_iso9660_pvd_magic(seekable_reader) {
+            } else if head_bytes.starts_with(b"ISO9660")
+                || Self::has_iso9660_pvd_magic(seekable_reader)
+            {
                 Some("ISO-9660 Optical Disk Image (CD001 magic)")
             } else if head_bytes.starts_with(&[0xE4, 0x52, 0x5C, 0x7B, 0x8C, 0xD8, 0xA7, 0x4D]) {
                 Some("Microsoft OneNote Container (.one magic)")
@@ -338,9 +349,7 @@ impl ContentScanner {
             return false;
         }
         let mut magic = [0u8; 8];
-        reader
-            .seek(std::io::SeekFrom::Start(end - 512))
-            .is_ok()
+        reader.seek(std::io::SeekFrom::Start(end - 512)).is_ok()
             && reader.read_exact(&mut magic).is_ok()
             && &magic == b"conectix"
     }
@@ -348,10 +357,7 @@ impl ContentScanner {
     /// Streams `reader` in 64 KiB windows with a 4 KiB overlap (`Rows 69, 78, 135`) and checks
     /// bit 0 of the general-purpose bit flag (and WinZip AE method 99) across **all** central
     /// directory (`PK\x01\x02`) and local file (`PK\x03\x04`) headers.
-    fn has_encrypted_zip_headers_reader<R: Read + Seek>(
-        reader: &mut R,
-        head_bytes: &[u8],
-    ) -> bool {
+    fn has_encrypted_zip_headers_reader<R: Read + Seek>(reader: &mut R, head_bytes: &[u8]) -> bool {
         let check_slice = |buf: &[u8]| -> bool {
             if buf.len() >= 10 {
                 for i in 0..=(buf.len() - 10) {
@@ -591,7 +597,9 @@ impl ContentScanner {
                 category: "ENCRYPTED_ARCHIVE_BLOCKED".to_string(),
                 severity: "HIGH".to_string(),
                 indicator: "Encrypted PDF (/Encrypt)".to_string(),
-                description: "Password-protected/encrypted PDF document blocked by default-deny allowlist".to_string(),
+                description:
+                    "Password-protected/encrypted PDF document blocked by default-deny allowlist"
+                        .to_string(),
             });
         }
         if saw_js {
@@ -655,10 +663,7 @@ impl ContentScanner {
 
     /// Scans an OOXML / ZIP archive using a seekable reader so >4 MB archives are scanned
     /// without truncation (`BUG-CORE-03`, `Row 70`). Fails closed on corrupt/encrypted archives (`Row 74, 135`).
-    pub fn scan_openxml_reader<R: Read + Seek>(
-        reader: &mut R,
-        findings: &mut Vec<ContentFinding>,
-    ) {
+    pub fn scan_openxml_reader<R: Read + Seek>(reader: &mut R, findings: &mut Vec<ContentFinding>) {
         let _ = reader.seek(std::io::SeekFrom::Start(0));
         let mut archive = match ZipArchive::new(reader) {
             Ok(a) => a,
@@ -667,10 +672,7 @@ impl ContentScanner {
                     category: "MALFORMED_OR_ENCRYPTED_ZIP".to_string(),
                     severity: "HIGH".to_string(),
                     indicator: "Corrupt or Encrypted ZIP Container".to_string(),
-                    description: format!(
-                        "Failed parsing ZIP/OOXML container (fail-closed): {}",
-                        e
-                    ),
+                    description: format!("Failed parsing ZIP/OOXML container (fail-closed): {}", e),
                 });
                 return;
             }
@@ -702,7 +704,10 @@ impl ContentScanner {
                         category: "MALFORMED_OR_ENCRYPTED_ZIP".to_string(),
                         severity: "HIGH".to_string(),
                         indicator: "Corrupt ZIP Entry".to_string(),
-                        description: format!("Failed reading ZIP entry #{} (fail-closed): {}", i, e),
+                        description: format!(
+                            "Failed reading ZIP entry #{} (fail-closed): {}",
+                            i, e
+                        ),
                     });
                     continue;
                 }
@@ -735,7 +740,11 @@ impl ContentScanner {
 
             if lower.ends_with(".rels") || lower.ends_with(".xml") {
                 let mut xml_buf = Vec::new();
-                if (&mut file).take(512 * 1024).read_to_end(&mut xml_buf).is_ok() {
+                if (&mut file)
+                    .take(512 * 1024)
+                    .read_to_end(&mut xml_buf)
+                    .is_ok()
+                {
                     let xml_lower = String::from_utf8_lossy(&xml_buf).to_ascii_lowercase();
                     if lower.ends_with(".rels") {
                         let has_external_mode = xml_lower.contains("targetmode=\"external\"")
@@ -926,8 +935,14 @@ impl ContentScanner {
             (" -enc ", "Encoded PowerShell command line (-enc)"),
             (" -encodedcommand ", "Encoded PowerShell command line"),
             ("frombase64string", ".NET Base64 payload decoding in script"),
-            ("invoke-expression", "PowerShell Invoke-Expression dynamic eval"),
-            ("downloadstring", "WebClient DownloadString in-memory cradle"),
+            (
+                "invoke-expression",
+                "PowerShell Invoke-Expression dynamic eval",
+            ),
+            (
+                "downloadstring",
+                "WebClient DownloadString in-memory cradle",
+            ),
             ("wscript.shell", "WScript.Shell COM command execution"),
             ("amsiutils", "AMSI bypass reflection indicator"),
         ];

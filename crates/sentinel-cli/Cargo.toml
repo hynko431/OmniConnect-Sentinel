@@ -10,16 +10,17 @@ description = "Command-line interface for OmniConnect Sentinel (manual testing, 
 name = "sentinel"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 sentinel-cdr.workspace = true
 sentinel-core.workspace = true
-sentinel-proto.workspace = true
 sentinel-sys.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4.5", features = ["derive"] }
-walkdir = "2.5"
 sha2.workspace = true
 hex = "0.4"
 uuid.workspace = true
@@ -31,3 +32,6 @@ http = "0.2"
 hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tower = "0.4"
 subtle = "2.6"
+
+[package.metadata.cargo-machete]
+ignored = ["tower"]

@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use tracing::info;
 #[cfg(not(windows))]
 use tracing::warn;
@@ -88,8 +88,8 @@ impl SignedPolicyBundle {
 
     /// Verifies the bundle's ECDSA P-256 signature against `trusted_public_key`.
     pub fn verify_signature(&self, trusted_public_key: &[u8]) -> Result<(), SentinelError> {
-        let digest = Self::signing_digest(&self.policy)
-            .map_err(SentinelError::PolicySignatureInvalid)?;
+        let digest =
+            Self::signing_digest(&self.policy).map_err(SentinelError::PolicySignatureInvalid)?;
         let sig_bytes = hex::decode(&self.signature_hex).map_err(|e| {
             SentinelError::PolicySignatureInvalid(format!(
                 "Invalid policy signature hex encoding: {}",
@@ -239,7 +239,8 @@ impl IntunePolicyManager {
                             warn!("Rejected /etc/omniconnect/policy.json bundle: {}", e);
                         }
                     }
-                } else if let Ok(parsed_policy) = serde_json::from_str::<IntuneMdmPolicy>(&raw_json) {
+                } else if let Ok(parsed_policy) = serde_json::from_str::<IntuneMdmPolicy>(&raw_json)
+                {
                     if parsed_policy.version >= self.policy.version {
                         self.policy = parsed_policy;
                     }
@@ -252,9 +253,11 @@ impl IntunePolicyManager {
         {
             self.policy.enforce_usb_zero_trust = val != 0;
         }
-        if let Some(val) =
-            read_registry_dword(false, SENTINEL_POLICY_REG_SUBKEY, "BlockCompositeHidStorage")
-        {
+        if let Some(val) = read_registry_dword(
+            false,
+            SENTINEL_POLICY_REG_SUBKEY,
+            "BlockCompositeHidStorage",
+        ) {
             self.policy.block_composite_hid_storage = val != 0;
         }
         if let Some(val) =
@@ -267,8 +270,7 @@ impl IntunePolicyManager {
                 self.policy.max_sanitization_file_size_mb = val;
             }
         }
-        if let Some(hw_ids) =
-            read_registry_string(SENTINEL_POLICY_REG_SUBKEY, "AllowedHardwareIds")
+        if let Some(hw_ids) = read_registry_string(SENTINEL_POLICY_REG_SUBKEY, "AllowedHardwareIds")
         {
             let parsed: Vec<String> = hw_ids
                 .split(';')

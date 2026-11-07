@@ -1,6 +1,6 @@
+use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashSet;
 use std::io::Cursor;
-use lopdf::{Dictionary, Document, Object, ObjectId};
 use tracing::info;
 
 use crate::error::CdrError;
@@ -31,9 +31,8 @@ impl PdfSanitizer {
         policy: &SanitizationPolicy,
         budget: &mut ResourceBudget,
     ) -> Result<(Vec<u8>, Vec<DisarmReportItem>), CdrError> {
-        let mut doc = Document::load_mem(input_bytes).map_err(|e| {
-            CdrError::ParserCorruption(format!("PDF AST parse error: {}", e))
-        })?;
+        let mut doc = Document::load_mem(input_bytes)
+            .map_err(|e| CdrError::ParserCorruption(format!("PDF AST parse error: {}", e)))?;
 
         let mut disarm_report = Vec::new();
 
@@ -52,14 +51,7 @@ impl PdfSanitizer {
 
             let location = format!("Obj({},{})", object_id.0, object_id.1);
             if let Some(obj) = doc.objects.get_mut(&object_id) {
-                Self::sanitize_pdf_object(
-                    obj,
-                    &location,
-                    policy,
-                    budget,
-                    0,
-                    &mut disarm_report,
-                )?;
+                Self::sanitize_pdf_object(obj, &location, policy, budget, 0, &mut disarm_report)?;
             }
         }
 
@@ -119,7 +111,12 @@ impl PdfSanitizer {
         policy: &SanitizationPolicy,
         reports: &mut Vec<DisarmReportItem>,
     ) {
-        let root_id = match doc.trailer.get(b"Root").ok().and_then(|o| o.as_reference().ok()) {
+        let root_id = match doc
+            .trailer
+            .get(b"Root")
+            .ok()
+            .and_then(|o| o.as_reference().ok())
+        {
             Some(id) => id,
             None => return,
         };
@@ -243,14 +240,7 @@ impl PdfSanitizer {
                 for (idx, item) in arr.iter_mut().enumerate() {
                     budget.charge_object()?;
                     let item_loc = format!("{}[{}]", location, idx);
-                    Self::sanitize_pdf_object(
-                        item,
-                        &item_loc,
-                        policy,
-                        budget,
-                        depth + 1,
-                        reports,
-                    )?;
+                    Self::sanitize_pdf_object(item, &item_loc, policy, budget, depth + 1, reports)?;
                 }
             }
             Object::Stream(stream) => {

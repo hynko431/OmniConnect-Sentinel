@@ -33,7 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("=========================================================");
     info!("OmniConnect Sentinel - Tier-1 CDR Engine");
     info!("Architecture: Hardened Option B (Local Pipe Service; TCP 50051 Retired)");
-    info!("Max Decompressed Budget: {} bytes", policy.max_decompressed_bytes);
+    info!(
+        "Max Decompressed Budget: {} bytes",
+        policy.max_decompressed_bytes
+    );
     info!("=========================================================");
 
     let args: Vec<String> = std::env::args().collect();
@@ -46,11 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let stdout = io::stdout();
 
-    loop {
-        let cmd = match WorkerCommand::read_framed(stdin.lock()) {
-            Ok(c) => c,
-            Err(_) => break,
-        };
+    while let Ok(cmd) = WorkerCommand::read_framed(stdin.lock()) {
         match cmd {
             WorkerCommand::Disarm(req) => {
                 let resp = match launcher.sanitize_isolated(req) {

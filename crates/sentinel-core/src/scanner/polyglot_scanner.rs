@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
-use serde::{Deserialize, Serialize};
 
 use crate::scanner::universal_scanner::{CarrierCategory, ThreatSeverity, UniversalThreat};
 
@@ -39,8 +39,8 @@ impl PolyglotScanner {
         in_memory_slice: Option<&[u8]>,
     ) -> Option<UniversalThreat> {
         let finding = Self::scan_reader(path, reader, file_size, in_memory_slice)?;
-        let is_video = finding.declared_format.contains("MP4")
-            || finding.declared_format.contains("Video");
+        let is_video =
+            finding.declared_format.contains("MP4") || finding.declared_format.contains("Video");
         let is_pe_or_elf = finding.hidden_payload_type.contains("PE Executable")
             || finding.hidden_payload_type.contains("ELF");
 
@@ -357,7 +357,14 @@ impl PolyglotScanner {
             let length = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
             let chunk_type = [hdr[4], hdr[5], hdr[6], hdr[7]];
             let chunk_total = match 12u64.checked_add(length) {
-                Some(t) if offset.checked_add(t).map(|e| e <= file_size).unwrap_or(false) => t,
+                Some(t)
+                    if offset
+                        .checked_add(t)
+                        .map(|e| e <= file_size)
+                        .unwrap_or(false) =>
+                {
+                    t
+                }
                 _ => return false,
             };
             let mut crc = 0xFFFF_FFFFu32;
@@ -692,7 +699,10 @@ impl PolyglotScanner {
         Self::classify_overlay_with_total(overlay, overlay.len())
     }
 
-    fn classify_overlay_with_total(overlay_sample: &[u8], total_overlay_len: usize) -> Option<String> {
+    fn classify_overlay_with_total(
+        overlay_sample: &[u8],
+        total_overlay_len: usize,
+    ) -> Option<String> {
         if let Some(sig) = Self::detect_explicit_signature(overlay_sample) {
             return Some(sig);
         }

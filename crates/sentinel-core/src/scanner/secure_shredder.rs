@@ -1,17 +1,17 @@
-use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use sentinel_sys::{
     ensure_not_symlink_or_reparse_point, flush_hardware_buffers, is_reparse_point_or_symlink,
     issue_file_level_trim, normalize_file_attributes, open_no_buffering_write_through,
-    open_write_through, query_media_type, query_sector_alignment,
-    query_sector_alignment_for_path, to_verbatim_path, AlignedSectorBuffer,
+    open_write_through, query_media_type, query_sector_alignment, query_sector_alignment_for_path,
+    to_verbatim_path, AlignedSectorBuffer,
 };
 
 use crate::enterprise::ledger::AuditLedger;
@@ -61,8 +61,13 @@ pub struct SecureShredder;
 impl SecureShredder {
     pub fn shred_file(path: &Path, method: ShredMethod) -> Result<ShredReceipt, String> {
         // Refuse symlinks and NTFS reparse points before touching attributes or opening handles (`Critical #1`, Row 67)
-        ensure_not_symlink_or_reparse_point(path)
-            .map_err(|e| format!("Refusing to shred symlink or reparse point '{}': {}", path.display(), e))?;
+        ensure_not_symlink_or_reparse_point(path).map_err(|e| {
+            format!(
+                "Refusing to shred symlink or reparse point '{}': {}",
+                path.display(),
+                e
+            )
+        })?;
 
         let verbatim_path = to_verbatim_path(path);
         let verbatim_exists = fs::symlink_metadata(&verbatim_path).is_ok();
@@ -124,7 +129,8 @@ impl SecureShredder {
         if padded_size > 0 {
             if let Ok(mut nb_file) = open_no_buffering_write_through(&target_path) {
                 let actual_sector = query_sector_alignment(&nb_file).max(sector_alignment) as u64;
-                let nb_padded_size = ((file_size + actual_sector - 1) / actual_sector) * actual_sector;
+                let nb_padded_size =
+                    ((file_size + actual_sector - 1) / actual_sector) * actual_sector;
                 let mut nb_ok = true;
 
                 for pass in 1..=effective_passes {
@@ -251,8 +257,7 @@ impl SecureShredder {
                 let mut verify_hasher = Sha256::new();
                 let mut verify_remaining = file_size;
                 while verify_remaining > 0 {
-                    let to_read =
-                        std::cmp::min(verify_remaining, chunk_capacity as u64) as usize;
+                    let to_read = std::cmp::min(verify_remaining, chunk_capacity as u64) as usize;
                     match file.read_exact(&mut aligned_buf.data[..to_read]) {
                         Ok(()) => {
                             verify_hasher.update(&aligned_buf.data[..to_read]);
@@ -366,7 +371,11 @@ impl SecureShredder {
             verify_read_ok: verification_passed,
         };
 
-        Self::record_shred_receipt_to_ledger(&default_shred_ledger_path(), "SHRED_RECEIPT", &receipt)?;
+        Self::record_shred_receipt_to_ledger(
+            &default_shred_ledger_path(),
+            "SHRED_RECEIPT",
+            &receipt,
+        )?;
         Ok(receipt)
     }
 
@@ -409,10 +418,7 @@ impl SecureShredder {
 
     /// Surgically overwrites and unlinks an NTFS Alternate Data Stream (`host_path:stream_name`)
     /// without harming the primary `$DATA` stream of `host_path` (`BUG-CORE-06` #7).
-    pub fn shred_ntfs_stream(
-        host_path: &Path,
-        stream_name: &str,
-    ) -> Result<ShredReceipt, String> {
+    pub fn shred_ntfs_stream(host_path: &Path, stream_name: &str) -> Result<ShredReceipt, String> {
         ensure_not_symlink_or_reparse_point(host_path).map_err(|e| {
             format!(
                 "Refusing NTFS ADS shred on symlink or reparse point '{}': {}",
@@ -520,9 +526,12 @@ impl SecureShredder {
                 final_pass_sha256 = hex::encode(Sha256::digest(&[]));
             }
 
-            stream_file
-                .set_len(0)
-                .map_err(|e| format!("Failed truncating NTFS ADS '{}' to 0 bytes: {}", display_ads, e))?;
+            stream_file.set_len(0).map_err(|e| {
+                format!(
+                    "Failed truncating NTFS ADS '{}' to 0 bytes: {}",
+                    display_ads, e
+                )
+            })?;
             all_flushes_ok = all_flushes_ok && flush_hardware_buffers(&stream_file);
         }
 

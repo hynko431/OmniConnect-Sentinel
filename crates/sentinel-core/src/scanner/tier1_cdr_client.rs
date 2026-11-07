@@ -48,7 +48,8 @@ impl Tier1CdrClient {
         source_path: &Path,
         dest_path: &Path,
     ) -> Result<SanitizationSummary, String> {
-        self.disarm_via_sandboxed_worker(source_path, dest_path).await
+        self.disarm_via_sandboxed_worker(source_path, dest_path)
+            .await
     }
 
     pub async fn inspect_file(&self, source_path: &Path) -> Result<InspectionAssessment, String> {
@@ -109,7 +110,10 @@ impl Tier1CdrClient {
             if let Some(parent) = dst.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        format!("Failed creating destination parent directory for CDR output: {}", e)
+                        format!(
+                            "Failed creating destination parent directory for CDR output: {}",
+                            e
+                        )
                     })?;
                 }
             }

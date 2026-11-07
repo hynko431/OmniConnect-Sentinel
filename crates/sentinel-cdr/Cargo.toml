@@ -14,6 +14,9 @@ path = "src/main.rs"
 name = "sentinel-cdr-worker"
 path = "src/bin/sentinel_cdr_worker.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 sentinel-proto.workspace = true
 sentinel-sys.workspace = true
@@ -23,16 +26,13 @@ tonic.workspace = true
 prost.workspace = true
 bytes.workspace = true
 sha2.workspace = true
-chrono.workspace = true
 uuid.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 async-trait.workspace = true
 thiserror = "1.0"
 hex = "0.4"
-crc32fast.workspace = true
 
 # Document & Media parsing crates
 lopdf = "0.33"
@@ -42,3 +42,4 @@ quick-xml = "0.36"
 
 [dev-dependencies]
 tempfile = "3.10"
+crc32fast.workspace = true

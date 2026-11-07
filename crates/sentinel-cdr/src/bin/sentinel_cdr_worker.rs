@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use std::io;
 use sentinel_cdr::engine::CdrEngine;
 use sentinel_cdr::worker::{write_inspect_response_framed, WorkerCommand};
 use sentinel_cdr::WorkerResponse;
 use sentinel_sys::apply_worker_process_mitigations;
+use std::io;
 
 /// Ephemeral Single-File CDR Worker Binary (`sentinel-cdr-worker`)
 ///
@@ -57,7 +57,8 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs(60));
             }
             if request.file_name == "__TEST_SPAWN_CHILD__.bin" {
-                let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("cmd.exe"));
+                let exe =
+                    std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("cmd.exe"));
                 match std::process::Command::new(exe).arg("--version").spawn() {
                     Ok(mut child) => {
                         let _ = child.kill();

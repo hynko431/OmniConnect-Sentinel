@@ -1,7 +1,7 @@
-use std::collections::HashSet;
-use std::io::{Cursor, Read, Write};
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 use quick_xml::{Reader, Writer};
+use std::collections::HashSet;
+use std::io::{Cursor, Read, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -91,10 +91,7 @@ impl OpenXmlSanitizer {
             let mut bounded_reader = (&mut file).take(read_cap);
             let mut entry_bytes = Vec::new();
             bounded_reader.read_to_end(&mut entry_bytes).map_err(|e| {
-                CdrError::ParserCorruption(format!(
-                    "Decompression stream error in {}: {}",
-                    name, e
-                ))
+                CdrError::ParserCorruption(format!("Decompression stream error in {}: {}", name, e))
             })?;
 
             budget.charge_bytes(entry_bytes.len() as u64)?;
@@ -319,17 +316,15 @@ impl OpenXmlSanitizer {
                         Event::Start(ref e) | Event::Empty(ref e) => {
                             let is_empty = matches!(event, Event::Empty(_));
                             let local_bytes = e.name().local_name().into_inner().to_vec();
-                            let local =
-                                String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
+                            let local = String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
 
                             if local == "override" {
                                 let mut part_name = String::new();
                                 let mut content_type = String::new();
-                                for attr in e.attributes().flatten() {
-                                    let k = String::from_utf8_lossy(
-                                        attr.key.local_name().into_inner(),
-                                    )
-                                    .to_ascii_lowercase();
+                                for attr in e.attributes().with_checks(false).flatten() {
+                                    let k =
+                                        String::from_utf8_lossy(attr.key.local_name().into_inner())
+                                            .to_ascii_lowercase();
                                     let v = String::from_utf8_lossy(&attr.value).into_owned();
                                     if k == "partname" {
                                         part_name = v;
@@ -362,7 +357,7 @@ impl OpenXmlSanitizer {
                                     let tag_name =
                                         String::from_utf8_lossy(e.name().as_ref()).into_owned();
                                     let mut clean_elem = BytesStart::new(tag_name);
-                                    for attr in e.attributes().flatten() {
+                                    for attr in e.attributes().with_checks(false).flatten() {
                                         let key_str =
                                             String::from_utf8_lossy(attr.key.as_ref()).into_owned();
                                         let local_k = String::from_utf8_lossy(
@@ -483,8 +478,7 @@ impl OpenXmlSanitizer {
                         Event::Start(ref e) | Event::Empty(ref e) => {
                             let is_empty = matches!(event, Event::Empty(_));
                             let local_bytes = e.name().local_name().into_inner().to_vec();
-                            let local =
-                                String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
+                            let local = String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
 
                             if local == "relationship" {
                                 let mut rel_id = String::new();
@@ -492,17 +486,16 @@ impl OpenXmlSanitizer {
                                 let mut target_mode = String::new();
                                 let mut rel_type = String::new();
 
-                                for attr_res in e.attributes() {
+                                for attr_res in e.attributes().with_checks(false) {
                                     let attr = attr_res.map_err(|err| {
                                         CdrError::ParserCorruption(format!(
                                             "Malformed Relationship attribute in {}: {}",
                                             rels_path, err
                                         ))
                                     })?;
-                                    let k = String::from_utf8_lossy(
-                                        attr.key.local_name().into_inner(),
-                                    )
-                                    .to_ascii_lowercase();
+                                    let k =
+                                        String::from_utf8_lossy(attr.key.local_name().into_inner())
+                                            .to_ascii_lowercase();
                                     let v = String::from_utf8_lossy(&attr.value).into_owned();
                                     if k == "id" {
                                         rel_id = v;
@@ -688,8 +681,7 @@ impl OpenXmlSanitizer {
                         Event::Start(ref e) | Event::Empty(ref e) => {
                             let is_empty = matches!(event, Event::Empty(_));
                             let local_bytes = e.name().local_name().into_inner().to_vec();
-                            let local =
-                                String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
+                            let local = String::from_utf8_lossy(&local_bytes).to_ascii_lowercase();
 
                             if policy.strip_office_dde
                                 && (local == "ddelink" || local == "ddeitem" || local == "olelink")
@@ -707,11 +699,10 @@ impl OpenXmlSanitizer {
                             }
 
                             let mut neutralized_attr = false;
-                            let tag_name =
-                                String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                            let tag_name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                             let mut clean_elem = BytesStart::new(tag_name);
 
-                            for attr_res in e.attributes() {
+                            for attr_res in e.attributes().with_checks(false) {
                                 let attr = attr_res.map_err(|err| {
                                     CdrError::ParserCorruption(format!(
                                         "Malformed XML attribute in {}: {}",
@@ -721,10 +712,9 @@ impl OpenXmlSanitizer {
                                 let key_str =
                                     String::from_utf8_lossy(attr.key.as_ref()).into_owned();
                                 let key_lower = key_str.to_ascii_lowercase();
-                                let local_key = String::from_utf8_lossy(
-                                    attr.key.local_name().into_inner(),
-                                )
-                                .to_ascii_lowercase();
+                                let local_key =
+                                    String::from_utf8_lossy(attr.key.local_name().into_inner())
+                                        .to_ascii_lowercase();
                                 let val_str = String::from_utf8_lossy(&attr.value).into_owned();
                                 let val_upper = val_str.to_ascii_uppercase();
 
@@ -757,8 +747,7 @@ impl OpenXmlSanitizer {
                                     neutralized_attr = true;
                                     clean_elem.push_attribute((key_str.as_str(), "REM_DISARMED"));
                                 } else {
-                                    clean_elem
-                                        .push_attribute((key_str.as_str(), val_str.as_str()));
+                                    clean_elem.push_attribute((key_str.as_str(), val_str.as_str()));
                                 }
                             }
 
@@ -804,8 +793,7 @@ impl OpenXmlSanitizer {
                             }
                         }
                         Event::End(ref e) => {
-                            let tag_name =
-                                String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                            let tag_name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                             writer
                                 .write_event(Event::End(BytesEnd::new(tag_name)))
                                 .map_err(|err| CdrError::XmlError(err.to_string()))?;

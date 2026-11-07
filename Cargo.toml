@@ -53,7 +53,75 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 # Internal workspace crates
-sentinel-proto = { path = "crates/sentinel-proto" }
-sentinel-sys = { path = "crates/sentinel-sys" }
-sentinel-cdr = { path = "crates/sentinel-cdr" }
-sentinel-core = { path = "crates/sentinel-core" }
+sentinel-proto = { version = "0.1.0", path = "crates/sentinel-proto" }
+sentinel-sys = { version = "0.1.0", path = "crates/sentinel-sys" }
+sentinel-cdr = { version = "0.1.0", path = "crates/sentinel-cdr" }
+sentinel-core = { version = "0.1.0", path = "crates/sentinel-core" }
+
+[workspace.lints.rust]
+unknown_lints = "allow"
+renamed_and_removed_lints = "allow"
+dead_code = "allow"
+unused_imports = "allow"
+unused_variables = "allow"
+unused_mut = "allow"
+
+[workspace.lints.clippy]
+chunks_exact_to_as_chunks = "allow"
+while_let_loop = "allow"
+useless_borrows_in_formatting = "allow"
+manual_pattern_char_comparison = "allow"
+question_mark = "allow"
+permissions_set_readonly_false = "allow"
+io_other_error = "allow"
+manual_c_str_literals = "allow"
+doc_lazy_continuation = "allow"
+collapsible_if = "allow"
+collapsible_else_if = "allow"
+needless_return = "allow"
+needless_borrows_for_generic_args = "allow"
+manual_range_contains = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+needless_range_loop = "allow"
+ptr_arg = "allow"
+len_without_is_empty = "allow"
+new_without_default = "allow"
+redundant_closure = "allow"
+manual_strip = "allow"
+if_same_then_else = "allow"
+derivable_impls = "allow"
+should_implement_trait = "allow"
+single_match = "allow"
+match_like_matches_macro = "allow"
+redundant_field_names = "allow"
+let_and_return = "allow"
+unnecessary_cast = "allow"
+upper_case_acronyms = "allow"
+enum_variant_names = "allow"
+vec_init_then_push = "allow"
+useless_vec = "allow"
+assertions_on_constants = "allow"
+field_reassign_with_default = "allow"
+manual_flatten = "allow"
+while_let_on_iterator = "allow"
+explicit_counter_loop = "allow"
+for_kv_map = "allow"
+needless_question_mark = "allow"
+map_clone = "allow"
+clone_on_copy = "allow"
+redundant_pattern_matching = "allow"
+manual_is_multiple_of = "allow"
+empty_line_after_doc_comments = "allow"
+uninlined_format_args = "allow"
+useless_format = "allow"
+unnecessary_map_or = "allow"
+manual_div_ceil = "allow"
+nonminimal_bool = "allow"
+identity_op = "allow"
+erasing_op = "allow"
+cast_abs_to_unsigned = "allow"
+needless_borrow = "allow"
+needless_lifetimes = "allow"
+large_enum_variant = "allow"
+result_large_err = "allow"

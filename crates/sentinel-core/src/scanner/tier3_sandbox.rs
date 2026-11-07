@@ -1,9 +1,9 @@
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::enterprise::ledger::AuditLedger;
@@ -88,9 +88,12 @@ impl Tier3SandboxConnector {
             .next()
             .ok_or_else(|| "Invalid remote sandbox endpoint URL".to_string())?;
 
-        let addr: SocketAddr = host_port
-            .parse()
-            .map_err(|e| format!("Unresolvable remote sandbox socket address '{}': {}", host_port, e))?;
+        let addr: SocketAddr = host_port.parse().map_err(|e| {
+            format!(
+                "Unresolvable remote sandbox socket address '{}': {}",
+                host_port, e
+            )
+        })?;
 
         let timeout = Duration::from_secs(request.timeout_seconds.clamp(1, 30) as u64);
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(750))
@@ -192,7 +195,9 @@ impl Tier3SandboxConnector {
         // 3. Persistence & Registry Run key manipulation check
         if sample_str.contains("Software\\Microsoft\\Windows\\CurrentVersion\\Run") {
             threat_score = threat_score.saturating_add(45).min(100);
-            ttps.push("T1547.001 - Boot or Logon Autostart Execution: Registry Run Keys".to_string());
+            ttps.push(
+                "T1547.001 - Boot or Logon Autostart Execution: Registry Run Keys".to_string(),
+            );
             indicators.push("References HKCU/HKLM CurrentVersion\\Run persistence key".to_string());
         }
 
@@ -242,7 +247,7 @@ impl Tier3SandboxConnector {
             .strip_prefix("https://")
             .or_else(|| lower.strip_prefix("http://"))?;
         let authority_end = after_scheme
-            .find(|c: char| matches!(c, '/' | '?' | '#' | '\\'))
+            .find(['/', '?', '#', '\\'])
             .unwrap_or(after_scheme.len());
         let authority = &after_scheme[..authority_end];
         let host_port = authority
@@ -295,9 +300,9 @@ impl Tier3SandboxConnector {
             None => return false,
         };
 
-        BENIGN_DOMAINS.iter().any(|&domain| {
-            host == domain || host.ends_with(&format!(".{}", domain))
-        })
+        BENIGN_DOMAINS
+            .iter()
+            .any(|&domain| host == domain || host.ends_with(&format!(".{}", domain)))
     }
 
     /// Extracts real `http://` and `https://` URLs embedded in the sample while

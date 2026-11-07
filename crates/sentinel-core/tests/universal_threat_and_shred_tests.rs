@@ -103,7 +103,8 @@ fn test_secure_shredder_reserved_dos_name_and_ads_surgical_shred() {
         verbatim_con.to_string_lossy().starts_with(r"\\?\"),
         "to_verbatim_path on Windows must prefix \\\\?\\ for reserved DOS names"
     );
-    fs::write(&verbatim_con, b"RESERVED_DOS_DEVICE_PAYLOAD").expect("Write CON.txt via verbatim path");
+    fs::write(&verbatim_con, b"RESERVED_DOS_DEVICE_PAYLOAD")
+        .expect("Write CON.txt via verbatim path");
     let con_receipt = SecureShredder::shred_file(&con_path, ShredMethod::NistClearThreePass)
         .expect("Shredding CON.txt with NistClearThreePass must succeed");
     assert!(con_receipt.verification_passed);
@@ -247,8 +248,8 @@ fn test_quarantine_vault_kek_persistence_aad_binding_and_restore() {
 
     // Tamper with the AAD header inside the `.quar` file and verify AEAD rejection (`BUG-CORE-02` #3)
     let quar_bytes = fs::read(&entry.vault_file_path).unwrap();
-    let tampered_str = String::from_utf8_lossy(&quar_bytes)
-        .replace("Trojan.Test.Dropper", "Tampered.Reason.X");
+    let tampered_str =
+        String::from_utf8_lossy(&quar_bytes).replace("Trojan.Test.Dropper", "Tampered.Reason.X");
     fs::write(&entry.vault_file_path, tampered_str.as_bytes()).unwrap();
 
     let tampered_restore = dir.path().join("tampered_restore.exe");
@@ -283,12 +284,18 @@ fn test_polyglot_scanner_jpeg_with_pe_overlay_and_exif_false_positive_immunity()
     clean_exif_jpeg.extend_from_slice(&app1_len.to_be_bytes());
     clean_exif_jpeg.extend_from_slice(exif_payload);
     // Add SOS (0xFF 0xDA) + scan data + true EOI (0xFF 0xD9)
-    clean_exif_jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x04, 0x00, 0x00, 0x11, 0x22, 0x33, 0xFF, 0xD9]);
+    clean_exif_jpeg.extend_from_slice(&[
+        0xFF, 0xDA, 0x00, 0x04, 0x00, 0x00, 0x11, 0x22, 0x33, 0xFF, 0xD9,
+    ]);
     fs::write(&exif_jpeg_path, &clean_exif_jpeg).unwrap();
 
     assert!(
-        PolyglotScanner::inspect(&exif_jpeg_path, &clean_exif_jpeg, clean_exif_jpeg.len() as u64)
-            .is_none(),
+        PolyglotScanner::inspect(
+            &exif_jpeg_path,
+            &clean_exif_jpeg,
+            clean_exif_jpeg.len() as u64
+        )
+        .is_none(),
         "Camera JPEG with EXIF thumbnail EOI must NOT be falsely flagged as a polyglot"
     );
 
@@ -322,12 +329,14 @@ fn test_polyglot_scanner_png_chunk_walk_and_mp4_moov_after_mdat() {
     clean_png.extend_from_slice(&[0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R']);
     clean_png.extend_from_slice(&[0x00; 13]);
     clean_png.extend_from_slice(&[0x00; 4]); // CRC
-    // tEXt chunk with payload "CommentIENDHere!" (16 bytes)
+                                             // tEXt chunk with payload "CommentIENDHere!" (16 bytes)
     clean_png.extend_from_slice(&[0x00, 0x00, 0x00, 0x10, b't', b'E', b'X', b't']);
     clean_png.extend_from_slice(b"CommentIENDHere!");
     clean_png.extend_from_slice(&[0x00; 4]); // CRC
-    // Real IEND chunk
-    clean_png.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82]);
+                                             // Real IEND chunk
+    clean_png.extend_from_slice(&[
+        0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82,
+    ]);
 
     let clean_png_path = dir.path().join("clean_logo.png");
     assert!(
@@ -386,7 +395,9 @@ fn test_unicode_trojan_detector_bidi_zero_width_and_dos_names() {
     assert_eq!(threat.mitre_technique, "T1036.002 (Right-to-Left Override)");
 
     // 2. Zero-Width Space (U+200B)
-    let zw_path = dir.path().join(format!("{}stealth_payload.exe", '\u{200B}'));
+    let zw_path = dir
+        .path()
+        .join(format!("{}stealth_payload.exe", '\u{200B}'));
     let threat2 = UnicodeTrojanDetector::inspect_path(&zw_path)
         .expect("UnicodeTrojanDetector must detect Zero-Width space");
     assert_eq!(threat2.carrier_category, CarrierCategory::FilesystemHidden);
@@ -450,7 +461,8 @@ fn test_content_scanner_false_positive_fixes_and_large_docx() {
 
     // 3. Developer `project_readme.txt` must NOT be flagged (`BUG-CORE-05` #2)
     let dev_readme_path = dir.path().join("project_readme.txt");
-    let dev_readme_bytes = b"# Project Build Instructions\nRun cargo test --workspace to verify all crates.\n";
+    let dev_readme_bytes =
+        b"# Project Build Instructions\nRun cargo test --workspace to verify all crates.\n";
     assert!(
         ContentScanner::inspect_content(
             &dev_readme_path,
@@ -495,7 +507,9 @@ fn test_content_scanner_false_positive_fixes_and_large_docx() {
         writer
             .start_file("word/vbaProject.bin", stored_opts)
             .unwrap();
-        writer.write_all(b"VBA_MACRO_PAYLOAD_PAST_4MB_OFFSET").unwrap();
+        writer
+            .write_all(b"VBA_MACRO_PAYLOAD_PAST_4MB_OFFSET")
+            .unwrap();
         writer.finish().unwrap();
     }
     fs::write(&large_docm_path, &zip_buf).unwrap();
@@ -533,8 +547,7 @@ async fn test_tier3_sandbox_and_yara_no_size_229376_or_pki_false_positives() {
     //    flagged as Ramnit and must NOT report PKI URLs as C2 IOCs.
     // 2. A PE binary containing a real `.rmnet` section header MUST be flagged.
     let mut benign_229376 = vec![0x41u8; 229_376];
-    let pki_str =
-        b"http://crl3.digicert.com/DigiCertTrustedRootG4.crl https://ocsp.digicert.com\0";
+    let pki_str = b"http://crl3.digicert.com/DigiCertTrustedRootG4.crl https://ocsp.digicert.com\0";
     benign_229376[0..pki_str.len()].copy_from_slice(pki_str);
 
     let yara = Tier0YaraScanner::new();
@@ -647,7 +660,9 @@ fn test_intune_xml_escaping_and_falcon_cef_injection_immunity() {
         .join("Docs")
         .join("intune_sentinel_policy_profile.xml");
     if docs_xml_path.exists() {
-        let on_disk_xml = fs::read_to_string(&docs_xml_path).unwrap().replace("\r\n", "\n");
+        let on_disk_xml = fs::read_to_string(&docs_xml_path)
+            .unwrap()
+            .replace("\r\n", "\n");
         let generated_xml = xml.replace("\r\n", "\n");
         assert_eq!(on_disk_xml.trim(), generated_xml.trim());
     }
@@ -655,7 +670,8 @@ fn test_intune_xml_escaping_and_falcon_cef_injection_immunity() {
     // Verify on-disk SIEM spool, flush_spool, and 180-day retention pruning (`Row 169`)
     let dir = tempdir().unwrap();
     let spool_path = dir.path().join("siem_spool.jsonl");
-    let offline_bridge = CrowdStrikeFalconBridge::with_spool_path("offline://siem", spool_path.clone());
+    let offline_bridge =
+        CrowdStrikeFalconBridge::with_spool_path("offline://siem", spool_path.clone());
     offline_bridge
         .emit_alert(&FalconTelemetryEvent {
             severity: 8,
@@ -680,7 +696,10 @@ fn test_intune_xml_escaping_and_falcon_cef_injection_immunity() {
         })
         .unwrap();
     let pruned = offline_bridge.prune_expired_records(180).unwrap();
-    assert_eq!(pruned, 1, "185-day-old SIEM record must be pruned by 180-day retention");
+    assert_eq!(
+        pruned, 1,
+        "185-day-old SIEM record must be pruned by 180-day retention"
+    );
     let remaining = offline_bridge.read_spool_records().unwrap();
     assert_eq!(remaining.len(), 1);
     assert!(!remaining[0].delivered);
@@ -689,8 +708,8 @@ fn test_intune_xml_escaping_and_falcon_cef_injection_immunity() {
     let (pub_key, priv_key) = sentinel_sys::generate_raw_ecdsa_p256_keypair()
         .expect("Generating ECDSA P-256 keypair must succeed");
 
-    let mut policy_mgr = IntunePolicyManager::new()
-        .with_ledger_path(dir.path().join("policy_ledger.jsonl"));
+    let mut policy_mgr =
+        IntunePolicyManager::new().with_ledger_path(dir.path().join("policy_ledger.jsonl"));
     assert_eq!(policy_mgr.policy().version, 2);
 
     let mut v3_policy = policy_mgr.policy().clone();
@@ -762,7 +781,10 @@ fn test_intune_xml_escaping_and_falcon_cef_injection_immunity() {
     )
     .unwrap();
     assert_eq!(yara.apply_signed_rule_pack(&pack_v2, &pub_key).unwrap(), 2);
-    assert!(yara.scan_bytes(b"header BADUSB_FW_SIGNATURE_V2 footer", "fw.bin").matched);
+    assert!(
+        yara.scan_bytes(b"header BADUSB_FW_SIGNATURE_V2 footer", "fw.bin")
+            .matched
+    );
     // Re-applying version 2 (non-monotonic) must be rejected
     assert!(yara.apply_signed_rule_pack(&pack_v2, &pub_key).is_err());
 
@@ -849,10 +871,7 @@ fn test_kiosk_recursive_subdirectory_shred_and_audit_ledger_tamper_detection() {
         .append_event("FILE_SANITIZED", "report.docx -> clean")
         .unwrap();
 
-    assert_eq!(
-        ledger.verify_chain().expect("Valid chain must verify"),
-        2
-    );
+    assert_eq!(ledger.verify_chain().expect("Valid chain must verify"), 2);
 
     // Tamper with the first record in the ledger file
     let raw_ledger = fs::read_to_string(&ledger_path).unwrap();
@@ -960,7 +979,9 @@ async fn test_interceptor_retains_channel_sender_and_vfs_shadow_cache() {
     );
     let quota_err = quota_cache
         .ingest_volume_read_once(&raw_usb, &dir.path().join("quota_mount"))
-        .expect_err("Ingesting file larger than max_cache_bytes must fail with CACHE_QUOTA_EXCEEDED");
+        .expect_err(
+            "Ingesting file larger than max_cache_bytes must fail with CACHE_QUOTA_EXCEEDED",
+        );
     assert!(
         quota_err.contains("CACHE_QUOTA_EXCEEDED") || quota_err.contains("SNTL-ERR-006"),
         "Unexpected quota error: {}",
@@ -999,7 +1020,10 @@ fn test_universal_scanner_end_to_end_directory_scan_and_completeness_report() {
     // Even with 3 nested subdirectories, `max_files = 3` must scan all 3 regular files (`complete == true`)
     let report = UniversalScanner::scan_directory_detailed(dir.path(), 3);
     assert_eq!(report.files_scanned, 3);
-    assert!(report.complete, "Scan of 3 regular files with limit=3 must be complete (`BUG-CORE-14` #3)");
+    assert!(
+        report.complete,
+        "Scan of 3 regular files with limit=3 must be complete (`BUG-CORE-14` #3)"
+    );
     assert!(report.threats.len() >= 2);
 
     let threat_paths: Vec<_> = report.threats.iter().map(|t| &t.file_path).collect();
@@ -1238,7 +1262,10 @@ fn mp4_moov_after_mdat_clean() {
 
     let mut stream = Virtual5GbMp4Stream::new();
     let total_len = stream.total_len;
-    assert!(total_len > 4 * 1024 * 1024 * 1024, "Stream must exceed 4 GiB");
+    assert!(
+        total_len > 4 * 1024 * 1024 * 1024,
+        "Stream must exceed 4 GiB"
+    );
     let mp4_path = std::path::Path::new("virtual_5gb_recording.mp4");
     assert!(
         PolyglotScanner::inspect_reader(mp4_path, &mut stream, total_len, None).is_none(),
@@ -1465,11 +1492,8 @@ fn invariant_i4() {
     let src_bytes = b"ORIGINAL_SOURCE_FILE_BYTES_MUST_SURVIVE_FAULT_INJECTION";
     fs::write(&src_file, src_bytes).unwrap();
 
-    let fault_res = vault.quarantine_file_with_fault_injection(
-        &src_file,
-        "Trojan.FaultInjection.Test",
-        true,
-    );
+    let fault_res =
+        vault.quarantine_file_with_fault_injection(&src_file, "Trojan.FaultInjection.Test", true);
     assert!(
         fault_res.is_err(),
         "quarantine_file_with_fault_injection(..., true) must abort when .quar verification fails"
@@ -1553,7 +1577,10 @@ fn allowlist_blocks_containers() {
     let disguised_cases: &[(&str, &[u8])] = &[
         ("disguised_cab.txt", b"MSCF\x00\x00\x00\x00_CABINET_DATA"),
         ("disguised_chm.txt", b"ITSF\x03\x00\x00\x00_CHM_HELP_DATA"),
-        ("disguised_lnk.txt", b"L\x00\x00\x00\x01\x14\x02\x00_SHELL_LINK"),
+        (
+            "disguised_lnk.txt",
+            b"L\x00\x00\x00\x01\x14\x02\x00_SHELL_LINK",
+        ),
         ("disguised_vhd.txt", b"conectix_VIRTUAL_HARD_DISK"),
         ("disguised_vhdx.txt", b"vhdxfile_VIRTUAL_HARD_DISK_V2"),
     ];
@@ -1573,12 +1600,13 @@ fn allowlist_blocks_containers() {
     let mut multi_zip = Vec::new();
     {
         let mut writer = ZipWriter::new(Cursor::new(&mut multi_zip));
-        let opts = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         writer.start_file("readme_clean.txt", opts).unwrap();
         writer.write_all(b"First entry is unencrypted").unwrap();
         writer.start_file("secret_second_entry.bin", opts).unwrap();
-        writer.write_all(b"Second entry will have encrypted bit 0 set").unwrap();
+        writer
+            .write_all(b"Second entry will have encrypted bit 0 set")
+            .unwrap();
         writer.finish().unwrap();
     }
     // Set general-purpose bit 0 on the SECOND Central Directory header (`PK\x01\x02`)
@@ -1726,11 +1754,8 @@ fn walk_skips_links() {
         let file_link = kiosk_session_dir.join("symlink_to_secret.txt");
         if std::os::windows::fs::symlink_file(&sensitive_target, &file_link).is_ok() {
             assert!(
-                SecureShredder::shred_file(
-                    &file_link,
-                    ShredMethod::ClearMultiPass { passes: 3 }
-                )
-                .is_err(),
+                SecureShredder::shred_file(&file_link, ShredMethod::ClearMultiPass { passes: 3 })
+                    .is_err(),
                 "SecureShredder::shred_file must refuse file symlinks"
             );
         }
@@ -1755,7 +1780,10 @@ fn walk_skips_links() {
     let mut kiosk = KioskEnforcer::new(KioskConfig::default(), kiosk_session_dir.clone());
     let _ = kiosk.begin_kiosk_session();
     let wiped = kiosk.end_kiosk_session().expect("Kiosk wipe must succeed");
-    assert_eq!(wiped, 1, "Only the 1 regular session file should be shredded");
+    assert_eq!(
+        wiped, 1,
+        "Only the 1 regular session file should be shredded"
+    );
     assert!(!session_regular.exists());
     assert!(
         sensitive_target.exists(),
@@ -1782,7 +1810,9 @@ async fn no_verdict_from_family_name() {
             .to_vec();
     let yara = Tier0YaraScanner::new();
     assert!(
-        !yara.scan_bytes(&benign_note, "threat_intel_note.txt").matched,
+        !yara
+            .scan_bytes(&benign_note, "threat_intel_note.txt")
+            .matched,
         "Plaintext mention of 'Ramnit'/'Emotet' must not match Tier-0 YARA"
     );
 
@@ -1852,9 +1882,13 @@ fn vault_migrate_legacy() {
         "Keep action must preserve legacy .quar as inert ciphertext"
     );
     let ledger_file = vault_dir.join("vault_audit.jsonl");
-    let ledger = AuditLedger::open_result(ledger_file.clone()).expect("Vault audit ledger must exist");
+    let ledger =
+        AuditLedger::open_result(ledger_file.clone()).expect("Vault audit ledger must exist");
     assert!(
-        ledger.verify_chain().expect("Vault ledger chain must verify") >= 1,
+        ledger
+            .verify_chain()
+            .expect("Vault ledger chain must verify")
+            >= 1,
         "Migration must record UNRECOVERABLE_LEGACY in signed audit ledger"
     );
     let ledger_text = fs::read_to_string(&ledger_file).unwrap();
@@ -1885,7 +1919,9 @@ fn kiosk_posture_blocks_session() {
     };
     assert!(!noncompliant.is_compliant());
     assert!(
-        kiosk.begin_kiosk_session_with_posture(&noncompliant).is_err(),
+        kiosk
+            .begin_kiosk_session_with_posture(&noncompliant)
+            .is_err(),
         "Non-compliant posture must block strict kiosk session startup"
     );
 

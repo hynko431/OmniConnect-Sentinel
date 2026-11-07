@@ -396,9 +396,9 @@ impl ImageSanitizer {
         let output = if policy.reencode_images {
             let mut reader = ImageReader::with_format(Cursor::new(clean_input), ImageFormat::Jpeg);
             reader.limits(Self::build_limits(policy));
-            let dynamic_image = reader
-                .decode()
-                .map_err(|e| CdrError::ParserCorruption(format!("Corrupt JPEG bitstream: {}", e)))?;
+            let dynamic_image = reader.decode().map_err(|e| {
+                CdrError::ParserCorruption(format!("Corrupt JPEG bitstream: {}", e))
+            })?;
 
             let mut out = Vec::with_capacity(clean_input.len());
             dynamic_image
@@ -520,9 +520,9 @@ impl ImageSanitizer {
         let output = if policy.reencode_images {
             let mut reader = ImageReader::with_format(Cursor::new(clean_input), ImageFormat::WebP);
             reader.limits(Self::build_limits(policy));
-            let dynamic_image = reader
-                .decode()
-                .map_err(|e| CdrError::ParserCorruption(format!("Corrupt WebP bitstream: {}", e)))?;
+            let dynamic_image = reader.decode().map_err(|e| {
+                CdrError::ParserCorruption(format!("Corrupt WebP bitstream: {}", e))
+            })?;
 
             let mut out = Vec::with_capacity(clean_input.len());
             dynamic_image

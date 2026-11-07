@@ -1,16 +1,13 @@
+use super::universal_scanner::{CarrierCategory, ThreatSeverity, UniversalThreat};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use super::universal_scanner::{UniversalThreat, CarrierCategory, ThreatSeverity};
 
 pub struct UnicodeTrojanDetector;
 
 impl UnicodeTrojanDetector {
     /// Inspects file names and path components for deceptive Unicode BiDi overrides, zero-width characters, and DOS devices
     pub fn inspect_path(path: &Path) -> Option<UniversalThreat> {
-        let filename = match path.file_name() {
-            Some(name) => name.to_string_lossy(),
-            None => return None,
-        };
+        let filename = path.file_name()?.to_string_lossy();
 
         // 1. Unicode BiDi Override Check (CVE-2021-42574)
         for c in filename.chars() {
@@ -62,9 +59,28 @@ impl UnicodeTrojanDetector {
 
         let is_reserved_dos = matches!(
             stem.as_str(),
-            "CON" | "PRN" | "AUX" | "NUL" |
-            "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" |
-            "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
         );
 
         if is_reserved_dos {

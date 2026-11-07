@@ -1,9 +1,9 @@
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use sentinel_sys::{apply_system_admin_dacl, sync_directory};
@@ -96,7 +96,9 @@ impl CrowdStrikeFalconBridge {
                 '|' => "\\|",
                 '\r' | '\n' => " ",
                 _ => {
-                    if char_count + 1 > MAX_CEF_HEADER_CHARS || out.len() + c.len_utf8() > MAX_CEF_HEADER_CHARS {
+                    if char_count + 1 > MAX_CEF_HEADER_CHARS
+                        || out.len() + c.len_utf8() > MAX_CEF_HEADER_CHARS
+                    {
                         break;
                     }
                     out.push(c);
@@ -105,7 +107,9 @@ impl CrowdStrikeFalconBridge {
                 }
             };
             let esc_chars = escaped.chars().count();
-            if char_count + esc_chars > MAX_CEF_HEADER_CHARS || out.len() + escaped.len() > MAX_CEF_HEADER_CHARS {
+            if char_count + esc_chars > MAX_CEF_HEADER_CHARS
+                || out.len() + escaped.len() > MAX_CEF_HEADER_CHARS
+            {
                 break;
             }
             out.push_str(escaped);
@@ -130,7 +134,9 @@ impl CrowdStrikeFalconBridge {
                 '\n' => "\\n",
                 '\r' => "\\r",
                 _ => {
-                    if char_count + 1 > MAX_CEF_EXT_CHARS || out.len() + c.len_utf8() > MAX_CEF_EXT_CHARS {
+                    if char_count + 1 > MAX_CEF_EXT_CHARS
+                        || out.len() + c.len_utf8() > MAX_CEF_EXT_CHARS
+                    {
                         break;
                     }
                     out.push(c);
@@ -139,7 +145,9 @@ impl CrowdStrikeFalconBridge {
                 }
             };
             let esc_chars = escaped.chars().count();
-            if char_count + esc_chars > MAX_CEF_EXT_CHARS || out.len() + escaped.len() > MAX_CEF_EXT_CHARS {
+            if char_count + esc_chars > MAX_CEF_EXT_CHARS
+                || out.len() + escaped.len() > MAX_CEF_EXT_CHARS
+            {
                 break;
             }
             out.push_str(escaped);
@@ -186,7 +194,9 @@ impl CrowdStrikeFalconBridge {
         info!("SIEM CEF Telemetry: {}", cef_line);
 
         let mut delivered = false;
-        if !self.syslog_endpoint.trim().is_empty() && !self.syslog_endpoint.starts_with("offline://") {
+        if !self.syslog_endpoint.trim().is_empty()
+            && !self.syslog_endpoint.starts_with("offline://")
+        {
             if let Ok(socket) = UdpSocket::bind("127.0.0.1:0") {
                 match socket.send_to(cef_line.as_bytes(), &self.syslog_endpoint) {
                     Ok(sent) if sent == cef_line.len() => {
@@ -236,10 +246,16 @@ impl CrowdStrikeFalconBridge {
     pub fn append_spool_record(&self, record: &SiemSpoolRecord) -> Result<(), String> {
         if let Some(parent) = self.spool_path.parent() {
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed creating SIEM spool directory '{}': {}", parent.display(), e))?;
-                apply_system_admin_dacl(parent)
-                    .map_err(|e| format!("Failed applying SYSTEM/Admin DACL to SIEM spool dir: {}", e))?;
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "Failed creating SIEM spool directory '{}': {}",
+                        parent.display(),
+                        e
+                    )
+                })?;
+                apply_system_admin_dacl(parent).map_err(|e| {
+                    format!("Failed applying SYSTEM/Admin DACL to SIEM spool dir: {}", e)
+                })?;
             }
         }
 
@@ -248,10 +264,20 @@ impl CrowdStrikeFalconBridge {
             .create(true)
             .append(true)
             .open(&self.spool_path)
-            .map_err(|e| format!("Failed opening SIEM spool '{}': {}", self.spool_path.display(), e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed opening SIEM spool '{}': {}",
+                    self.spool_path.display(),
+                    e
+                )
+            })?;
         if is_new {
-            apply_system_admin_dacl(&self.spool_path)
-                .map_err(|e| format!("Failed applying SYSTEM/Admin DACL to SIEM spool file: {}", e))?;
+            apply_system_admin_dacl(&self.spool_path).map_err(|e| {
+                format!(
+                    "Failed applying SYSTEM/Admin DACL to SIEM spool file: {}",
+                    e
+                )
+            })?;
         }
 
         let mut line = serde_json::to_string(record)
@@ -276,12 +302,18 @@ impl CrowdStrikeFalconBridge {
         if !self.spool_path.exists() {
             return Ok(Vec::new());
         }
-        let file = fs::File::open(&self.spool_path)
-            .map_err(|e| format!("Failed opening SIEM spool '{}': {}", self.spool_path.display(), e))?;
+        let file = fs::File::open(&self.spool_path).map_err(|e| {
+            format!(
+                "Failed opening SIEM spool '{}': {}",
+                self.spool_path.display(),
+                e
+            )
+        })?;
         let reader = BufReader::new(file);
         let mut records = Vec::new();
         for (idx, line_res) in reader.lines().enumerate() {
-            let line = line_res.map_err(|e| format!("Error reading SIEM spool line {}: {}", idx + 1, e))?;
+            let line = line_res
+                .map_err(|e| format!("Error reading SIEM spool line {}: {}", idx + 1, e))?;
             if line.trim().is_empty() {
                 continue;
             }
@@ -300,11 +332,15 @@ impl CrowdStrikeFalconBridge {
         let mut records = self.read_spool_records()?;
         let mut newly_delivered = 0usize;
 
-        if !self.syslog_endpoint.trim().is_empty() && !self.syslog_endpoint.starts_with("offline://") {
+        if !self.syslog_endpoint.trim().is_empty()
+            && !self.syslog_endpoint.starts_with("offline://")
+        {
             if let Ok(socket) = UdpSocket::bind("127.0.0.1:0") {
                 for rec in &mut records {
                     if !rec.delivered {
-                        if let Ok(sent) = socket.send_to(rec.cef_payload.as_bytes(), &self.syslog_endpoint) {
+                        if let Ok(sent) =
+                            socket.send_to(rec.cef_payload.as_bytes(), &self.syslog_endpoint)
+                        {
                             if sent == rec.cef_payload.len() {
                                 rec.delivered = true;
                                 newly_delivered += 1;
@@ -341,8 +377,13 @@ impl CrowdStrikeFalconBridge {
     fn write_spool_records(&self, records: &[SiemSpoolRecord]) -> Result<(), String> {
         let tmp_path = self.spool_path.with_extension("jsonl.tmp");
         {
-            let mut tmp_file = fs::File::create(&tmp_path)
-                .map_err(|e| format!("Failed creating temp SIEM spool '{}': {}", tmp_path.display(), e))?;
+            let mut tmp_file = fs::File::create(&tmp_path).map_err(|e| {
+                format!(
+                    "Failed creating temp SIEM spool '{}': {}",
+                    tmp_path.display(),
+                    e
+                )
+            })?;
             for rec in records {
                 let mut line = serde_json::to_string(rec)
                     .map_err(|e| format!("Failed serializing SIEM spool record: {}", e))?;
@@ -372,7 +413,10 @@ fn default_siem_spool_dir() -> PathBuf {
     #[cfg(windows)]
     {
         let pd = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
-        let candidate = PathBuf::from(pd).join("OmniConnect").join("Sentinel").join("SiemSpool");
+        let candidate = PathBuf::from(pd)
+            .join("OmniConnect")
+            .join("Sentinel")
+            .join("SiemSpool");
         if fs::create_dir_all(&candidate).is_ok() {
             return candidate;
         }

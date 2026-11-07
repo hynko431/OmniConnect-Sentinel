@@ -136,8 +136,7 @@ impl SvgSanitizer {
                         continue;
                     }
                     if in_style_depth > 0 {
-                        let css_lower =
-                            String::from_utf8_lossy(t.as_ref()).to_ascii_lowercase();
+                        let css_lower = String::from_utf8_lossy(t.as_ref()).to_ascii_lowercase();
                         if Self::has_dangerous_css(&css_lower) {
                             reports.push(DisarmReportItem::new(
                                 "SVG_STYLE_EXTERNAL_OR_SCRIPT",
@@ -158,8 +157,7 @@ impl SvgSanitizer {
                         continue;
                     }
                     if in_style_depth > 0 {
-                        let css_lower =
-                            String::from_utf8_lossy(c.as_ref()).to_ascii_lowercase();
+                        let css_lower = String::from_utf8_lossy(c.as_ref()).to_ascii_lowercase();
                         if Self::has_dangerous_css(&css_lower) {
                             reports.push(DisarmReportItem::new(
                                 "SVG_STYLE_EXTERNAL_OR_SCRIPT",
@@ -224,7 +222,7 @@ impl SvgSanitizer {
         let name_str = String::from_utf8_lossy(elem.name().as_ref()).into_owned();
         let mut cleaned = BytesStart::new(name_str);
 
-        for attr_res in elem.attributes() {
+        for attr_res in elem.attributes().with_checks(false) {
             let attr = attr_res.map_err(|e| CdrError::XmlError(e.to_string()))?;
             let key_raw = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
             let key_lower = key_raw.to_ascii_lowercase();
@@ -267,4 +265,3 @@ impl SvgSanitizer {
         Ok(cleaned)
     }
 }
-

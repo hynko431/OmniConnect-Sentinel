@@ -1,6 +1,3 @@
-use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Key, Nonce,
@@ -9,14 +6,17 @@ use chrono::Utc;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use sentinel_sys::{
     apply_system_admin_dacl, decrypt_kek_from_soc_escrow, default_soc_rsa_public_blob,
-    encrypt_kek_for_soc_escrow, seal_key_bytes, sync_directory, to_verbatim_path,
-    unseal_key_bytes, write_protected_key_file, zeroize_slice, KeyProtectionPosture,
-    SealedKeyBlob, SocEscrowBlob, ZeroizingBytes,
+    encrypt_kek_for_soc_escrow, seal_key_bytes, sync_directory, to_verbatim_path, unseal_key_bytes,
+    write_protected_key_file, zeroize_slice, KeyProtectionPosture, SealedKeyBlob, SocEscrowBlob,
+    ZeroizingBytes,
 };
 
 use crate::enterprise::ledger::AuditLedger;
@@ -212,8 +212,8 @@ impl QuarantineVault {
             )
         })?;
 
-        let mut recovered_kek =
-            decrypt_kek_from_soc_escrow(&escrow_blob, soc_rsa_priv_blob).map_err(|e| {
+        let mut recovered_kek = decrypt_kek_from_soc_escrow(&escrow_blob, soc_rsa_priv_blob)
+            .map_err(|e| {
                 format!(
                     "VAULT_INTEGRITY_FAIL: Offline SOC RSA-OAEP decryption failed: {}",
                     e
@@ -232,10 +232,8 @@ impl QuarantineVault {
         zeroize_slice(&mut recovered_kek);
 
         let context = format!("OmniConnect-Sentinel-Vault:{}", vault_dir.display());
-        let sealed_blob =
-            seal_key_bytes(zeroizing.as_slice(), context.as_bytes(), &computed_id).map_err(
-                |e| format!("Failed re-sealing recovered KEK: {}", e),
-            )?;
+        let sealed_blob = seal_key_bytes(zeroizing.as_slice(), context.as_bytes(), &computed_id)
+            .map_err(|e| format!("Failed re-sealing recovered KEK: {}", e))?;
         let posture = sealed_blob.posture;
         let degradation_event = if posture == KeyProtectionPosture::Tpm2Assisted {
             None
@@ -259,7 +257,10 @@ impl QuarantineVault {
         };
         vault.append_ledger_event(
             "VAULT_ESCROW_RECOVERED",
-            &format!("Recovered master KEK '{}' via offline SOC RSA-2048 OAEP escrow", computed_id),
+            &format!(
+                "Recovered master KEK '{}' via offline SOC RSA-2048 OAEP escrow",
+                computed_id
+            ),
         )?;
         Ok(vault)
     }
@@ -501,8 +502,13 @@ impl QuarantineVault {
         dek_blob.extend_from_slice(&wrapped_ct);
 
         let dek_path = self.vault_dir.join(format!("{}.dek", entry_id));
-        write_protected_key_file(&dek_path, &dek_blob)
-            .map_err(|e| format!("Failed persisting wrapped DEK {}: {}", dek_path.display(), e))?;
+        write_protected_key_file(&dek_path, &dek_blob).map_err(|e| {
+            format!(
+                "Failed persisting wrapped DEK {}: {}",
+                dek_path.display(),
+                e
+            )
+        })?;
         Ok(dek_path)
     }
 
@@ -656,12 +662,8 @@ impl QuarantineVault {
                 .map_err(|e| format!("Failed reading file for quarantine: {}", e))?;
         }
 
-        let entry = self.seal_bytes_into_vault(
-            &raw_bytes,
-            &file_path.to_string_lossy(),
-            threat_name,
-            95,
-        );
+        let entry =
+            self.seal_bytes_into_vault(&raw_bytes, &file_path.to_string_lossy(), threat_name, 95);
         zeroize_slice(&mut raw_bytes);
         let entry = entry?;
 
@@ -880,11 +882,7 @@ impl QuarantineVault {
     }
 
     /// Decrypts, authenticates (AEAD + AAD + SHA-256), and atomically restores a quarantined file (`BUG-CORE-02`).
-    pub fn restore_file(
-        &self,
-        entry_id: &str,
-        destination_path: &Path,
-    ) -> Result<PathBuf, String> {
+    pub fn restore_file(&self, entry_id: &str, destination_path: &Path) -> Result<PathBuf, String> {
         self.check_healthy()?;
 
         if entry_id.contains('/') || entry_id.contains('\\') || entry_id.contains("..") {
@@ -926,7 +924,9 @@ impl QuarantineVault {
         let mut hasher = Sha256::new();
         hasher.update(&plaintext);
         let actual_sha256 = hex::encode(hasher.finalize());
-        if actual_sha256 != header.sha256_plaintext || (plaintext.len() as u64) != header.original_size {
+        if actual_sha256 != header.sha256_plaintext
+            || (plaintext.len() as u64) != header.original_size
+        {
             zeroize_slice(&mut plaintext);
             return Err(format!(
                 "VAULT_INTEGRITY_FAIL: Restored plaintext SHA-256 or size mismatch (expected {}, got {})",
@@ -1053,7 +1053,10 @@ impl QuarantineVault {
 
         self.append_ledger_event(
             "QUARANTINE_PURGED",
-            &format!("Crypto-erased DEK and shredded quarantine entry '{}'", entry_id),
+            &format!(
+                "Crypto-erased DEK and shredded quarantine entry '{}'",
+                entry_id
+            ),
         )?;
 
         Ok(())
@@ -1151,8 +1154,9 @@ impl QuarantineVault {
             if path.extension().and_then(|s| s.to_str()) != Some("quar") {
                 continue;
             }
-            let bytes = fs::read(&path)
-                .map_err(|e| format!("Failed reading {} during migration: {}", path.display(), e))?;
+            let bytes = fs::read(&path).map_err(|e| {
+                format!("Failed reading {} during migration: {}", path.display(), e)
+            })?;
 
             if Self::parse_envelope(&bytes).is_err() {
                 let entry_name = path

@@ -46,4 +46,3 @@ pub use sandbox_worker::{
     verify_named_pipe_client_pid, verify_named_pipe_peer_credentials, JobSandboxConfig,
     JobSandboxGuard, PeerCredentials, SandboxedChildProcess, DEFAULT_NAMED_PIPE_ENDPOINT,
 };
-

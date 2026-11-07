@@ -28,7 +28,9 @@ pub enum SentinelError {
     #[error("[SNTL-ERR-006] Shadow cache quota exceeded (CACHE_QUOTA_EXCEEDED): {0}")]
     CacheQuotaExceeded(String),
 
-    #[error("[SNTL-ERR-007] Policy signature or monotonic version rejected (POLICY_REJECTED): {0}")]
+    #[error(
+        "[SNTL-ERR-007] Policy signature or monotonic version rejected (POLICY_REJECTED): {0}"
+    )]
     PolicySignatureInvalid(String),
 
     #[error("[SNTL-ERR-008] Audit ledger hash chain tampered (LEDGER_TAMPERED): {0}")]
@@ -200,7 +202,9 @@ impl SentinelMetrics {
         let mut out = String::new();
 
         // 1. sentinel_active_workers
-        out.push_str("# HELP sentinel_active_workers Currently active sandboxed CDR worker processes.\n");
+        out.push_str(
+            "# HELP sentinel_active_workers Currently active sandboxed CDR worker processes.\n",
+        );
         out.push_str("# TYPE sentinel_active_workers gauge\n");
         out.push_str(&format!(
             "sentinel_active_workers {}\n",
@@ -208,7 +212,9 @@ impl SentinelMetrics {
         ));
 
         // 2. sentinel_cdr_processed_total{format,status}
-        out.push_str("# HELP sentinel_cdr_processed_total Total CDR operations by format and status.\n");
+        out.push_str(
+            "# HELP sentinel_cdr_processed_total Total CDR operations by format and status.\n",
+        );
         out.push_str("# TYPE sentinel_cdr_processed_total counter\n");
         if let Ok(guard) = self.cdr_processed_by_label.lock() {
             if guard.is_empty() {
@@ -246,7 +252,9 @@ impl SentinelMetrics {
         }
 
         // 4. sentinel_threats_total{category,severity}
-        out.push_str("# HELP sentinel_threats_total Total detected threats by category and severity.\n");
+        out.push_str(
+            "# HELP sentinel_threats_total Total detected threats by category and severity.\n",
+        );
         out.push_str("# TYPE sentinel_threats_total counter\n");
         if let Ok(guard) = self.threats_by_label.lock() {
             if guard.is_empty() {
@@ -265,7 +273,9 @@ impl SentinelMetrics {
         }
 
         // 5. sentinel_vault_ops_total{op,status}
-        out.push_str("# HELP sentinel_vault_ops_total Total QuarantineVault operations by op and status.\n");
+        out.push_str(
+            "# HELP sentinel_vault_ops_total Total QuarantineVault operations by op and status.\n",
+        );
         out.push_str("# TYPE sentinel_vault_ops_total counter\n");
         if let Ok(guard) = self.vault_ops_by_label.lock() {
             if guard.is_empty() {
@@ -304,7 +314,12 @@ impl SentinelMetrics {
         ));
         out.push_str(&format!(
             "sentinel_posture{{feature=\"removable_volumes_offline\"}} {}\n",
-            u8::from(posture.removable_volumes_offline.iter().all(|(_, off)| *off))
+            u8::from(
+                posture
+                    .removable_volumes_offline
+                    .iter()
+                    .all(|(_, off)| *off)
+            )
         ));
         out.push_str(&format!(
             "sentinel_posture{{feature=\"is_compliant\"}} {}\n",

@@ -2,6 +2,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 //! Generated gRPC client and server bindings for OmniConnect Sentinel CDR service.
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 pub mod v1 {
     tonic::include_proto!("sentinel.cdr.v1");
 }

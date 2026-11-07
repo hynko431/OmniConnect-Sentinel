@@ -1,7 +1,7 @@
-use std::io::Cursor;
-use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::Cursor;
+use std::time::Instant;
 use tracing::{debug, info};
 use zip::ZipArchive;
 
@@ -400,9 +400,7 @@ impl CdrEngine {
             DetectedFormat::WebP => {
                 ImageSanitizer::sanitize_webp_with_budget(input_bytes, policy, budget)?
             }
-            DetectedFormat::Svg => {
-                SvgSanitizer::sanitize_with_budget(input_bytes, policy, budget)?
-            }
+            DetectedFormat::Svg => SvgSanitizer::sanitize_with_budget(input_bytes, policy, budget)?,
             DetectedFormat::Ole2 => {
                 Ole2Sanitizer::sanitize_with_budget(input_bytes, policy, budget)?
             }
@@ -496,7 +494,8 @@ impl CdrEngine {
                             ))
                         })?;
                         Self::verify_rels_clean(&rels_bytes, policy)?;
-                    } else if !is_generic_zip && policy.strip_office_dde && lower.ends_with(".xml") {
+                    } else if !is_generic_zip && policy.strip_office_dde && lower.ends_with(".xml")
+                    {
                         let mut xml_bytes = Vec::new();
                         std::io::Read::read_to_end(&mut entry, &mut xml_bytes).map_err(|e| {
                             CdrError::OutputRejected(format!(
@@ -555,23 +554,23 @@ impl CdrEngine {
                         }
                         Ok(quick_xml::events::Event::Start(ref e))
                         | Ok(quick_xml::events::Event::Empty(ref e)) => {
-                            let tag_lower =
-                                String::from_utf8_lossy(e.local_name().as_ref()).to_ascii_lowercase();
+                            let tag_lower = String::from_utf8_lossy(e.local_name().as_ref())
+                                .to_ascii_lowercase();
                             if SvgSanitizer::is_forbidden_tag(&tag_lower) {
                                 return Err(CdrError::OutputRejected(format!(
                                     "CDR_OUTPUT_REJECTED: Residual <{}> in sanitized SVG",
                                     tag_lower
                                 )));
                             }
-                            for attr_res in e.attributes() {
+                            for attr_res in e.attributes().with_checks(false) {
                                 let attr = attr_res.map_err(|err| {
                                     CdrError::OutputRejected(format!(
                                         "CDR_OUTPUT_REJECTED: Malformed SVG attribute: {}",
                                         err
                                     ))
                                 })?;
-                                let k = String::from_utf8_lossy(attr.key.as_ref())
-                                    .to_ascii_lowercase();
+                                let k =
+                                    String::from_utf8_lossy(attr.key.as_ref()).to_ascii_lowercase();
                                 let v = String::from_utf8_lossy(&attr.value)
                                     .trim()
                                     .to_ascii_lowercase();
@@ -727,10 +726,7 @@ impl CdrEngine {
         Ok(())
     }
 
-    fn verify_pdf_dict_clean(
-        dict: &lopdf::Dictionary,
-        policy: &SanitizationPolicy,
-    ) -> Result<()> {
+    fn verify_pdf_dict_clean(dict: &lopdf::Dictionary, policy: &SanitizationPolicy) -> Result<()> {
         if policy.strip_pdf_scripts && (dict.has(b"JS") || dict.has(b"JavaScript")) {
             return Err(CdrError::OutputRejected(
                 "CDR_OUTPUT_REJECTED: Residual /JS or /JavaScript in sanitized PDF".to_string(),
@@ -786,7 +782,7 @@ impl CdrEngine {
                         let mut target = String::new();
                         let mut target_mode = String::new();
                         let mut rel_type = String::new();
-                        for attr in e.attributes().flatten() {
+                        for attr in e.attributes().with_checks(false).flatten() {
                             let k = String::from_utf8_lossy(attr.key.local_name().into_inner())
                                 .to_ascii_lowercase();
                             let v = String::from_utf8_lossy(&attr.value).into_owned();
@@ -807,11 +803,10 @@ impl CdrEngine {
                             || target_lower.starts_with("file:")
                             || target_lower.starts_with("data:")
                             || target_lower.starts_with("\\\\");
-                        let is_benign_hyperlink = rel_type
-                            .to_ascii_lowercase()
-                            .ends_with("/hyperlink")
-                            && !has_dangerous_scheme
-                            && !policy.strip_external_hyperlinks;
+                        let is_benign_hyperlink =
+                            rel_type.to_ascii_lowercase().ends_with("/hyperlink")
+                                && !has_dangerous_scheme
+                                && !policy.strip_external_hyperlinks;
                         if has_dangerous_scheme || (is_external && !is_benign_hyperlink) {
                             return Err(CdrError::OutputRejected(format!(
                                 "CDR_OUTPUT_REJECTED: Residual external/unsafe relationship targeting '{}'",

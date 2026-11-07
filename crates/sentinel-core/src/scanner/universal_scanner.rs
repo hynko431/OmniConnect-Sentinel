@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use sentinel_sys::is_reparse_point_or_symlink;

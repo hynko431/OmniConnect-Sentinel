@@ -1,9 +1,9 @@
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use sentinel_sys::{
@@ -12,8 +12,7 @@ use sentinel_sys::{
     SealedEcdsaKeyPair,
 };
 
-const GENESIS_PREV_HASH: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Append-only Audit Ledger JSONL Record (`Master Plan v2 §4.2`, Invariant I5).
 ///
@@ -132,9 +131,9 @@ impl AuditLedger {
         if let Some(err) = &self.init_error {
             return Err(err.clone());
         }
-        self.ecdsa_keypair
-            .as_ref()
-            .ok_or_else(|| "LEDGER_KEY_INTEGRITY_FAIL: ECDSA P-256 signing key unavailable".to_string())
+        self.ecdsa_keypair.as_ref().ok_or_else(|| {
+            "LEDGER_KEY_INTEGRITY_FAIL: ECDSA P-256 signing key unavailable".to_string()
+        })
     }
 
     fn key_file_path(ledger_path: &Path) -> PathBuf {
@@ -146,7 +145,10 @@ impl AuditLedger {
     }
 
     fn context_string(ledger_path: &Path) -> String {
-        format!("OmniConnect-Sentinel-Ledger-ECDSA-P256:{}", ledger_path.display())
+        format!(
+            "OmniConnect-Sentinel-Ledger-ECDSA-P256:{}",
+            ledger_path.display()
+        )
     }
 
     fn load_or_init_ecdsa_key(ledger_path: &Path) -> Result<SealedEcdsaKeyPair, String> {
@@ -200,7 +202,7 @@ impl AuditLedger {
         // First-time provisioning of the ledger's asymmetric ECDSA P-256 keypair
         let unique_key_id = format!(
             "LEDGER-ECDSA-P256-{}",
-            &hex::encode(Sha256::digest(context.as_bytes()))[..16].to_ascii_uppercase()
+            hex::encode(Sha256::digest(context.as_bytes()))[..16].to_ascii_uppercase()
         );
         let keypair = create_sealed_ecdsa_p256_keypair(context.as_bytes(), &unique_key_id)
             .map_err(|e| format!("Failed creating ledger ECDSA P-256 keypair: {}", e))?;
@@ -227,13 +229,17 @@ impl AuditLedger {
         let mut last_hash = GENESIS_PREV_HASH.to_string();
 
         for (idx, line_res) in reader.lines().enumerate() {
-            let line = line_res
-                .map_err(|e| format!("Failed reading ledger line {}: {}", idx + 1, e))?;
+            let line =
+                line_res.map_err(|e| format!("Failed reading ledger line {}: {}", idx + 1, e))?;
             if line.trim().is_empty() {
                 continue;
             }
             let rec: LedgerRecord = serde_json::from_str(&line).map_err(|e| {
-                format!("Corrupted ledger JSON during tail scan at line {}: {}", idx + 1, e)
+                format!(
+                    "Corrupted ledger JSON during tail scan at line {}: {}",
+                    idx + 1,
+                    e
+                )
             })?;
             last_seq = rec.seq;
             last_hash = rec.hash;
@@ -334,8 +340,13 @@ impl AuditLedger {
         let head_path = Self::head_sig_path(&self.ledger_path);
         let head_json = serde_json::to_vec_pretty(&signed_head)
             .map_err(|e| format!("Failed serializing signed chain head: {}", e))?;
-        write_protected_key_file(&head_path, &head_json)
-            .map_err(|e| format!("Failed writing signed chain head {}: {}", head_path.display(), e))?;
+        write_protected_key_file(&head_path, &head_json).map_err(|e| {
+            format!(
+                "Failed writing signed chain head {}: {}",
+                head_path.display(),
+                e
+            )
+        })?;
 
         Ok(signed_head)
     }
@@ -350,8 +361,7 @@ impl AuditLedger {
             let head_path = Self::head_sig_path(&self.ledger_path);
             if head_path.exists() {
                 return Err(
-                    "Ledger file was deleted while signed chain-head checkpoint exists"
-                        .to_string(),
+                    "Ledger file was deleted while signed chain-head checkpoint exists".to_string(),
                 );
             }
             return Ok(0);
@@ -387,13 +397,8 @@ impl AuditLedger {
                 ));
             }
 
-            let recomputed_hash = Self::compute_record_hash(
-                rec.seq,
-                &rec.ts,
-                &rec.event,
-                &rec.data,
-                &rec.prev_hash,
-            );
+            let recomputed_hash =
+                Self::compute_record_hash(rec.seq, &rec.ts, &rec.event, &rec.data, &rec.prev_hash);
             if rec.hash != recomputed_hash {
                 return Err(format!(
                     "Ledger content tampered at seq {}: hash mismatch",
@@ -456,13 +461,7 @@ impl AuditLedger {
         Ok(count)
     }
 
-    fn compute_record_hash(
-        seq: u64,
-        ts: &str,
-        event: &str,
-        data: &str,
-        prev_hash: &str,
-    ) -> String {
+    fn compute_record_hash(seq: u64, ts: &str, event: &str, data: &str, prev_hash: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(format!("{}|{}|{}|{}|{}", seq, ts, event, data, prev_hash));
         hex::encode(hasher.finalize())
@@ -470,7 +469,10 @@ impl AuditLedger {
 
     fn compute_head_digest(head_seq: u64, head_hash: &str) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(format!("SENTINEL-LEDGER-HEAD-V2:{}|{}", head_seq, head_hash));
+        hasher.update(format!(
+            "SENTINEL-LEDGER-HEAD-V2:{}|{}",
+            head_seq, head_hash
+        ));
         let final_hash = hasher.finalize();
         let mut out = [0u8; 32];
         out.copy_from_slice(&final_hash);

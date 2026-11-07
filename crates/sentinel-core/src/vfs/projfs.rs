@@ -1,6 +1,6 @@
+use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use async_trait::async_trait;
 use tracing::{info, warn};
 
 use sentinel_sys::{prj_start_virtualizing_root, prj_write_file_data, ProjFsInstanceHandle};
@@ -59,7 +59,9 @@ impl ProjFsProvider {
             .clone()
             .ok_or_else(|| "ProjFS virtualization root is not mounted".to_string())?;
 
-        let plaintext = self.shadow_cache.read_projected_file(&root, relative_path)?;
+        let plaintext = self
+            .shadow_cache
+            .read_projected_file(&root, relative_path)?;
 
         if let Ok(guard) = self.projfs_handle.lock() {
             if let Some(ref handle) = *guard {
@@ -72,10 +74,7 @@ impl ProjFsProvider {
     }
 
     pub fn is_degraded_no_projfs(&self) -> bool {
-        self.degraded_no_projfs
-            .lock()
-            .map(|g| *g)
-            .unwrap_or(false)
+        self.degraded_no_projfs.lock().map(|g| *g).unwrap_or(false)
     }
 
     pub fn shadow_cache(&self) -> &Arc<ShadowCacheManager> {
@@ -154,7 +153,8 @@ impl VirtualFileSystemProvider for ProjFsProvider {
 
         // Verify decryption and SHA-256 integrity (`read_projected_file`) and hydrate with MotW (`ZoneId=3`)
         let _verified_bytes = self.read_projected_file(relative_path)?;
-        self.shadow_cache.resolve_projected_file(&root, relative_path)
+        self.shadow_cache
+            .resolve_projected_file(&root, relative_path)
     }
 
     async fn unmount_volume(&self, virtual_mount_point: &Path) -> Result<(), String> {

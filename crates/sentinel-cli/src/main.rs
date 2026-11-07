@@ -34,9 +34,7 @@ use sentinel_core::interceptor::PendingDeviceConfirmationManager;
 use sentinel_core::scanner::quarantine::QuarantineVault;
 use sentinel_core::scanner::secure_shredder::{SecureShredder, ShredMethod, ShredReceipt};
 use sentinel_core::scanner::tier0_yara::Tier0YaraScanner;
-use sentinel_core::scanner::tier3_sandbox::{
-    SandboxDetonationRequest, Tier3SandboxConnector,
-};
+use sentinel_core::scanner::tier3_sandbox::{SandboxDetonationRequest, Tier3SandboxConnector};
 use sentinel_core::scanner::universal_scanner::{UniversalScanner, UniversalThreat};
 use sentinel_sys::{verify_system_posture, write_mark_of_the_web};
 
@@ -344,9 +342,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("===========================================================");
                 println!("File Path:              {:?}", path);
                 println!("File Size:              {} bytes", bytes.len());
-                println!("Detected Format:        {:?} ({})", inspection.detected_format, inspection.true_mime_type);
-                println!("Shannon Entropy:        {:.2} bits/byte", inspection.entropy_score);
-                println!("Polyglot Verdict:       {}", if inspection.is_malicious_polyglot { "POLYGLOT DETECTED" } else { "Clean" });
+                println!(
+                    "Detected Format:        {:?} ({})",
+                    inspection.detected_format, inspection.true_mime_type
+                );
+                println!(
+                    "Shannon Entropy:        {:.2} bits/byte",
+                    inspection.entropy_score
+                );
+                println!(
+                    "Polyglot Verdict:       {}",
+                    if inspection.is_malicious_polyglot {
+                        "POLYGLOT DETECTED"
+                    } else {
+                        "Clean"
+                    }
+                );
                 println!(
                     "CDR Risk Markers:       {}",
                     if !inspection.risk_tags.is_empty() {
@@ -392,7 +403,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Detonate { path, vm, endpoint } => {
-            info!("Reading target binary for OpenSandbox detonation: {:?}", path);
+            info!(
+                "Reading target binary for OpenSandbox detonation: {:?}",
+                path
+            );
             let bytes = fs::read(&path)?;
             let file_name = path
                 .file_name()
@@ -421,10 +435,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("SHA256:                 {}", sha256_hex);
             println!(
                 "Verdict:                {}",
-                if report.verdict_malicious { "MALICIOUS" } else { "CLEAN / BENIGN" }
+                if report.verdict_malicious {
+                    "MALICIOUS"
+                } else {
+                    "CLEAN / BENIGN"
+                }
             );
             println!("Threat Score:           {}/100", report.threat_score);
-            println!("Threat Family:          {}", report.threat_family.as_deref().unwrap_or("None"));
+            println!(
+                "Threat Family:          {}",
+                report.threat_family.as_deref().unwrap_or("None")
+            );
             println!("VM Profile:             {}", vm);
             println!("Containment Mode:       Air-Gapped Network Sinkhole");
             println!(
@@ -481,10 +502,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             for err in &scan_report.errors {
-                println!(
-                    "⚠️ [SCAN ACCESS ERROR]: {:?} -> {}",
-                    err.path, err.reason
-                );
+                println!("⚠️ [SCAN ACCESS ERROR]: {:?} -> {}", err.path, err.reason);
             }
 
             println!("\n===========================================================");
@@ -542,22 +560,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("   Sanitization Level:   {}", receipt.sanitization_level);
                     println!("   Media Type:           {}", receipt.media_type);
                     println!("   Original File Size:   {} bytes", receipt.file_size_bytes);
-                    println!("   Overwrites Completed: {} passes", receipt.passes_completed);
-                    println!("   MFT Scramble Cycles:  {} cycles", receipt.rename_cycles_completed);
+                    println!(
+                        "   Overwrites Completed: {} passes",
+                        receipt.passes_completed
+                    );
+                    println!(
+                        "   MFT Scramble Cycles:  {} cycles",
+                        receipt.rename_cycles_completed
+                    );
                     println!("   Hardware Flushed:     {}", receipt.flush_succeeded);
                     println!("   Verification Passed:  {}", receipt.verify_read_ok);
-                    println!("   Verification Hash:    SHA256[{}]", receipt.final_pass_sha256);
+                    println!(
+                        "   Verification Hash:    SHA256[{}]",
+                        receipt.final_pass_sha256
+                    );
                     if fill_free_space {
                         if let Some(dir) = parent_dir {
                             if let Ok(filled) = SecureShredder::fill_free_space(&dir, 0) {
-                                println!("   Free-Space Fill:      {} bytes (best-effort logical fill)", filled);
+                                println!(
+                                    "   Free-Space Fill:      {} bytes (best-effort logical fill)",
+                                    filled
+                                );
                             }
                         }
                     }
-                    println!(
-                        "\n✅ File {:?} overwritten, verified, and unlinked.",
-                        path
-                    );
+                    println!("\n✅ File {:?} overwritten, verified, and unlinked.", path);
                 }
                 Err(e) => {
                     println!("❌ Shredding failed: {}", e);
@@ -616,17 +643,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("===========================================================");
             println!("Policy ID:                   {}", policy.policy_id);
             println!("Policy Version:              {}", policy.version);
-            println!("Enforce USB Zero-Trust:      {}", policy.enforce_usb_zero_trust);
-            println!("Block Composite HID+Storage: {}", policy.block_composite_hid_storage);
-            println!("Require CDR for Documents:   {}", policy.require_cdr_for_documents);
-            println!("Max Sanitization File Size:  {} MB", policy.max_sanitization_file_size_mb);
-            println!("Allowed Hardware IDs:        {:?}", policy.allowed_hardware_ids);
+            println!(
+                "Enforce USB Zero-Trust:      {}",
+                policy.enforce_usb_zero_trust
+            );
+            println!(
+                "Block Composite HID+Storage: {}",
+                policy.block_composite_hid_storage
+            );
+            println!(
+                "Require CDR for Documents:   {}",
+                policy.require_cdr_for_documents
+            );
+            println!(
+                "Max Sanitization File Size:  {} MB",
+                policy.max_sanitization_file_size_mb
+            );
+            println!(
+                "Allowed Hardware IDs:        {:?}",
+                policy.allowed_hardware_ids
+            );
             println!("Enforcement Mode:            {}", policy.enforcement_mode);
 
             if let Some(out_path) = export {
                 let xml = mgr.export_oma_uri_profile_xml();
                 fs::write(&out_path, &xml)?;
-                println!("\n✅ Exported XML-escaped Intune OMA-URI profile to: {:?}", out_path);
+                println!(
+                    "\n✅ Exported XML-escaped Intune OMA-URI profile to: {:?}",
+                    out_path
+                );
             } else {
                 println!("\n💡 Tip: Use --export <PATH.xml> to save the deployment profile.");
             }
@@ -700,12 +745,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("\n===========================================================");
                 println!("         OMNICONNECT SENTINEL: QUARANTINE VAULT            ");
                 println!("===========================================================");
-                println!("KEK ID:      {} (Posture: {:?})", vault.kek_id(), vault.key_posture());
+                println!(
+                    "KEK ID:      {} (Posture: {:?})",
+                    vault.kek_id(),
+                    vault.key_posture()
+                );
                 println!("Total Items: {}\n", entries.len());
                 for e in entries {
                     println!(
                         "• [{}] {} ({} bytes, SHA256: {}, Status: {})",
-                        e.entry_id, e.original_path, e.original_size_bytes, e.original_sha256, e.recovery_status
+                        e.entry_id,
+                        e.original_path,
+                        e.original_size_bytes,
+                        e.original_sha256,
+                        e.recovery_status
                     );
                 }
             }
@@ -764,7 +817,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut ledger = AuditLedger::open(PathBuf::from(".sentinel_vault/audit.jsonl"));
             let _ = ledger.append_event(
                 "DEVICE_CONFIRMED_BY_USER",
-                &format!("Device {} authorized via physical user-presence challenge", device_id),
+                &format!(
+                    "Device {} authorized via physical user-presence challenge",
+                    device_id
+                ),
             );
             println!(
                 "✅ Physical user-presence challenge verified. Re-enabled USB device node: {}",
@@ -819,9 +875,7 @@ fn prompt_remediation(threat: &UniversalThreat, vault: &QuarantineVault) -> Resu
             let receipt = SecureShredder::shred_ntfs_stream(&threat.file_path, stream_name)?;
             println!(
                 "✅ [ADS STREAM ERADICATED]: {} ({} bytes overwritten, {}). Host file preserved!",
-                receipt.original_path,
-                receipt.file_size_bytes,
-                receipt.sanitization_level
+                receipt.original_path, receipt.file_size_bytes, receipt.sanitization_level
             );
         } else {
             println!("⚡ Executing NIST 800-88 Clear (logical) multi-pass shredding...");
@@ -831,9 +885,7 @@ fn prompt_remediation(threat: &UniversalThreat, vault: &QuarantineVault) -> Resu
             )?;
             println!(
                 "✅ [PERMANENTLY ERADICATED]: {} ({} bytes overwritten, {}).",
-                receipt.original_path,
-                receipt.file_size_bytes,
-                receipt.sanitization_level
+                receipt.original_path, receipt.file_size_bytes, receipt.sanitization_level
             );
         }
     } else if choice == "2" {
@@ -853,7 +905,9 @@ fn prompt_remediation(threat: &UniversalThreat, vault: &QuarantineVault) -> Resu
             )?
         };
         println!("✅ Quarantined to: {}", q.vault_file_path);
-        println!("✅ Source plaintext verified in vault and overwritten/unlinked via SecureShredder.");
+        println!(
+            "✅ Source plaintext verified in vault and overwritten/unlinked via SecureShredder."
+        );
     } else {
         println!("⚠️ Threat skipped per user request.");
     }
@@ -986,11 +1040,18 @@ pub fn is_valid_dashboard_launch_url(url: &str) -> bool {
     let tail = &rest[slash_idx..];
     !tail.chars().any(|c| {
         c.is_whitespace()
-            || matches!(c, '&' | '|' | ';' | '`' | '$' | '<' | '>' | '"' | '\'' | '(' | ')')
+            || matches!(
+                c,
+                '&' | '|' | ';' | '`' | '$' | '<' | '>' | '"' | '\'' | '(' | ')'
+            )
     })
 }
 
-fn with_security_headers(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> Response {
+fn with_security_headers(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> Response {
     let mut resp = http::Response::new(Body::from(body));
     *resp.status_mut() = status;
     let headers = resp.headers_mut();
@@ -1054,9 +1115,7 @@ fn check_bearer_auth(headers: &HeaderMap, expected_token: &str) -> Result<(), Re
 }
 
 fn check_csrf_header(headers: &HeaderMap, expected_token: &str) -> Result<(), Response> {
-    let csrf_str = headers
-        .get("x-sentinel-csrf")
-        .and_then(|v| v.to_str().ok());
+    let csrf_str = headers.get("x-sentinel-csrf").and_then(|v| v.to_str().ok());
     if !verify_csrf_token_constant_time(csrf_str, expected_token) {
         return Err(with_security_headers(
             StatusCode::FORBIDDEN,
@@ -1156,11 +1215,7 @@ async fn handle_api_status(
         .lock()
         .map(|g| g.clone())
         .unwrap_or_default();
-    let last_shred = state
-        .last_shred_receipt
-        .lock()
-        .ok()
-        .and_then(|g| g.clone());
+    let last_shred = state.last_shred_receipt.lock().ok().and_then(|g| g.clone());
 
     let status_json = serde_json::json!({
         "status": "ACTIVE",
@@ -1364,7 +1419,8 @@ async fn handle_api_shred(
         return with_security_headers(
             StatusCode::BAD_REQUEST,
             "application/json; charset=utf-8",
-            br#"{"error":"INVALID_SHRED_TARGET","message":"Missing path for shred operation"}"#.to_vec(),
+            br#"{"error":"INVALID_SHRED_TARGET","message":"Missing path for shred operation"}"#
+                .to_vec(),
         );
     };
 
@@ -1515,7 +1571,6 @@ async fn serve_dashboard_ui(port: u16, demo_mode: bool) -> Result<(), Box<dyn st
         .await?;
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {

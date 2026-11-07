@@ -99,4 +99,3 @@ impl TextCsvSanitizer {
             || cell.starts_with('\r')
     }
 }
-

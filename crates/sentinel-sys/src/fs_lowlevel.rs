@@ -262,7 +262,10 @@ pub fn ensure_not_symlink_or_reparse_point(path: &Path) -> io::Result<()> {
                 if is_reparse_point_or_symlink(&host_meta) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("Refusing operation: host path '{}' is a symlink or reparse point", host_str),
+                        format!(
+                            "Refusing operation: host path '{}' is a symlink or reparse point",
+                            host_str
+                        ),
                     ));
                 }
             }
@@ -274,7 +277,10 @@ pub fn ensure_not_symlink_or_reparse_point(path: &Path) -> io::Result<()> {
         if is_reparse_point_or_symlink(&meta) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Refusing operation: '{}' is a symlink or reparse point", path.display()),
+                format!(
+                    "Refusing operation: '{}' is a symlink or reparse point",
+                    path.display()
+                ),
             ));
         }
     }
@@ -282,7 +288,10 @@ pub fn ensure_not_symlink_or_reparse_point(path: &Path) -> io::Result<()> {
         if is_reparse_point_or_symlink(&meta) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Refusing operation: '{}' is a symlink or reparse point", path.display()),
+                format!(
+                    "Refusing operation: '{}' is a symlink or reparse point",
+                    path.display()
+                ),
             ));
         }
     }
@@ -500,7 +509,10 @@ pub fn query_sector_alignment_for_path(path: &Path, fallback_file: Option<&File>
 }
 
 /// Classifies media type from seek-penalty and USB bus properties.
-pub fn classify_media_characteristics(is_usb_bus: bool, incurs_seek_penalty: Option<bool>) -> MediaType {
+pub fn classify_media_characteristics(
+    is_usb_bus: bool,
+    incurs_seek_penalty: Option<bool>,
+) -> MediaType {
     if is_usb_bus {
         return MediaType::UsbFlash;
     }
@@ -593,7 +605,8 @@ pub fn query_media_type(path: &Path) -> MediaType {
                         core::ptr::null_mut(),
                     )
                 };
-                if ok_dev != 0 && (dev_hdr.bus_type == BUS_TYPE_USB || dev_hdr.removable_media != 0) {
+                if ok_dev != 0 && (dev_hdr.bus_type == BUS_TYPE_USB || dev_hdr.removable_media != 0)
+                {
                     is_usb = true;
                 }
 
@@ -864,10 +877,7 @@ pub fn enumerate_ntfs_ads(path: &Path) -> Vec<(String, u64)> {
                 }
 
                 if unsafe {
-                    FindNextStreamW(
-                        handle,
-                        &mut stream_data as *mut _ as *mut core::ffi::c_void,
-                    )
+                    FindNextStreamW(handle, &mut stream_data as *mut _ as *mut core::ffi::c_void)
                 } == 0
                 {
                     break;
@@ -979,10 +989,8 @@ impl Drop for ProjFsInstanceHandle {
                 }
                 type PrjStopVirtualizingFn = unsafe extern "system" fn(isize);
                 unsafe {
-                    let proc_addr = GetProcAddress(
-                        self.lib_handle,
-                        b"PrjStopVirtualizing\0".as_ptr(),
-                    );
+                    let proc_addr =
+                        GetProcAddress(self.lib_handle, b"PrjStopVirtualizing\0".as_ptr());
                     if proc_addr != 0 {
                         let stop_fn: PrjStopVirtualizingFn = core::mem::transmute(proc_addr);
                         stop_fn(self.namespace_ctx);
@@ -1029,12 +1037,8 @@ struct PrjCallbacks {
         unsafe extern "system" fn(*const PrjCallbackData, *const PrjGuid) -> i32,
     end_directory_enumeration_cb:
         unsafe extern "system" fn(*const PrjCallbackData, *const PrjGuid) -> i32,
-    get_directory_enumeration_cb: unsafe extern "system" fn(
-        *const PrjCallbackData,
-        *const PrjGuid,
-        *const u16,
-        isize,
-    ) -> i32,
+    get_directory_enumeration_cb:
+        unsafe extern "system" fn(*const PrjCallbackData, *const PrjGuid, *const u16, isize) -> i32,
     get_placeholder_info_cb: unsafe extern "system" fn(*const PrjCallbackData) -> i32,
     get_file_data_cb: unsafe extern "system" fn(*const PrjCallbackData, u64, u32) -> i32,
     query_file_name_cb: usize,
@@ -1122,15 +1126,11 @@ pub fn is_projfs_available() -> bool {
         if h_lib == 0 {
             return false;
         }
-        let has_start =
-            unsafe { GetProcAddress(h_lib, b"PrjStartVirtualizing\0".as_ptr()) != 0 };
-        let has_stop =
-            unsafe { GetProcAddress(h_lib, b"PrjStopVirtualizing\0".as_ptr()) != 0 };
-        let has_write =
-            unsafe { GetProcAddress(h_lib, b"PrjWriteFileData\0".as_ptr()) != 0 };
-        let has_mark = unsafe {
-            GetProcAddress(h_lib, b"PrjMarkDirectoryAsPlaceholder\0".as_ptr()) != 0
-        };
+        let has_start = unsafe { GetProcAddress(h_lib, b"PrjStartVirtualizing\0".as_ptr()) != 0 };
+        let has_stop = unsafe { GetProcAddress(h_lib, b"PrjStopVirtualizing\0".as_ptr()) != 0 };
+        let has_write = unsafe { GetProcAddress(h_lib, b"PrjWriteFileData\0".as_ptr()) != 0 };
+        let has_mark =
+            unsafe { GetProcAddress(h_lib, b"PrjMarkDirectoryAsPlaceholder\0".as_ptr()) != 0 };
         unsafe {
             let _ = FreeLibrary(h_lib);
         }
@@ -1181,11 +1181,9 @@ pub fn prj_start_virtualizing_root(root_path: &Path) -> io::Result<ProjFsInstanc
             ));
         }
 
-        let mark_addr = unsafe {
-            GetProcAddress(h_lib, b"PrjMarkDirectoryAsPlaceholder\0".as_ptr())
-        };
-        let start_addr =
-            unsafe { GetProcAddress(h_lib, b"PrjStartVirtualizing\0".as_ptr()) };
+        let mark_addr =
+            unsafe { GetProcAddress(h_lib, b"PrjMarkDirectoryAsPlaceholder\0".as_ptr()) };
+        let start_addr = unsafe { GetProcAddress(h_lib, b"PrjStartVirtualizing\0".as_ptr()) };
         if mark_addr == 0 || start_addr == 0 {
             unsafe {
                 let _ = FreeLibrary(h_lib);
@@ -1196,10 +1194,8 @@ pub fn prj_start_virtualizing_root(root_path: &Path) -> io::Result<ProjFsInstanc
             ));
         }
 
-        let mark_fn: PrjMarkDirectoryAsPlaceholderFn =
-            unsafe { core::mem::transmute(mark_addr) };
-        let start_fn: PrjStartVirtualizingFn =
-            unsafe { core::mem::transmute(start_addr) };
+        let mark_fn: PrjMarkDirectoryAsPlaceholderFn = unsafe { core::mem::transmute(mark_addr) };
+        let start_fn: PrjStartVirtualizingFn = unsafe { core::mem::transmute(start_addr) };
 
         let root_wide: Vec<u16> = root_path.as_os_str().encode_wide().chain(Some(0)).collect();
         let instance_guid = PrjGuid {
@@ -1294,16 +1290,10 @@ pub fn prj_write_file_data(
             fn GetProcAddress(h_module: isize, lp_proc_name: *const u8) -> isize;
             fn FreeLibrary(h_lib_module: isize) -> i32;
         }
-        type PrjAllocateAlignedBufferFn =
-            unsafe extern "system" fn(isize, usize) -> *mut u8;
+        type PrjAllocateAlignedBufferFn = unsafe extern "system" fn(isize, usize) -> *mut u8;
         type PrjFreeAlignedBufferFn = unsafe extern "system" fn(*mut u8);
-        type PrjWriteFileDataFn = unsafe extern "system" fn(
-            isize,
-            *const PrjGuid,
-            *const u8,
-            u64,
-            u32,
-        ) -> i32;
+        type PrjWriteFileDataFn =
+            unsafe extern "system" fn(isize, *const PrjGuid, *const u8, u64, u32) -> i32;
 
         if namespace_ctx == 0 {
             return Err(io::Error::new(
@@ -1324,13 +1314,9 @@ pub fn prj_write_file_data(
             ));
         }
 
-        let alloc_addr = unsafe {
-            GetProcAddress(h_lib, b"PrjAllocateAlignedBuffer\0".as_ptr())
-        };
-        let free_addr =
-            unsafe { GetProcAddress(h_lib, b"PrjFreeAlignedBuffer\0".as_ptr()) };
-        let write_addr =
-            unsafe { GetProcAddress(h_lib, b"PrjWriteFileData\0".as_ptr()) };
+        let alloc_addr = unsafe { GetProcAddress(h_lib, b"PrjAllocateAlignedBuffer\0".as_ptr()) };
+        let free_addr = unsafe { GetProcAddress(h_lib, b"PrjFreeAlignedBuffer\0".as_ptr()) };
+        let write_addr = unsafe { GetProcAddress(h_lib, b"PrjWriteFileData\0".as_ptr()) };
 
         if alloc_addr == 0 || free_addr == 0 || write_addr == 0 {
             unsafe {
@@ -1342,12 +1328,9 @@ pub fn prj_write_file_data(
             ));
         }
 
-        let alloc_fn: PrjAllocateAlignedBufferFn =
-            unsafe { core::mem::transmute(alloc_addr) };
-        let free_fn: PrjFreeAlignedBufferFn =
-            unsafe { core::mem::transmute(free_addr) };
-        let write_fn: PrjWriteFileDataFn =
-            unsafe { core::mem::transmute(write_addr) };
+        let alloc_fn: PrjAllocateAlignedBufferFn = unsafe { core::mem::transmute(alloc_addr) };
+        let free_fn: PrjFreeAlignedBufferFn = unsafe { core::mem::transmute(free_addr) };
+        let write_fn: PrjWriteFileDataFn = unsafe { core::mem::transmute(write_addr) };
 
         let buf_len = data.len().max(1);
         let aligned_ptr = unsafe { alloc_fn(namespace_ctx, buf_len) };

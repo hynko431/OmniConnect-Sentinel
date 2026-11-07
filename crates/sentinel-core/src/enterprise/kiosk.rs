@@ -1,12 +1,12 @@
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::{Path, PathBuf};
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Key, Nonce,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -286,10 +286,10 @@ impl KioskEnforcer {
     /// Decrypts a kiosk session file written by `write_encrypted_session_file` using the active
     /// session's `ZeroizingBytes<32>` AES-256-GCM key (`Row 65`).
     pub fn read_encrypted_session_file(&self, relative_path: &Path) -> Result<Vec<u8>, String> {
-        let session_key = self
-            .active_session_key
-            .as_ref()
-            .ok_or_else(|| "Cannot decrypt kiosk file: session key has been destroyed or no active session".to_string())?;
+        let session_key = self.active_session_key.as_ref().ok_or_else(|| {
+            "Cannot decrypt kiosk file: session key has been destroyed or no active session"
+                .to_string()
+        })?;
 
         let in_path = self.session_dir.join(relative_path);
         let payload = fs::read(&in_path).map_err(|e| {
@@ -411,11 +411,7 @@ impl KioskEnforcer {
                         wiped_files_count += 1;
                     }
                     Err(e) => {
-                        warn!(
-                            "Kiosk SecureShredder error for '{}': {}",
-                            path.display(),
-                            e
-                        );
+                        warn!("Kiosk SecureShredder error for '{}': {}", path.display(), e);
                         wipe_errors.push(format!("Shred failed for '{}': {}", path.display(), e));
                     }
                 }

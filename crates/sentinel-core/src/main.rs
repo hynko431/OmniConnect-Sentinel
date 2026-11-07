@@ -54,9 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = sentinel_sys::apply_autoplay_suppression_policy() {
         warn!("Startup apply_autoplay_suppression_policy failed: {}", e);
     }
-    if let Err(e) = sentinel_sys::apply_usb_storage_and_install_policies(
-        &intune_policy.allowed_hardware_ids,
-    ) {
+    if let Err(e) =
+        sentinel_sys::apply_usb_storage_and_install_policies(&intune_policy.allowed_hardware_ids)
+    {
         warn!(
             "Startup apply_usb_storage_and_install_policies failed: {}",
             e
@@ -355,7 +355,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     let _ = audit_ledger.append_event(
         "AGENT_SHUTDOWN",
-        &format!("Node {} shutting down; session cache crypto-erased", config.node_id),
+        &format!(
+            "Node {} shutting down; session cache crypto-erased",
+            config.node_id
+        ),
     );
 
     Ok(())

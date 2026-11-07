@@ -1,6 +1,6 @@
-use std::io::{Cursor, Write};
 use image::{ImageBuffer, Rgb};
 use lopdf::{dictionary, Document, Object, Stream};
+use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
@@ -47,8 +47,11 @@ fn test_fuzz_image_polyglot_truncation() {
 
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(4, 4, Rgb([255, 0, 0]));
     let mut valid_png_bytes = Vec::new();
-    img.write_to(&mut Cursor::new(&mut valid_png_bytes), image::ImageFormat::Png)
-        .expect("PNG encoding should succeed");
+    img.write_to(
+        &mut Cursor::new(&mut valid_png_bytes),
+        image::ImageFormat::Png,
+    )
+    .expect("PNG encoding should succeed");
 
     let overlay_shellcode = b"MALICIOUS_OVERLAY_SHELLCODE_VIRUS_PAYLOAD";
     valid_png_bytes.extend_from_slice(overlay_shellcode);
@@ -303,11 +306,7 @@ fn test_pdf_preserves_transparency_and_dests_while_stripping_js_and_inline_annot
     assert!(report.was_modified);
 
     let clean_doc = Document::load_mem(&clean_pdf).expect("Sanitized PDF must be valid");
-    let clean_page = clean_doc
-        .get_object(page_id)
-        .unwrap()
-        .as_dict()
-        .unwrap();
+    let clean_page = clean_doc.get_object(page_id).unwrap().as_dict().unwrap();
 
     // Verify /Group << /S /Transparency >> survived intact
     let group_dict = clean_page.get(b"Group").unwrap().as_dict().unwrap();
@@ -317,11 +316,7 @@ fn test_pdf_preserves_transparency_and_dests_while_stripping_js_and_inline_annot
     );
 
     // Verify /Dests survived in Catalog while /OpenAction was removed
-    let clean_catalog = clean_doc
-        .get_object(catalog_id)
-        .unwrap()
-        .as_dict()
-        .unwrap();
+    let clean_catalog = clean_doc.get_object(catalog_id).unwrap().as_dict().unwrap();
     assert!(
         clean_catalog.get(b"Dests").is_ok(),
         "Legitimate /Dests table must be preserved"
@@ -445,9 +440,12 @@ fn test_svg_and_csv_and_text_sanitizers() {
     cfb[512..516].copy_from_slice(&0xFFFF_FFFDu32.to_le_bytes()); // Sec 0 = FATSECT
     cfb[516..520].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes()); // Sec 1 = Directory ENDOFCHAIN
     cfb[520..524].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes()); // Sec 2 = Stream ENDOFCHAIN
-    // Sector 1 (offset 1024..1536): Directory entry 0 = "_VBA_PROJECT" stream at Sector 2, size 4096
+                                                                  // Sector 1 (offset 1024..1536): Directory entry 0 = "_VBA_PROJECT" stream at Sector 2, size 4096
     let dir_off = 1024;
-    let name_utf16: Vec<u16> = "_VBA_PROJECT".encode_utf16().chain(std::iter::once(0)).collect();
+    let name_utf16: Vec<u16> = "_VBA_PROJECT"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     for (i, ch) in name_utf16.iter().enumerate() {
         cfb[dir_off + i * 2..dir_off + i * 2 + 2].copy_from_slice(&ch.to_le_bytes());
     }
@@ -460,7 +458,9 @@ fn test_svg_and_csv_and_text_sanitizers() {
     cfb[1536..1536 + vba_payload.len()].copy_from_slice(vba_payload);
 
     assert!(
-        engine.sanitize_with_hint(&cfb, "legacy.doc", &default_policy).is_err(),
+        engine
+            .sanitize_with_hint(&cfb, "legacy.doc", &default_policy)
+            .is_err(),
         "Default policy must reject legacy OLE2 (`allow_legacy_ole2 = false`)"
     );
     let mut ole_policy = SanitizationPolicy::default();
@@ -627,7 +627,9 @@ fn large_pptx_macros_removed() {
         let stored_opts =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
-        writer.start_file("[Content_Types].xml", deflate_opts).unwrap();
+        writer
+            .start_file("[Content_Types].xml", deflate_opts)
+            .unwrap();
         writer
             .write_all(
                 br#"<?xml version="1.0" encoding="UTF-8"?>
@@ -641,7 +643,9 @@ fn large_pptx_macros_removed() {
             )
             .unwrap();
 
-        writer.start_file("ppt/presentation.xml", deflate_opts).unwrap();
+        writer
+            .start_file("ppt/presentation.xml", deflate_opts)
+            .unwrap();
         writer
             .write_all(
                 br#"<?xml version="1.0" encoding="UTF-8"?>
@@ -830,8 +834,11 @@ fn rels_quote_variants() {
     );
 
     let mut doc_xml = String::new();
-    std::io::Read::read_to_string(&mut archive.by_name("word/document.xml").unwrap(), &mut doc_xml)
-        .unwrap();
+    std::io::Read::read_to_string(
+        &mut archive.by_name("word/document.xml").unwrap(),
+        &mut doc_xml,
+    )
+    .unwrap();
     assert!(
         !doc_xml.contains("rId3"),
         "Dangling r:id=\"rId3\" reference to stripped external relationship must be removed (`Row 115`)"
@@ -1172,8 +1179,15 @@ fn test_cdr_output_oracles_pdf_ooxml_and_image_roundtrips() {
 
     let (clean_pdf, _) = engine.sanitize(&dirty_pdf).unwrap();
     let parsed_pdf = Document::load_mem(&clean_pdf).expect("PDF output oracle: must load cleanly");
-    assert!(parsed_pdf.catalog().is_ok(), "PDF output oracle: Catalog must be valid");
-    assert_eq!(parsed_pdf.get_pages().len(), 1, "PDF output oracle: Page tree must be intact");
+    assert!(
+        parsed_pdf.catalog().is_ok(),
+        "PDF output oracle: Catalog must be valid"
+    );
+    assert_eq!(
+        parsed_pdf.get_pages().len(),
+        1,
+        "PDF output oracle: Page tree must be intact"
+    );
 
     // 2. Image round-trip oracle (PNG & JPEG)
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(6, 6, Rgb([12, 200, 90]));

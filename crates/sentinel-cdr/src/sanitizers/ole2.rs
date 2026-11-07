@@ -62,10 +62,8 @@ impl Ole2Sanitizer {
         };
         let mini_stream_cutoff =
             u32::from_le_bytes([input[56], input[57], input[58], input[59]]) as u64;
-        let first_minifat_sec =
-            u32::from_le_bytes([input[60], input[61], input[62], input[63]]);
-        let first_difat_sec =
-            u32::from_le_bytes([input[68], input[69], input[70], input[71]]);
+        let first_minifat_sec = u32::from_le_bytes([input[60], input[61], input[62], input[63]]);
+        let first_difat_sec = u32::from_le_bytes([input[68], input[69], input[70], input[71]]);
         let num_difat_secs =
             u32::from_le_bytes([input[72], input[73], input[74], input[75]]) as usize;
 
@@ -73,7 +71,8 @@ impl Ole2Sanitizer {
         let mut reports = Vec::new();
 
         // 1. Collect FAT sector IDs from header DIFAT[0..109] and any chained DIFAT sectors
-        let fat_sector_ids = Self::collect_fat_sectors(&output, sector_size, first_difat_sec, num_difat_secs);
+        let fat_sector_ids =
+            Self::collect_fat_sectors(&output, sector_size, first_difat_sec, num_difat_secs);
 
         // 2. Locate Root Entry (obj_type == 5) to resolve MiniStream sectors if needed
         let mut root_start_sec = ENDOFCHAIN;
@@ -279,7 +278,8 @@ impl Ole2Sanitizer {
     ) -> Vec<u32> {
         let mut fat_secs = Vec::new();
         for off in (76..512).step_by(4) {
-            let s = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+            let s =
+                u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
             if s < DIFSECT {
                 fat_secs.push(s);
             }
@@ -368,7 +368,8 @@ impl Ole2Sanitizer {
             let Some(&table_sec_id) = fat_sector_ids.get(table_sec_idx) else {
                 break;
             };
-            let Some(sec_base) = Self::sector_offset(table_sec_id, sector_size, output.len()) else {
+            let Some(sec_base) = Self::sector_offset(table_sec_id, sector_size, output.len())
+            else {
                 break;
             };
             let entry_offset = sec_base + slot_in_sec * 4;
@@ -397,7 +398,8 @@ impl Ole2Sanitizer {
             if let Some(sec_off) = Self::sector_offset(curr, sector_size, output.len()) {
                 output[sec_off..sec_off + sector_size].fill(0);
             }
-            match Self::read_and_clear_table_entry(output, fat_sector_ids, sector_size, curr, true) {
+            match Self::read_and_clear_table_entry(output, fat_sector_ids, sector_size, curr, true)
+            {
                 Some(next) if next < DIFSECT && next != FATSECT => curr = next,
                 _ => break,
             }
@@ -442,4 +444,3 @@ impl Ole2Sanitizer {
         }
     }
 }
-

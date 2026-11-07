@@ -266,10 +266,8 @@ impl ContentDisarmService for CdrGrpcService {
 
                     let was_modified = outcome.original_sha256 != outcome.sanitized_sha256
                         || !outcome.disarm_report.is_empty();
-                    let orig_sha_bytes =
-                        hex::decode(&outcome.original_sha256).unwrap_or_default();
-                    let san_sha_bytes =
-                        hex::decode(&outcome.sanitized_sha256).unwrap_or_default();
+                    let orig_sha_bytes = hex::decode(&outcome.original_sha256).unwrap_or_default();
+                    let san_sha_bytes = hex::decode(&outcome.sanitized_sha256).unwrap_or_default();
 
                     let summary_elements: Vec<SanitizedElement> = outcome
                         .disarm_report

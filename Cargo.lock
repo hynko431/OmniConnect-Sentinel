@@ -1382,7 +1382,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
- "chrono",
  "crc32fast",
  "hex",
  "image",
@@ -1392,7 +1391,6 @@ dependencies = [
  "sentinel-proto",
  "sentinel-sys",
  "serde",
- "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
@@ -1417,7 +1415,6 @@ dependencies = [
  "hyper",
  "sentinel-cdr",
  "sentinel-core",
- "sentinel-proto",
  "sentinel-sys",
  "serde",
  "serde_json",
@@ -1428,7 +1425,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "walkdir",
 ]
 
 [[package]]
@@ -1452,8 +1448,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-stream",
- "tonic",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1465,10 +1459,8 @@ dependencies = [
 name = "sentinel-proto"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "prost",
  "prost-build",
- "prost-types",
  "tonic",
  "tonic-build",
 ]
@@ -1480,7 +1472,6 @@ dependencies = [
  "libc",
  "serde",
  "sha2",
- "thiserror",
  "tracing",
  "windows-sys 0.61.2",
 ]

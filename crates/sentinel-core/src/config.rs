@@ -47,14 +47,12 @@ impl Default for SentinelConfig {
             auto_sanitize_removable_media: true,
             charge_only_fallback_enabled: true,
             telemetry_reporting_enabled: true,
-            hardware_whitelist: vec![
-                HardwareIdentifier {
-                    vendor_id: 0x0781, // SanDisk Enterprise Token
-                    product_id: 0x5583,
-                    serial_number: None,
-                    friendly_name: "Corporate Encrypted Hardware Key".to_string(),
-                },
-            ],
+            hardware_whitelist: vec![HardwareIdentifier {
+                vendor_id: 0x0781, // SanDisk Enterprise Token
+                product_id: 0x5583,
+                serial_number: None,
+                friendly_name: "Corporate Encrypted Hardware Key".to_string(),
+            }],
         }
     }
 }
