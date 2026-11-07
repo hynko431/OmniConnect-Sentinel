@@ -1073,55 +1073,55 @@ fn with_security_headers(
     resp.into_response()
 }
 
-fn check_host_and_origin(headers: &HeaderMap, port: u16) -> Result<(), Response> {
+fn check_host_and_origin(headers: &HeaderMap, port: u16) -> Result<(), Box<Response>> {
     let Some(host_val) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
-        return Err(with_security_headers(
+        return Err(Box::new(with_security_headers(
             StatusCode::FORBIDDEN,
             "text/plain; charset=utf-8",
             b"Forbidden: Missing Host Header".to_vec(),
-        ));
+        )));
     };
     if !is_valid_local_host_header(host_val, port) {
-        return Err(with_security_headers(
+        return Err(Box::new(with_security_headers(
             StatusCode::FORBIDDEN,
             "text/plain; charset=utf-8",
             b"Forbidden: Invalid Host Header (DNS Rebinding Blocked)".to_vec(),
-        ));
+        )));
     }
     if let Some(origin_val) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         if !is_valid_local_origin_header(origin_val, port) {
-            return Err(with_security_headers(
+            return Err(Box::new(with_security_headers(
                 StatusCode::FORBIDDEN,
                 "text/plain; charset=utf-8",
                 b"Forbidden: Cross-Origin Request Blocked".to_vec(),
-            ));
+            )));
         }
     }
     Ok(())
 }
 
-fn check_bearer_auth(headers: &HeaderMap, expected_token: &str) -> Result<(), Response> {
+fn check_bearer_auth(headers: &HeaderMap, expected_token: &str) -> Result<(), Box<Response>> {
     let auth_str = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     if !verify_bearer_token_constant_time(auth_str, expected_token) {
-        return Err(with_security_headers(
+        return Err(Box::new(with_security_headers(
             StatusCode::UNAUTHORIZED,
             "application/json; charset=utf-8",
             br#"{"error":"UNAUTHORIZED","message":"Missing or invalid Authorization: Bearer token"}"#.to_vec(),
-        ));
+        )));
     }
     Ok(())
 }
 
-fn check_csrf_header(headers: &HeaderMap, expected_token: &str) -> Result<(), Response> {
+fn check_csrf_header(headers: &HeaderMap, expected_token: &str) -> Result<(), Box<Response>> {
     let csrf_str = headers.get("x-sentinel-csrf").and_then(|v| v.to_str().ok());
     if !verify_csrf_token_constant_time(csrf_str, expected_token) {
-        return Err(with_security_headers(
+        return Err(Box::new(with_security_headers(
             StatusCode::FORBIDDEN,
             "application/json; charset=utf-8",
             br#"{"error":"CSRF_VALIDATION_FAILED","message":"Missing or invalid X-Sentinel-CSRF header"}"#.to_vec(),
-        ));
+        )));
     }
     Ok(())
 }
@@ -1131,7 +1131,7 @@ async fn handle_index(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
-        return resp;
+        return *resp;
     }
     let raw_html = fs::read_to_string(state.dashboard_dir.join("index.html")).unwrap_or_default();
     let hydrated_html = raw_html.replace(
@@ -1153,7 +1153,7 @@ async fn handle_style(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
-        return resp;
+        return *resp;
     }
     let bytes = fs::read(state.dashboard_dir.join("style.css"))
         .or_else(|_| fs::read(state.dashboard_dir.join("styles.css")))
@@ -1166,7 +1166,7 @@ async fn handle_app_js(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
-        return resp;
+        return *resp;
     }
     let bytes = fs::read(state.dashboard_dir.join("app.js")).unwrap_or_default();
     with_security_headers(
@@ -1181,10 +1181,10 @@ async fn handle_api_status(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
-        return resp;
+        return *resp;
     }
     if let Err(resp) = check_bearer_auth(&headers, &state.session_token) {
-        return resp;
+        return *resp;
     }
 
     let posture = verify_system_posture();
@@ -1264,10 +1264,10 @@ async fn handle_api_ws(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
-        return resp;
+        return *resp;
     }
     if let Err(resp) = check_bearer_auth(&headers, &state.session_token) {
-        return resp;
+        return *resp;
     }
 
     let events: Vec<serde_json::Value> = state
@@ -1320,13 +1320,13 @@ async fn handle_api_scan(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
-        return resp;
+        return *resp;
     }
     if let Err(resp) = check_bearer_auth(&headers, &state.session_token) {
-        return resp;
+        return *resp;
     }
     if let Err(resp) = check_csrf_header(&headers, &state.session_token) {
-        return resp;
+        return *resp;
     }
 
     let req: ScanApiRequest = serde_json::from_slice(&body).unwrap_or_default();
@@ -1387,13 +1387,13 @@ async fn handle_api_shred(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
-        return resp;
+        return *resp;
     }
     if let Err(resp) = check_bearer_auth(&headers, &state.session_token) {
-        return resp;
+        return *resp;
     }
     if let Err(resp) = check_csrf_header(&headers, &state.session_token) {
-        return resp;
+        return *resp;
     }
 
     let req: ShredApiRequest = serde_json::from_slice(&body).unwrap_or_default();
@@ -1467,10 +1467,10 @@ async fn handle_api_metrics(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
-        return resp;
+        return *resp;
     }
     if let Err(resp) = check_bearer_auth(&headers, &state.session_token) {
-        return resp;
+        return *resp;
     }
 
     let posture = verify_system_posture();
@@ -1488,7 +1488,7 @@ async fn handle_not_found(
     _req: Request<Body>,
 ) -> impl IntoResponse {
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
-        return resp;
+        return *resp;
     }
     with_security_headers(
         StatusCode::NOT_FOUND,
@@ -1566,9 +1566,8 @@ async fn serve_dashboard_ui(port: u16, demo_mode: bool) -> Result<(), Box<dyn st
     ));
     let app = build_dashboard_router(state);
 
-    hyper::Server::from_tcp(std_listener)?
-        .serve(app.into_make_service())
-        .await?;
+    let listener = tokio::net::TcpListener::from_std(std_listener)?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
@@ -1687,7 +1686,7 @@ mod tests {
             .await
             .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
         assert_eq!(resp_metrics.status(), StatusCode::OK);
-        let body_bytes = hyper::body::to_bytes(resp_metrics.into_body())
+        let body_bytes = axum::body::to_bytes(resp_metrics.into_body(), 1024 * 1024)
             .await
             .unwrap_or_default();
         let prom_text = String::from_utf8_lossy(&body_bytes);

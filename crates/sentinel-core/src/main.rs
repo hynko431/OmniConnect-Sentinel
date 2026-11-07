@@ -140,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 7. 60-Second Health Beacon & Fail-Closed Mount Posture Reconciliation Timer (Phase 0.1 & Phase 4.5)
     let mut reconcile_interval = tokio::time::interval(Duration::from_secs(60));
+    reconcile_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     reconcile_interval.tick().await; // consume initial tick
 
     info!("Sentinel Agent running. Zero BSOD risk: 100% userspace execution.");

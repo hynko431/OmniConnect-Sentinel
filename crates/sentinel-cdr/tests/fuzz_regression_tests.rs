@@ -1778,3 +1778,85 @@ fn test_zip_symlink_suid_and_traversal_entries_rejected_rustsec_2026_0367_0368_0
         spoof_err
     );
 }
+
+#[tokio::test]
+async fn test_grpc_stream_empty_chunk_flood_rejected_rustsec_2026_0258() {
+    use sentinel_cdr::service::{
+        CdrGrpcService, MAX_CONSECUTIVE_EMPTY_CHUNKS, MAX_STREAM_FRAMES_PER_SESSION,
+    };
+    use sentinel_proto::{disarm_request, disarm_response, DisarmMetadata, DisarmRequest};
+    use tokio_stream::StreamExt;
+
+    let service = CdrGrpcService::new(SanitizationPolicy::default());
+    let _hardened_server = service.into_hardened_server();
+
+    // 1. Consecutive empty ChunkData frames (> MAX_CONSECUTIVE_EMPTY_CHUNKS = 4) must be rejected
+    //    with EMPTY_DATA_FRAME_FLOOD
+    let service = CdrGrpcService::new(SanitizationPolicy::default());
+    let mut empty_flood_frames = vec![Ok(DisarmRequest {
+        payload: Some(disarm_request::Payload::Metadata(DisarmMetadata {
+            session_id: "sess-empty-flood".to_string(),
+            file_name: "test.txt".to_string(),
+            declared_format: FileFormatType::FormatTxt as i32,
+            total_size_bytes: 16,
+            policy: None,
+        })),
+    })];
+    for _ in 0..=MAX_CONSECUTIVE_EMPTY_CHUNKS {
+        empty_flood_frames.push(Ok(DisarmRequest {
+            payload: Some(disarm_request::Payload::ChunkData(Vec::new())),
+        }));
+    }
+    let mut out_stream = service.spawn_stream_disarm(tokio_stream::iter(empty_flood_frames));
+    let first_resp = out_stream
+        .next()
+        .await
+        .expect("Stream must yield error response on empty frame flood")
+        .expect("gRPC status should be Ok wrapping DisarmError");
+    match first_resp.result {
+        Some(disarm_response::Result::Error(err)) => {
+            assert_eq!(err.code, "EMPTY_DATA_FRAME_FLOOD");
+            assert!(err.message.contains("RUSTSEC-2026-0258"));
+            assert!(!err.recoverable);
+        }
+        other => panic!(
+            "Expected DisarmError(EMPTY_DATA_FRAME_FLOOD), got: {:?}",
+            other
+        ),
+    }
+
+    // 2. Excessive total frames (> MAX_STREAM_FRAMES_PER_SESSION = 4096) with 1-byte chunks
+    //    must be rejected with STREAM_FRAME_FLOOD_DETECTED
+    let mut frame_flood_frames = Vec::with_capacity(MAX_STREAM_FRAMES_PER_SESSION + 2);
+    frame_flood_frames.push(Ok(DisarmRequest {
+        payload: Some(disarm_request::Payload::Metadata(DisarmMetadata {
+            session_id: "sess-frame-flood".to_string(),
+            file_name: "flood.txt".to_string(),
+            declared_format: FileFormatType::FormatTxt as i32,
+            total_size_bytes: (MAX_STREAM_FRAMES_PER_SESSION + 10) as u64,
+            policy: None,
+        })),
+    }));
+    for _ in 0..=MAX_STREAM_FRAMES_PER_SESSION {
+        frame_flood_frames.push(Ok(DisarmRequest {
+            payload: Some(disarm_request::Payload::ChunkData(vec![b'A'])),
+        }));
+    }
+    let mut out_stream2 = service.spawn_stream_disarm(tokio_stream::iter(frame_flood_frames));
+    let second_resp = out_stream2
+        .next()
+        .await
+        .expect("Stream must yield error response on frame flood")
+        .expect("gRPC status should be Ok wrapping DisarmError");
+    match second_resp.result {
+        Some(disarm_response::Result::Error(err)) => {
+            assert_eq!(err.code, "STREAM_FRAME_FLOOD_DETECTED");
+            assert!(err.message.contains("RUSTSEC-2026-0258"));
+            assert!(!err.recoverable);
+        }
+        other => panic!(
+            "Expected DisarmError(STREAM_FRAME_FLOOD_DETECTED), got: {:?}",
+            other
+        ),
+    }
+}

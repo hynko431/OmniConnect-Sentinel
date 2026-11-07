@@ -6,7 +6,9 @@ use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, warn};
 
-use sentinel_proto::content_disarm_service_server::ContentDisarmService;
+use sentinel_proto::content_disarm_service_server::{
+    ContentDisarmService, ContentDisarmServiceServer,
+};
 use sentinel_proto::{
     disarm_request, disarm_response, DisarmError, DisarmRequest, DisarmResponse, FileFormatType,
     HealthCheckRequest, HealthCheckResponse, InspectRequest, InspectResponse, SanitizationSummary,
@@ -16,6 +18,15 @@ use sentinel_proto::{
 use crate::engine::{CdrEngine, DetectedFormat};
 use crate::policy::SanitizationPolicy;
 use crate::worker::{WorkerLauncher, WorkerRequest};
+
+/// Maximum number of gRPC frames permitted in a single `StreamDisarm` session (`RUSTSEC-2026-0258` mitigation).
+pub const MAX_STREAM_FRAMES_PER_SESSION: usize = 4_096;
+
+/// Maximum number of consecutive empty `ChunkData` / empty-payload frames permitted (`RUSTSEC-2026-0258` mitigation).
+pub const MAX_CONSECUTIVE_EMPTY_CHUNKS: usize = 4;
+
+/// Maximum decoded/encoded gRPC message size (16 MiB).
+pub const MAX_GRPC_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// RAII Session Guard (`BUG-CDR-01`)
 ///
@@ -72,6 +83,13 @@ impl CdrGrpcService {
             .max(WorkerLauncher::processed_ok_count())
     }
 
+    /// Wraps this service in a `ContentDisarmServiceServer` with hardened decoding/encoding message size limits.
+    pub fn into_hardened_server(self) -> ContentDisarmServiceServer<Self> {
+        ContentDisarmServiceServer::new(self)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+    }
+
     fn map_detected_format(fmt: DetectedFormat) -> i32 {
         match fmt {
             DetectedFormat::Pdf => FileFormatType::FormatPdf as i32,
@@ -89,18 +107,14 @@ impl CdrGrpcService {
             DetectedFormat::Unknown => FileFormatType::FormatUnknown as i32,
         }
     }
-}
 
-#[tonic::async_trait]
-impl ContentDisarmService for CdrGrpcService {
-    type StreamDisarmStream =
-        Pin<Box<dyn Stream<Item = Result<DisarmResponse, Status>> + Send + 'static>>;
-
-    async fn stream_disarm(
+    pub fn spawn_stream_disarm<S>(
         &self,
-        request: Request<Streaming<DisarmRequest>>,
-    ) -> Result<Response<Self::StreamDisarmStream>, Status> {
-        let mut in_stream = request.into_inner();
+        mut in_stream: S,
+    ) -> Pin<Box<dyn Stream<Item = Result<DisarmResponse, Status>> + Send + 'static>>
+    where
+        S: Stream<Item = Result<DisarmRequest, Status>> + Send + Unpin + 'static,
+    {
         let (out_tx, out_rx) = mpsc::channel(32);
 
         let engine = Arc::clone(&self.engine);
@@ -117,12 +131,34 @@ impl ContentDisarmService for CdrGrpcService {
             let mut raw_buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
             let mut session_id = uuid::Uuid::new_v4().to_string();
             let mut file_name = String::from("UNKNOWN_FILE");
+            let mut frame_count: usize = 0;
+            let mut consecutive_empty_frames: usize = 0;
 
-            // 1. Accumulate incoming chunks with strict pre-CDR byte cap (`BUG-CDR-02`)
+            // 1. Accumulate incoming chunks with strict pre-CDR byte cap (`BUG-CDR-02`) and frame-flood guards (`RUSTSEC-2026-0258`)
             while let Some(chunk_res) = in_stream.next().await {
+                frame_count = frame_count.saturating_add(1);
+                if frame_count > MAX_STREAM_FRAMES_PER_SESSION {
+                    warn!(
+                        "CDR session '{}' rejected: exceeded maximum stream frames ({})",
+                        session_id, MAX_STREAM_FRAMES_PER_SESSION
+                    );
+                    let _ = out_tx
+                        .send(Ok(DisarmResponse {
+                            result: Some(disarm_response::Result::Error(DisarmError {
+                                code: "STREAM_FRAME_FLOOD_DETECTED".to_string(),
+                                message:
+                                    "Exceeded maximum allowed gRPC frames per stream session (RUSTSEC-2026-0258 mitigation)"
+                                        .to_string(),
+                                recoverable: false,
+                            })),
+                        }))
+                        .await;
+                    return;
+                }
                 match chunk_res {
                     Ok(req) => match req.payload {
                         Some(disarm_request::Payload::Metadata(meta)) => {
+                            consecutive_empty_frames = 0;
                             if !meta.session_id.is_empty() {
                                 session_id = meta.session_id;
                             }
@@ -159,6 +195,32 @@ impl ContentDisarmService for CdrGrpcService {
                             );
                         }
                         Some(disarm_request::Payload::ChunkData(bytes)) => {
+                            if bytes.is_empty() {
+                                consecutive_empty_frames =
+                                    consecutive_empty_frames.saturating_add(1);
+                                if consecutive_empty_frames > MAX_CONSECUTIVE_EMPTY_CHUNKS {
+                                    warn!(
+                                        "CDR session '{}' rejected: consecutive empty data frames exceeded {}",
+                                        session_id, MAX_CONSECUTIVE_EMPTY_CHUNKS
+                                    );
+                                    let _ = out_tx
+                                        .send(Ok(DisarmResponse {
+                                            result: Some(disarm_response::Result::Error(
+                                                DisarmError {
+                                                    code: "EMPTY_DATA_FRAME_FLOOD".to_string(),
+                                                    message:
+                                                        "Rejected consecutive empty gRPC data frames (RUSTSEC-2026-0258 mitigation)"
+                                                            .to_string(),
+                                                    recoverable: false,
+                                                },
+                                            )),
+                                        }))
+                                        .await;
+                                    return;
+                                }
+                                continue;
+                            }
+                            consecutive_empty_frames = 0;
                             if raw_buffer.len().saturating_add(bytes.len()) > max_stream_bytes {
                                 warn!(
                                     "CDR session '{}' rejected: stream size exceeded {} bytes",
@@ -180,7 +242,27 @@ impl ContentDisarmService for CdrGrpcService {
                             }
                             raw_buffer.extend_from_slice(&bytes);
                         }
-                        None => {}
+                        None => {
+                            consecutive_empty_frames = consecutive_empty_frames.saturating_add(1);
+                            if consecutive_empty_frames > MAX_CONSECUTIVE_EMPTY_CHUNKS {
+                                warn!(
+                                    "CDR session '{}' rejected: consecutive empty payload frames exceeded {}",
+                                    session_id, MAX_CONSECUTIVE_EMPTY_CHUNKS
+                                );
+                                let _ = out_tx
+                                    .send(Ok(DisarmResponse {
+                                        result: Some(disarm_response::Result::Error(DisarmError {
+                                            code: "EMPTY_DATA_FRAME_FLOOD".to_string(),
+                                            message:
+                                                "Rejected consecutive empty gRPC data frames (RUSTSEC-2026-0258 mitigation)"
+                                                    .to_string(),
+                                            recoverable: false,
+                                        })),
+                                    }))
+                                    .await;
+                                return;
+                            }
+                        }
                     },
                     Err(e) => {
                         warn!("Error in incoming CDR stream: {}", e);
@@ -308,8 +390,21 @@ impl ContentDisarmService for CdrGrpcService {
         });
 
         let output_stream = ReceiverStream::new(out_rx);
+        Box::pin(output_stream)
+    }
+}
+
+#[tonic::async_trait]
+impl ContentDisarmService for CdrGrpcService {
+    type StreamDisarmStream =
+        Pin<Box<dyn Stream<Item = Result<DisarmResponse, Status>> + Send + 'static>>;
+
+    async fn stream_disarm(
+        &self,
+        request: Request<Streaming<DisarmRequest>>,
+    ) -> Result<Response<Self::StreamDisarmStream>, Status> {
         Ok(Response::new(
-            Box::pin(output_stream) as Self::StreamDisarmStream
+            self.spawn_stream_disarm(request.into_inner()),
         ))
     }
 

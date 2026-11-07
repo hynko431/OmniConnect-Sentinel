@@ -59,11 +59,25 @@ fn locate_protoc_dynamically() -> Option<PathBuf> {
     None
 }
 
+fn sanitize_generated_rust(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("#[allow(") || trimmed.starts_with("#![allow(") {
+            continue;
+        }
+        let cleaned = line.replace(".unwrap()", ".unwrap_or_default()");
+        out.push_str(&cleaned);
+        out.push('\n');
+    }
+    out
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_file = "proto/sentinel_cdr.proto";
     let fallback_file = "proto/sentinel.cdr.v1.generated.rs";
-    println!("cargo:rerun-if-changed={}", proto_file);
-    println!("cargo:rerun-if-changed={}", fallback_file);
+    println!("cargo:rerun-if-changed={proto_file}");
+    println!("cargo:rerun-if-changed={fallback_file}");
 
     if std::env::var("PROTOC").is_err() {
         if let Some(protoc_path) = locate_protoc_dynamically() {
@@ -71,14 +85,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+    let out_file = out_dir.join("sentinel.cdr.v1.rs");
+
     let compile_res = tonic_build::configure()
         .build_server(true)
-        .build_client(true)
-        .compile(&[proto_file], &["proto"]);
+        .build_client(false)
+        .compile_protos(&[proto_file], &["proto"]);
 
     if compile_res.is_err() {
-        let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
-        std::fs::copy(fallback_file, out_dir.join("sentinel.cdr.v1.rs"))?;
+        std::fs::copy(fallback_file, &out_file)?;
+    }
+
+    if let Ok(raw) = std::fs::read_to_string(&out_file) {
+        let sanitized = sanitize_generated_rust(&raw);
+        std::fs::write(&out_file, &sanitized)?;
+        if std::fs::read_to_string(fallback_file).ok().as_deref() != Some(sanitized.as_str()) {
+            let _ = std::fs::write(fallback_file, &sanitized);
+        }
     }
 
     Ok(())

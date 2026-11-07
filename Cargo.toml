@@ -17,15 +17,13 @@ repository = "https://github.com/omniconnect/sentinel"
 
 [workspace.dependencies]
 # Async Runtime & Concurrency
-tokio = { version = "1.38", features = ["full"] }
+tokio = { version = "=1.53.3", features = ["full"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
-futures = "0.3"
 
 # gRPC & Protocol Buffers
-tonic = "0.11"
-prost = "0.12"
-prost-types = "0.12"
+tonic = { version = "0.13.1", default-features = false, features = ["codegen", "prost"] }
+prost = "0.13.5"
 
 # Serialization & Data
 serde = { version = "1.0", features = ["derive"] }

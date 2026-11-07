@@ -52,7 +52,7 @@ impl DriveWatcher {
             let _ = pnp_tx.send(());
         });
 
-        let mut interval = tokio::time::interval(Duration::from_millis(800));
+        let mut interval = Self::new_poll_interval();
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
@@ -76,5 +76,28 @@ impl DriveWatcher {
 
             self.known_drives = current;
         }
+    }
+
+    /// Creates a hardened stack-local `tokio::time::Interval` with `MissedTickBehavior::Delay` (`RUSTSEC-2026-0384` defense-in-depth).
+    pub fn new_poll_interval() -> tokio::time::Interval {
+        let mut ticker = tokio::time::interval(Duration::from_millis(800));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_drive_watcher_interval_uses_delay_missed_tick_behavior() {
+        let mut ticker = DriveWatcher::new_poll_interval();
+        assert_eq!(
+            ticker.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay
+        );
+        assert_eq!(ticker.period(), Duration::from_millis(800));
+        ticker.tick().await;
     }
 }

@@ -127,6 +127,7 @@ impl DeviceInterceptor for LinuxUdevInterceptor {
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(800));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = interval.tick() => {}

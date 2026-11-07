@@ -14,8 +14,4 @@ tonic.workspace = true
 prost.workspace = true
 
 [build-dependencies]
-tonic-build = "0.11"
-prost-build = "0.12"
-
-[package.metadata.cargo-machete]
-ignored = ["prost"]
+tonic-build = { version = "0.13.1", default-features = false, features = ["prost"] }
