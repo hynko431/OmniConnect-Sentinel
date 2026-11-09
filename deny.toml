@@ -1,0 +1,40 @@
+# OmniConnect Sentinel Supply-Chain & Dependency Policy (`Master Plan v2 §6, Row 230`)
+# Enforced in CI via `cargo deny check advisories licenses bans sources`
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+unmaintained = "workspace"
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+    # Disallow unused or superseded crates from v1 (`EV-04`, `Master Plan v2 §11.2`)
+    { name = "kamadak-exif" },
+    { name = "chacha20poly1305" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,100 @@
+name: OmniConnect Sentinel Enterprise Security & Supply-Chain CI
+
+on:
+  push:
+    branches: ["main", "master", "release/**", "feature/**"]
+  pull_request:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-and-verify:
+    name: Test Matrix, Clippy & Fuzz Corpus Regression
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install qpdf output oracle and Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y qpdf libfuse3-dev pkg-config protobuf-compiler
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy strict lint gate (no unwrap/expect in production crates)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Execute full test pyramid (unit, property, invariant I1-I5, output oracles, chaos)
+        run: cargo test --workspace -- --nocapture
+
+  supply-chain-and-sbom:
+    name: Supply-Chain Gate (cargo-deny, cargo-audit, cargo-machete, CycloneDX SBOM, SLSA)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y pkg-config protobuf-compiler
+
+      - name: Run cargo-deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+      - name: Install prebuilt supply-chain security tools (cargo-audit, cargo-machete, cargo-cyclonedx)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-machete,cargo-cyclonedx
+
+      - name: Run cargo-audit (RustSec advisory database with zero-ignore policy)
+        run: cargo audit --deny yanked
+
+      - name: Run cargo-machete (unused dependency check — EV-04)
+        run: cargo machete
+
+      - name: Generate CycloneDX SBOM (sbom.cdx.json)
+        run: |
+          cargo cyclonedx --format json --all --override-filename sbom.cdx
+          if [ ! -f sbom.cdx.json ]; then
+            if [ -f crates/sentinel-core/sbom.cdx.json ]; then
+              cp crates/sentinel-core/sbom.cdx.json sbom.cdx.json
+            elif [ -f crates/sentinel-core/sbom.json ]; then
+              cp crates/sentinel-core/sbom.json sbom.cdx.json
+            fi
+          fi
+          test -f sbom.cdx.json
+
+      - name: Build release binaries for SLSA provenance & signing
+        run: cargo build --workspace --release --locked
+
+      - name: Attest SLSA Build Provenance & CycloneDX SBOM
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            target/release/sentinel
+            target/release/sentinel-agent
+            target/release/sentinel-cdr-daemon
+            target/release/sentinel-cdr-worker
+            sbom.cdx.json

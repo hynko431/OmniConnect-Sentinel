@@ -13,10 +13,8 @@ path = "src/main.rs"
 [dependencies]
 sentinel-proto.workspace = true
 sentinel-cdr.workspace = true
+sentinel-sys.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
-tonic.workspace = true
-bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -31,8 +29,12 @@ async-trait.workspace = true
 
 # Cross-platform userspace I/O
 walkdir = "2.5"
-thiserror = "1.0"
-zip = { version = "2.1", default-features = false, features = ["deflate"] }
+thiserror = "2.0"
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
+
+[features]
+default = []
+vfs-winfsp = []
 
 [dev-dependencies]
 tempfile = "3.10"

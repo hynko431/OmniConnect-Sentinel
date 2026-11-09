@@ -8,7 +8,7 @@
 [![MITRE ATT&CK](https://img.shields.io/badge/MITRE%20ATT%26CK-T1027%20%7C%20T1564%20%7C%20T1036-red.svg)](https://attack.mitre.org)
 [![License](https://img.shields.io/badge/License-Apache%202.0%20%2F%20MIT-blue.svg)](LICENSE)
 
-OmniConnect Sentinel is an enterprise-grade endpoint security system that replaces post-mount antivirus scanning with **zero-trust pre-mount hardware interception**, **deep carrier syntax validation**, **in-line Content Disarm & Reconstruction (CDR)**, and **NIST SP 800-88 Rev 1 Anti-Forensic Cryptographic Shredding**.
+OmniConnect Sentinel is an enterprise-grade endpoint security system that replaces post-mount antivirus scanning with **zero-trust pre-mount hardware interception**, **deep carrier syntax validation**, **in-line Content Disarm & Reconstruction (CDR)**, and **NIST SP 800-88 Rev 1 Clear (logical) & Cryptographic Erase Sanitization**.
 
 It brings the defensive posture of dedicated $50,000 industrial security kiosks (OPSWAT MetaDefender) directly to the OS endpoint as a lightweight, memory-safe, 100% userspace daemon across **Windows, Linux, and macOS**.
 
@@ -63,13 +63,13 @@ OmniConnect Sentinel operates **before the operating system mounts the volume**:
             │
       ┌─────┴───────────────────────────────────────────────────────┐
       ▼                                                             ▼
-[ Option 1: NIST SP 800-88 Cryptographic Shred ]     [ Option 2: Deep CDR Disarm ]
-• Pass 1: Cryptographic Random (CSPRNG)              • Strip active macros / overlays
-• Pass 2: Inverted Bitwise Complement (0xAA)         • Re-linearize to known-good spec
-• Pass 3: Cryptographic Zeroes (0x00)                • Mount sterile files to Z:\
-• Direct FlushFileBuffers() to media
-• MFT directory entry scrambled (3 cycles)
-• 0% Remanence · ZERO BACKDOORS
+[ Option 1: NIST 800-88 Clear (Logical) Shred ]       [ Option 2: Deep CDR Disarm ]
+• Pass 1: Fixed Zeroes (0x00)                         • Strip active macros / overlays
+• Pass 2: Bitwise Complement (0xFF)                   • Re-linearize to known-good spec
+• Pass 3: Cryptographic Random (CSPRNG + Verify)      • Project via Read-Once ShadowCache
+• Direct FILE_FLAG_WRITE_THROUGH + FlushFileBuffers()
+• MFT directory entry scrambled (3 measured cycles)
+• Crypto-Erase for ephemeral session & shadow caches
 ```
 
 ---
@@ -93,21 +93,21 @@ Attackers camouflage exploits inside container formats and filesystem metadata t
 
 When malicious payloads or weaponized documents are detected, standard deletion (`DeleteFileW` / `unlink`) leaves the raw data intact on physical storage clusters, easily recovered by forensic carving tools (Autopsy, PhotoRec, FTK).
 
-Sentinel executes a **NIST SP 800-88 Rev 1 / DoD 5220.22-M Cryptographic Purge**:
+Sentinel executes a **NIST SP 800-88 Rev 1 Clear (Logical) Overwrite + Cryptographic Erase**:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │           OMNICONNECT SENTINEL ANTI-FORENSIC SHREDDER PIPELINE          │
 ├────────────────────────────────────────────────────────────────────────┤
 │ 1. Attribute Normalization: Strips READONLY, HIDDEN, and SYSTEM flags  │
-│ 2. Unbuffered Hardware Overwrite:                                      │
-│    • Pass 1: Cryptographic Pseudo-Random Noise (CSPRNG via OsRng)      │
-│    • Pass 2: Inverted Bitwise Complement (0xAA / 0x55)                 │
-│    • Pass 3: Cryptographic Zeroes (0x00)                               │
-│ 3. Direct Hardware Flush: FlushFileBuffers() commits physical blocks   │
-│ 4. MFT Directory Scrambling: 3 cycles of random 32-char hex names      │
-│ 5. Truncation: File pointer truncated to 0 bytes via SetEndOfFile      │
-│ 6. Unlink: Cluster deallocation with ZERO residual bits or backdoors   │
+│ 2. Write-Through Overwrite (FILE_FLAG_WRITE_THROUGH / O_DSYNC):        │
+│    • Pass 1: Fixed Zeroes (0x00)                                       │
+│    • Pass 2: Bitwise Complement (0xFF)                                 │
+│    • Pass 3: Cryptographic Pseudo-Random Noise (CSPRNG + SHA256 Verify)│
+│ 3. Hardware Flush & TRIM: FlushFileBuffers() + FSCTL_FILE_LEVEL_TRIM   │
+│ 4. MFT Directory Scrambling: 3 measured cycles of random hex names     │
+│ 5. Truncation: File pointer truncated to 0 bytes after verification    │
+│ 6. Unlink & Crypto-Erase: Zeroizes AES-256-GCM session/shadow keys     │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -133,19 +133,19 @@ Technical Details:
   - Embedded Signature: Portable Executable (MZ / PE32+ x86-64 GUI)
 --------------------------------------------------------------------------------
 REMEDIATION CHOICES:
-  [1] PERMANENT ANTI-FORENSIC SHRED (NIST SP 800-88 Cryptographic Purge - 0% Remanence)
-  [2] QUARANTINE TO ENCRYPTED VAULT (AES-256-GCM container)
+  [1] PERMANENT ANTI-FORENSIC SHRED (NIST 800-88 Clear (logical))
+  [2] QUARANTINE TO ENCRYPTED VAULT (AES-256-GCM AEAD + Shred Source Plaintext)
   [3] SKIP / LEAVE UNTOUCHED
 Select action [1-3] (Default: 1): 1
 
-⚡ Executing NIST SP 800-88 cryptographic shredding...
-   - Pass 1/3: Cryptographic random noise overwrite... OK
-   - Pass 2/3: Bitwise inverted complement overwrite... OK
-   - Pass 3/3: Cryptographic zeroes overwrite... OK
-   - Flushing hardware write buffers to NAND media... OK
-   - Scrambling MFT/FAT directory entry metadata... OK
+⚡ Executing NIST 800-88 Clear (logical) multi-pass shredding...
+   - Pass 1/3: Fixed zeroes (0x00) overwrite... OK
+   - Pass 2/3: Bitwise complement (0xFF) overwrite... OK
+   - Pass 3/3: Cryptographic random noise (CSPRNG + SHA-256 verify)... OK
+   - Flushing write-through buffers & issuing TRIM hint... OK
+   - Scrambling MFT/FAT directory entry metadata (3 cycles)... OK
    - Truncating file size to 0 bytes and unlinking... OK
-✅ [PERMANENTLY ERADICATED]: "E:\Presentations\Roadmap.jpg" (629,862 bytes overwritten in 12 ms). Zero backdoors remain!
+✅ [PERMANENTLY ERADICATED]: "E:\Presentations\Roadmap.jpg" (629,862 bytes overwritten in 12 ms).
 ```
 
 ---
@@ -253,11 +253,13 @@ sentinel kiosk --media USB-MEDIA-SCADA-01
 | `sentinel watch` | `sentinel watch [-i 1000]` | Launches autonomous background sentry listening for external drive insertions. |
 | `sentinel sanitize` | `sentinel sanitize -i doc.pdf -o clean.pdf` | Surgically disarms documents and images via pure-Rust CDR engine. |
 | `sentinel detonate` | `sentinel detonate -p malware.exe --vm win11-whvp` | Asynchronously detonates binary in OpenSandbox microVM with C2 sinkhole logs. |
-| `sentinel inspect` | `sentinel inspect -p sample.bin` | Analyzes file entropy, headers, and structural risk indicators. |
-| `sentinel ui` | `sentinel ui [--port 8088]` | Launches the glassmorphic desktop and web defense dashboard. |
-| `sentinel intune` | `sentinel intune [--export <PATH.xml>]` | Inspects active policy or exports Microsoft Intune OMA-URI XML profile. |
-| `sentinel telemetry` | `sentinel telemetry [--event <TYPE>]` | Emits sample CrowdStrike Falcon FDR NDJSON and CEF syslog telemetry. |
+| `sentinel inspect` | `sentinel inspect -p sample.bin [--json]` | Analyzes file entropy, headers, polyglots, ADS, YARA, and structural risk indicators. |
+| `sentinel ui` | `sentinel ui [--port 8088]` | Launches the localhost (`127.0.0.1`) web defense dashboard with per-session bearer token. |
+| `sentinel intune` | `sentinel intune [--export <PATH.xml>]` | Inspects active policy or exports XML-escaped Microsoft Intune OMA-URI profile. |
+| `sentinel telemetry` | `sentinel telemetry [--event <TYPE>]` | Emits CEF-escaped CrowdStrike Falcon FDR NDJSON and Syslog telemetry. |
 | `sentinel kiosk` | `sentinel kiosk [--media <SERIAL>]` | Executes an IEC 62443 compliant air-gapped industrial kiosk session. |
+| `sentinel vault` | `sentinel vault <list\|restore\|migrate>` | Lists, restores, or migrates AES-256-GCM AEAD quarantine vault envelopes. |
+| `sentinel ledger` | `sentinel ledger verify [-p <PATH>]` | Verifies the SHA-256 hash chain and Ed25519 signatures of the audit ledger. |
 
 ---
 
@@ -274,7 +276,7 @@ OmniConnect Sentinel was verified live on a physical 1.91 GB FAT32 removable fla
 2. **Shortcut Vectors**: Uncovered 19 `.lnk` files exploiting `Win32/CplLnk.A` shortcut vulnerabilities.
 3. **Crypted Droppers**: Flagged `E:\VA1703w ViewSonic Wizard (G)\ar405eng.exe` (Anomalous High-Entropy Crypted Dropper, Score: 82/100).
 4. **Unicode Trojan Source**: Flagged `french.swf` and `spanish.swf` containing Bidirectional Overrides (**CVE-2021-42574**, Score: 97/100).
-5. **Polymorphic Worm Cluster**: Identified 134 identical 229,376-byte infected executables sharing identical byte footprints (**Trojan:Win32/Ramnit!pz**).
+5. **Polymorphic Worm Cluster**: Identified infected executables exhibiting `.rmnet` / writable entry-point PE section signatures (**Trojan:Win32/Ramnit!pz**).
 
 ---
 

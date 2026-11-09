@@ -5,6 +5,9 @@ pub enum CdrError {
     #[error("Unsupported file format: {0}")]
     UnsupportedFormat(String),
 
+    #[error("Invalid format structure: {0}")]
+    InvalidFormat(String),
+
     #[error("Parser error during deconstruction: {0}")]
     ParserCorruption(String),
 
@@ -28,6 +31,15 @@ pub enum CdrError {
 
     #[error("Security violation: resource limit exceeded ({0})")]
     ResourceLimitExceeded(String),
+
+    #[error("CDR_WORKER_TIMEOUT: {0}")]
+    WorkerTimeout(String),
+
+    #[error("CDR_SANDBOX_FAILURE: {0}")]
+    SandboxFailure(String),
+
+    #[error("CDR_OUTPUT_REJECTED: {0}")]
+    OutputRejected(String),
 }
 
 pub type Result<T> = std::result::Result<T, CdrError>;

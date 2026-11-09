@@ -1,15 +1,13 @@
+use super::universal_scanner::{CarrierCategory, ThreatSeverity, UniversalThreat};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use super::universal_scanner::{UniversalThreat, CarrierCategory, ThreatSeverity};
 
 pub struct UnicodeTrojanDetector;
 
 impl UnicodeTrojanDetector {
     /// Inspects file names and path components for deceptive Unicode BiDi overrides, zero-width characters, and DOS devices
     pub fn inspect_path(path: &Path) -> Option<UniversalThreat> {
-        let filename = match path.file_name() {
-            Some(name) => name.to_string_lossy(),
-            None => return None,
-        };
+        let filename = path.file_name()?.to_string_lossy();
 
         // 1. Unicode BiDi Override Check (CVE-2021-42574)
         for c in filename.chars() {
@@ -61,9 +59,28 @@ impl UnicodeTrojanDetector {
 
         let is_reserved_dos = matches!(
             stem.as_str(),
-            "CON" | "PRN" | "AUX" | "NUL" |
-            "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" |
-            "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
         );
 
         if is_reserved_dos {
@@ -75,8 +92,7 @@ impl UnicodeTrojanDetector {
                 risk_score: 88,
                 mitre_technique: "T1564.001 (Hidden Files and Directories)".to_string(),
                 technical_details: format!(
-                    "Filename uses reserved device name '{}', causing standard OS deletion APIs to fail without extended UNC pathing.",
-                    stem
+                    "Filename uses reserved device name '{stem}', causing standard OS deletion APIs to fail without extended UNC pathing."
                 ),
                 overlay_offset: None,
                 stream_name: None,
@@ -105,25 +121,68 @@ impl UnicodeTrojanDetector {
 
     /// Inspects source code or script content bytes for embedded Trojan Source BiDi overrides
     pub fn inspect_content(path: &Path, content: &[u8]) -> Option<UniversalThreat> {
-        let text = String::from_utf8_lossy(content);
-        for c in text.chars() {
-            if matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}') {
-                return Some(UniversalThreat {
-                    file_path: path.to_path_buf(),
-                    carrier_category: CarrierCategory::ScriptCode,
-                    threat_name: "Source Code Trojan Source (CVE-2021-42574)".to_string(),
-                    severity: ThreatSeverity::Critical,
-                    risk_score: 97,
-                    mitre_technique: "T1036.002 (Right-to-Left Override)".to_string(),
-                    technical_details: format!(
-                        "File contains embedded BiDi control U+{:04X}. Visually inverts logic seen by human reviewers while compiler interprets raw instructions.",
-                        c as u32
-                    ),
-                    overlay_offset: None,
-                    stream_name: None,
-                    can_disarm_via_cdr: false,
-                });
+        let mut cursor = std::io::Cursor::new(content);
+        Self::inspect_content_reader(path, &mut cursor)
+    }
+
+    /// Streams `reader` in 64 KiB windows with a 4 KiB (`4096`-byte) overlap (`Rows 69, 78`)
+    /// so UTF-8 BiDi override codepoints (`U+202A..=U+202E`, `U+2066..=U+2069`) spanning chunk
+    /// boundaries or past the first 64 KiB are always detected in O(64 KiB) memory.
+    pub fn inspect_content_reader<R: Read + Seek>(
+        path: &Path,
+        reader: &mut R,
+    ) -> Option<UniversalThreat> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_cdr_text = matches!(ext.as_str(), "txt" | "csv");
+
+        if reader.seek(SeekFrom::Start(0)).is_err() {
+            return None;
+        }
+
+        const WINDOW_SIZE: usize = 64 * 1024;
+        const OVERLAP_SIZE: usize = 4 * 1024;
+        let mut chunk = vec![0u8; WINDOW_SIZE];
+        let mut overlap = Vec::with_capacity(OVERLAP_SIZE);
+        let mut window = Vec::with_capacity(WINDOW_SIZE + OVERLAP_SIZE);
+
+        loop {
+            let n = match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            window.clear();
+            window.extend_from_slice(&overlap);
+            window.extend_from_slice(&chunk[..n]);
+
+            let text = String::from_utf8_lossy(&window);
+            for c in text.chars() {
+                if matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}') {
+                    return Some(UniversalThreat {
+                        file_path: path.to_path_buf(),
+                        carrier_category: CarrierCategory::ScriptCode,
+                        threat_name: "Source Code Trojan Source (CVE-2021-42574)".to_string(),
+                        severity: ThreatSeverity::Critical,
+                        risk_score: 97,
+                        mitre_technique: "T1036.002 (Right-to-Left Override)".to_string(),
+                        technical_details: format!(
+                            "File contains embedded BiDi control U+{:04X}. Visually inverts logic seen by human reviewers while compiler interprets raw instructions.",
+                            c as u32
+                        ),
+                        overlay_offset: None,
+                        stream_name: None,
+                        can_disarm_via_cdr: is_cdr_text,
+                    });
+                }
             }
+
+            overlap.clear();
+            let tail_start = n.saturating_sub(OVERLAP_SIZE);
+            overlap.extend_from_slice(&chunk[tail_start..n]);
         }
         None
     }
