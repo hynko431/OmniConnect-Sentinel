@@ -75,9 +75,13 @@ jobs:
 
       - name: Generate CycloneDX SBOM (sbom.cdx.json)
         run: |
-          cargo cyclonedx --format json --all --override-filename sbom
+          cargo cyclonedx --format json --all --override-filename sbom.cdx
           if [ ! -f sbom.cdx.json ]; then
-            cp crates/sentinel-core/sbom.cdx.json sbom.cdx.json
+            if [ -f crates/sentinel-core/sbom.cdx.json ]; then
+              cp crates/sentinel-core/sbom.cdx.json sbom.cdx.json
+            elif [ -f crates/sentinel-core/sbom.json ]; then
+              cp crates/sentinel-core/sbom.json sbom.cdx.json
+            fi
           fi
           test -f sbom.cdx.json
 

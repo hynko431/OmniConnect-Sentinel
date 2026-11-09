@@ -521,7 +521,7 @@ pub fn enumerate_usb_volumes() -> Vec<UsbVolumeInfo> {
                 let is_ro = std::fs::read_to_string(sys_path.join("ro"))
                     .map(|s| s.trim() == "1")
                     .unwrap_or(false);
-                let dev_node = format!("/dev/{}", dev_name);
+                let dev_node = format!("/dev/{dev_name}");
                 let is_off = is_volume_offline(Path::new(&dev_node));
                 volumes.push(UsbVolumeInfo {
                     volume_guid_path: dev_node,
@@ -1266,7 +1266,7 @@ pub fn is_volume_readonly(volume_path: &Path) -> bool {
                 let opts = parts.next().unwrap_or("");
                 let dev_matches =
                     dev == trimmed || (trimmed.starts_with("/dev/") && dev.starts_with(trimmed));
-                let mnt_matches = mnt == trimmed || mnt.starts_with(&format!("{}/", trimmed));
+                let mnt_matches = mnt == trimmed || mnt.starts_with(&format!("{trimmed}/"));
                 if dev_matches || mnt_matches {
                     return opts.split(',').any(|o| o == "ro");
                 }
@@ -1402,7 +1402,7 @@ pub fn is_volume_offline(volume_path: &Path) -> bool {
             let opts = parts.next().unwrap_or("");
             let dev_matches =
                 dev == trimmed || (trimmed.starts_with("/dev/") && dev.starts_with(trimmed));
-            let mnt_matches = mnt == trimmed || mnt.starts_with(&format!("{}/", trimmed));
+            let mnt_matches = mnt == trimmed || mnt.starts_with(&format!("{trimmed}/"));
             if dev_matches || mnt_matches {
                 // Any read-write mount means the volume is NOT offline.
                 // Even if mounted read-only, a mounted volume in `/proc/mounts` is online unless `/sys/block/<dev>/ro` is enforced and unmounted.
@@ -1715,7 +1715,7 @@ pub fn enumerate_usb_pnp_devices() -> Vec<UsbPnpDeviceInfo> {
                 if let Ok(sub_entries) = std::fs::read_dir(&p) {
                     for sub in sub_entries.flatten() {
                         let sub_name = sub.file_name().to_string_lossy().to_string();
-                        if sub_name.starts_with(&format!("{}:", dev_name)) {
+                        if sub_name.starts_with(&format!("{dev_name}:")) {
                             children.push(sub_name);
                             if let Ok(cls_str) =
                                 std::fs::read_to_string(sub.path().join("bInterfaceClass"))
@@ -1836,7 +1836,7 @@ pub fn disable_device_node(device_instance_id: &str) -> io::Result<()> {
                 "Empty USB device ID",
             ));
         }
-        let sysfs_path = format!("/sys/bus/usb/devices/{}/authorized", sanitized_id);
+        let sysfs_path = format!("/sys/bus/usb/devices/{sanitized_id}/authorized");
         std::fs::write(&sysfs_path, "0")
     }
 }
@@ -1854,7 +1854,7 @@ pub fn disable_usb_interface(device_id: &str, interface_id: &str) -> io::Result<
         let target = if interface_id.contains(':') {
             interface_id.to_string()
         } else {
-            format!("{}:{}", device_id, interface_id)
+            format!("{device_id}:{interface_id}")
         };
         disable_device_node(&target)
     }
@@ -1899,7 +1899,7 @@ pub fn enable_device_node(device_instance_id: &str) -> io::Result<()> {
                 "Empty USB device ID",
             ));
         }
-        let sysfs_path = format!("/sys/bus/usb/devices/{}/authorized", sanitized_id);
+        let sysfs_path = format!("/sys/bus/usb/devices/{sanitized_id}/authorized");
         std::fs::write(&sysfs_path, "1")
     }
 }

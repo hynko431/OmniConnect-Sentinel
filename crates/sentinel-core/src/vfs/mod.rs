@@ -25,9 +25,8 @@ use walkdir::WalkDir;
 
 use sentinel_cdr::{SanitizationPolicy, WorkerLauncher, WorkerRequest};
 use sentinel_sys::{
-    apply_system_admin_dacl, is_projfs_available, is_reparse_point_or_symlink,
-    normalize_file_attributes, set_volume_offline, set_volume_online_readonly,
-    write_mark_of_the_web, ZeroizingBytes,
+    apply_system_admin_dacl, is_reparse_point_or_symlink, normalize_file_attributes,
+    set_volume_offline, set_volume_online_readonly, write_mark_of_the_web, ZeroizingBytes,
 };
 
 use crate::enterprise::ledger::AuditLedger;
@@ -1119,7 +1118,7 @@ impl VirtualFileSystemProvider for StagingFolderProvider {
 pub fn resolve_best_vfs_provider() -> Box<dyn VirtualFileSystemProvider> {
     #[cfg(target_os = "windows")]
     {
-        if is_projfs_available() {
+        if sentinel_sys::is_projfs_available() {
             info!("Selected VFS Backend: Windows Projected File System (ProjFS + Read-Once ShadowCache)");
             Box::new(projfs::ProjFsProvider::new())
         } else {

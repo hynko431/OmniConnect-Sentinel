@@ -1338,7 +1338,7 @@ pub fn verify_named_pipe_peer_credentials(pipe_handle: isize) -> io::Result<Peer
     }
     #[cfg(target_os = "linux")]
     {
-        let exe_path = std::fs::read_link(format!("/proc/{}/exe", pid))?;
+        let exe_path = std::fs::read_link(format!("/proc/{pid}/exe"))?;
         Ok(PeerCredentials {
             pid,
             executable_path: exe_path,

@@ -879,17 +879,17 @@ fn unix_authenticated_seal(
         let mut h = Sha256::new();
         h.update(b"UNIX-KEYRING-STREAM-V2:");
         h.update(master_secret);
-        h.update(&nonce);
+        h.update(nonce);
         h.update(entropy_tag);
         h.update(kek_id.as_bytes());
-        h.update(&(idx as u32).to_le_bytes());
+        h.update((idx as u32).to_le_bytes());
         let stream = h.finalize();
         ciphertext.push(b ^ stream[0]);
     }
     let mut mac = Sha256::new();
     mac.update(b"UNIX-KEYRING-MAC-V2:");
     mac.update(master_secret);
-    mac.update(&nonce);
+    mac.update(nonce);
     mac.update(entropy_tag);
     mac.update(kek_id.as_bytes());
     mac.update(&ciphertext);
@@ -947,7 +947,7 @@ fn unix_authenticated_unseal(
         h.update(nonce);
         h.update(entropy_tag);
         h.update(kek_id.as_bytes());
-        h.update(&(idx as u32).to_le_bytes());
+        h.update((idx as u32).to_le_bytes());
         let stream = h.finalize();
         out.push(b ^ stream[0]);
     }
@@ -1519,7 +1519,7 @@ pub fn generate_raw_ecdsa_p256_keypair() -> io::Result<(Vec<u8>, Vec<u8>)> {
         }
         let mut h = Sha256::new();
         h.update(b"ECDSA-P256-UNIX-PUB:");
-        h.update(&priv_scalar);
+        h.update(priv_scalar);
         let pub_digest = h.finalize();
         let mut pub_blob = b"ECS1".to_vec();
         pub_blob.extend_from_slice(&32u32.to_le_bytes());

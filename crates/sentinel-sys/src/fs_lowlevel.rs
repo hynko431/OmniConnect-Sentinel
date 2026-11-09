@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{self, Write};
+use std::io;
+#[cfg(windows)]
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 #[cfg(windows)]
 use tracing::debug;
@@ -844,10 +846,10 @@ pub fn issue_file_level_trim(file: &File, len: u64) -> bool {
 /// Enumerates NTFS Alternate Data Streams (`FindFirstStreamW` / `FindNextStreamW`) safely.
 /// Returns `(stream_name, stream_size)` pairs excluding the default `::$DATA` stream.
 pub fn enumerate_ntfs_ads(path: &Path) -> Vec<(String, u64)> {
-    let mut results = Vec::new();
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
+        let mut results = Vec::new();
         let verbatim = to_verbatim_path(path);
         let wide_path: Vec<u16> = verbatim.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut stream_data = Win32FindStreamData {
@@ -887,12 +889,13 @@ pub fn enumerate_ntfs_ads(path: &Path) -> Vec<(String, u64)> {
                 let _ = FindClose(handle);
             }
         }
+        results
     }
     #[cfg(not(windows))]
     {
         let _ = path;
+        Vec::new()
     }
-    results
 }
 
 /// Checks if a `Metadata` object represents a symlink or a Windows NTFS reparse point / junction (`FILE_ATTRIBUTE_REPARSE_POINT`).
@@ -939,10 +942,7 @@ pub fn write_mark_of_the_web(path: &Path, zone_id: u8) -> io::Result<()> {
     {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
-        let payload = format!(
-            "[ZoneTransfer]\r\nZoneId={}\r\nHostUrl=about:internet\r\n",
-            zone_id
-        );
+        let payload = format!("[ZoneTransfer]\r\nZoneId={zone_id}\r\nHostUrl=about:internet\r\n");
         if let (Ok(c_path), Ok(c_name)) = (
             CString::new(path.as_os_str().as_bytes()),
             CString::new("user.xdg.origin.url"),
