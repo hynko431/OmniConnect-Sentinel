@@ -61,9 +61,19 @@ fn locate_protoc_dynamically() -> Option<PathBuf> {
 
 fn sanitize_generated_rust(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
+    let mut skipping_allow = false;
     for line in source.lines() {
         let trimmed = line.trim_start();
+        if skipping_allow {
+            if trimmed.ends_with(")]") {
+                skipping_allow = false;
+            }
+            continue;
+        }
         if trimmed.starts_with("#[allow") || trimmed.starts_with("#![allow") {
+            if !trimmed.ends_with(")]") {
+                skipping_allow = true;
+            }
             continue;
         }
         let cleaned = line.replace(".unwrap()", ".unwrap_or_default()");

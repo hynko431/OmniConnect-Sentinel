@@ -522,7 +522,7 @@ fn test_policy_proto_respects_caller_overrides() {
     };
 
     let permissive = SanitizationPolicy::permissive_floor();
-    let policy = SanitizationPolicy::from_proto(Some(proto.clone()), &permissive);
+    let policy = SanitizationPolicy::from_proto(Some(proto), &permissive);
     assert!(!policy.strip_office_macros);
     assert!(policy.strip_pdf_scripts);
     assert!(!policy.strip_office_ole_objects);
