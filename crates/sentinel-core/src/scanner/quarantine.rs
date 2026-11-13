@@ -359,7 +359,7 @@ impl QuarantineVault {
         let blob = seal_key_bytes(zeroizing.as_slice(), context.as_bytes(), &kek_id)
             .map_err(|e| format!("Failed sealing new Master KEK: {e}"))?;
         let posture = blob.posture;
-        let degradation = if posture == KeyProtectionPosture::Tpm2Assisted {
+        let mut degradation = if posture == KeyProtectionPosture::Tpm2Assisted {
             None
         } else {
             warn!(
@@ -377,17 +377,26 @@ impl QuarantineVault {
             .map_err(|e| format!("Failed writing {}: {}", sealed_path.display(), e))?;
 
         // Provision offline SOC RSA-2048-OAEP recovery escrow blob (`vault_kek.escrow`, Master Plan v2 §1.1 #2)
-        let escrow_path = vault_dir.join(ESCROW_KEK_FILENAME);
-        let mut kek_arr = [0u8; 32];
-        kek_arr.copy_from_slice(zeroizing.as_slice());
-        let escrow_res = encrypt_kek_for_soc_escrow(&kek_arr, soc_rsa_pub_blob, &kek_id);
-        zeroize_slice(&mut kek_arr);
-        let escrow_blob = escrow_res
-            .map_err(|e| format!("Failed encrypting Master KEK for offline SOC escrow: {e}"))?;
-        let escrow_json = serde_json::to_vec_pretty(&escrow_blob)
-            .map_err(|e| format!("Failed serializing SOC escrow blob: {e}"))?;
-        write_protected_key_file(&escrow_path, &escrow_json)
-            .map_err(|e| format!("Failed writing {}: {}", escrow_path.display(), e))?;
+        if soc_rsa_pub_blob.is_empty() {
+            warn!(
+                "Degradation event {}: QuarantineVault KEK '{}' provisioned without offline SOC RSA public key; vault_kek.escrow skipped",
+                DegradationEvent::SocEscrowUnconfigured.event_code(),
+                kek_id
+            );
+            degradation = Some(DegradationEvent::SocEscrowUnconfigured);
+        } else {
+            let escrow_path = vault_dir.join(ESCROW_KEK_FILENAME);
+            let mut kek_arr = [0u8; 32];
+            kek_arr.copy_from_slice(zeroizing.as_slice());
+            let escrow_res = encrypt_kek_for_soc_escrow(&kek_arr, soc_rsa_pub_blob, &kek_id);
+            zeroize_slice(&mut kek_arr);
+            let escrow_blob = escrow_res
+                .map_err(|e| format!("Failed encrypting Master KEK for offline SOC escrow: {e}"))?;
+            let escrow_json = serde_json::to_vec_pretty(&escrow_blob)
+                .map_err(|e| format!("Failed serializing SOC escrow blob: {e}"))?;
+            write_protected_key_file(&escrow_path, &escrow_json)
+                .map_err(|e| format!("Failed writing {}: {}", escrow_path.display(), e))?;
+        }
 
         Ok((zeroizing, posture, degradation))
     }

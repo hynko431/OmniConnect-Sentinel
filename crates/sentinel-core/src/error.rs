@@ -87,6 +87,7 @@ pub enum DegradationEvent {
     VaultIntegrityFail,
     PolicyRejected,
     SandboxOfflineEmulated,
+    SocEscrowUnconfigured,
 }
 
 impl DegradationEvent {
@@ -99,6 +100,7 @@ impl DegradationEvent {
             DegradationEvent::VaultIntegrityFail => "VAULT_INTEGRITY_FAIL",
             DegradationEvent::PolicyRejected => "POLICY_REJECTED",
             DegradationEvent::SandboxOfflineEmulated => "SANDBOX_OFFLINE_EMULATED",
+            DegradationEvent::SocEscrowUnconfigured => "SOC_ESCROW_UNCONFIGURED",
         }
     }
 }

@@ -212,6 +212,16 @@ enum VaultAction {
         #[arg(long, default_value = ".sentinel_vault")]
         vault_dir: PathBuf,
     },
+    /// Verify offline SOC RSA-2048 OAEP escrow recovery package (vault_kek.escrow)
+    VerifyEscrow {
+        /// Vault directory path
+        #[arg(long, default_value = ".sentinel_vault")]
+        vault_dir: PathBuf,
+
+        /// Path to the offline SOC RSA private key
+        #[arg(long)]
+        soc_priv_key: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -784,6 +794,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "✅ Crypto-erased wrapped DEK and shredded quarantine entry '{id}' from vault."
                 );
+            }
+            VaultAction::VerifyEscrow {
+                vault_dir,
+                soc_priv_key,
+            } => {
+                let escrow_path = vault_dir.join("vault_kek.escrow");
+                if !escrow_path.exists() {
+                    return Err(format!("Escrow file not found: {}", escrow_path.display()).into());
+                }
+                let raw_escrow = fs::read(&escrow_path)?;
+                let escrow: sentinel_sys::SocEscrowBlob = serde_json::from_slice(&raw_escrow)
+                    .map_err(|e| format!("Failed parsing escrow JSON: {e}"))?;
+                let priv_bytes = fs::read(&soc_priv_key)?;
+                let mut kek = sentinel_sys::decrypt_kek_from_soc_escrow(&escrow, &priv_bytes)
+                    .map_err(|e| format!("Escrow decryption failed: {e}"))?;
+                let mut hasher = Sha256::new();
+                hasher.update(b"SENTINEL-KEK-ID-V2:");
+                hasher.update(kek.as_slice());
+                let computed_id = &hex::encode(hasher.finalize())[..16];
+                sentinel_sys::zeroize_slice(&mut kek);
+                if computed_id != escrow.kek_id {
+                    return Err(format!(
+                        "Escrow verification failed: computed KEK ID '{}' does not match escrow KEK ID '{}'",
+                        computed_id, escrow.kek_id
+                    )
+                    .into());
+                }
+                println!("✅ Offline SOC RSA escrow verified successfully!");
+                println!("   KEK ID:      {}", escrow.kek_id);
+                println!("   Algorithm:   {}", escrow.algorithm);
+                println!("   Fingerprint: {}", escrow.soc_key_fingerprint);
             }
         },
         Commands::Ledger { action } => match action {

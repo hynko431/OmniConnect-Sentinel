@@ -12,9 +12,13 @@ pub mod mount_control;
 pub mod sandbox_worker;
 
 pub use crypto_seal::{
-    create_sealed_ecdsa_p256_keypair, decrypt_kek_from_soc_escrow, default_soc_rsa_public_blob,
-    encrypt_kek_for_soc_escrow, generate_raw_ecdsa_p256_keypair, generate_soc_rsa_keypair,
-    is_tpm2_pcp_available, seal_key_bytes, sign_ecdsa_p256_with_private_blob,
+    create_sealed_ecdsa_p256_keypair, decrypt_kek_from_soc_escrow,
+    decrypt_kek_from_soc_escrow_software, default_soc_rsa_private_blob,
+    default_soc_rsa_public_blob, encrypt_kek_for_soc_escrow, encrypt_kek_for_soc_escrow_software,
+    export_rsa_private_key_to_cng, export_rsa_public_key_to_cng,
+    generate_ecdsa_p256_keypair_from_seed, generate_raw_ecdsa_p256_keypair,
+    generate_soc_rsa_keypair, generate_soc_rsa_keypair_software, is_tpm2_pcp_available,
+    parse_rsa_private_key, parse_rsa_public_key, seal_key_bytes, sign_ecdsa_p256_with_private_blob,
     sign_with_sealed_ecdsa_p256, unseal_key_bytes, verify_ecdsa_p256_digest,
     write_protected_key_file, KeyProtectionPosture, SealedEcdsaKeyPair, SealedKeyBlob,
     SocEscrowBlob,
