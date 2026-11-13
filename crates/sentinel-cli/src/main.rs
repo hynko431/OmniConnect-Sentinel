@@ -25,7 +25,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use sentinel_cdr::policy::SanitizationPolicy;
 use sentinel_cdr::worker::{WorkerLauncher, WorkerRequest};
 use sentinel_core::enterprise::falcon::{CrowdStrikeFalconBridge, FalconTelemetryEvent};
-use sentinel_core::enterprise::intune::IntunePolicyManager;
+use sentinel_core::enterprise::intune::{IntunePolicyManager, SignedPolicyBundle};
 use sentinel_core::enterprise::kiosk::AirGappedKioskManager;
 use sentinel_core::enterprise::ledger::AuditLedger;
 use sentinel_core::error::SentinelMetrics;
@@ -167,6 +167,20 @@ enum Commands {
         /// 8-character hex user-presence confirmation challenge code
         #[arg(long)]
         challenge: String,
+    },
+    /// Verify an enterprise signed policy bundle against pinned root public keys (Master Plan v2 §4.2 Sub-Phase 0.4)
+    PolicyVerify {
+        /// Path to SignedPolicyBundle JSON file
+        #[arg(short, long)]
+        bundle: PathBuf,
+
+        /// Optional custom root public key path (defaults to pinned enterprise roots)
+        #[arg(long)]
+        root_key: Option<PathBuf>,
+
+        /// Vault directory path
+        #[arg(long, default_value = ".sentinel_vault")]
+        vault_dir: PathBuf,
     },
 }
 
@@ -677,6 +691,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("\n✅ Exported XML-escaped Intune OMA-URI profile to: {out_path:?}");
             } else {
                 println!("\n💡 Tip: Use --export <PATH.xml> to save the deployment profile.");
+            }
+        }
+        Commands::PolicyVerify {
+            bundle,
+            root_key,
+            vault_dir,
+        } => {
+            let bundle_json = fs::read_to_string(&bundle)?;
+            let signed_bundle: SignedPolicyBundle = serde_json::from_str(&bundle_json)?;
+
+            let mut mgr = IntunePolicyManager::new().with_vault_dir(vault_dir);
+            if let Some(rk_path) = root_key {
+                let rk_bytes = fs::read(rk_path)?;
+                mgr = mgr.with_pinned_root_public_keys(vec![rk_bytes]);
+            }
+
+            match mgr.apply_signed_bundle(&signed_bundle) {
+                Ok(pol) => {
+                    println!("\n===========================================================");
+                    println!("             POLICY VERIFICATION SUCCEEDED                 ");
+                    println!("===========================================================");
+                    println!("Policy ID:                   {}", pol.policy_id);
+                    println!("Policy Version:              {}", pol.version);
+                    println!(
+                        "Enforce USB Zero-Trust:      {}",
+                        pol.enforce_usb_zero_trust
+                    );
+                    println!(
+                        "Block Composite HID+Storage: {}",
+                        pol.block_composite_hid_storage
+                    );
+                    println!(
+                        "Require CDR for Documents:   {}",
+                        pol.require_cdr_for_documents
+                    );
+                    println!(
+                        "Max Sanitization Size:       {} MB",
+                        pol.max_sanitization_file_size_mb
+                    );
+                    println!(
+                        "Allowed Hardware IDs:        {:?}",
+                        pol.allowed_hardware_ids
+                    );
+                    println!("Enforcement Mode:            {}", pol.enforcement_mode);
+                    println!("\n✅ Enterprise signature and anti-rollback verified successfully.");
+                }
+                Err(err) => {
+                    eprintln!("\n❌ [POLICY VERIFICATION REJECTED]: {err}");
+                    std::process::exit(1);
+                }
             }
         }
         Commands::Telemetry { event } => {

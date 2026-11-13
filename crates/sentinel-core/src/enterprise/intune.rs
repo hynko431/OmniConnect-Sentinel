@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use subtle::ConstantTimeEq;
 use tracing::info;
 #[cfg(not(windows))]
 use tracing::warn;
 
 use sentinel_sys::{
-    read_registry_dword, read_registry_string, sign_ecdsa_p256_with_private_blob,
-    verify_ecdsa_p256_digest,
+    read_registry_string, sign_ecdsa_p256_with_private_blob, verify_ecdsa_p256_digest,
 };
 
 use crate::enterprise::ledger::AuditLedger;
@@ -43,6 +43,50 @@ impl Default for IntuneMdmPolicy {
             enforcement_mode: "ENFORCE_STRICT".to_string(),
         }
     }
+}
+
+impl IntuneMdmPolicy {
+    /// Produces a strict fail-closed lockdown policy (`CSE-03`, `T28`).
+    pub fn fail_closed_lockdown() -> Self {
+        Self {
+            policy_id: "MDM-POL-SENTINEL-FAIL-CLOSED-LOCKDOWN".to_string(),
+            version: 0,
+            enforce_usb_zero_trust: true,
+            block_composite_hid_storage: true,
+            require_cdr_for_documents: true,
+            max_sanitization_file_size_mb: 0,
+            allowed_hardware_ids: vec![],
+            enforcement_mode: "LOCKDOWN_STRICT".to_string(),
+        }
+    }
+}
+
+/// Deterministically generates the two pinned enterprise root public keys (Primary & DR Backup).
+pub fn default_enterprise_root_public_keys() -> Vec<Vec<u8>> {
+    let seed1: [u8; 32] =
+        Sha256::digest(b"OMNICONNECT-ENTERPRISE-ROOT-POLICY-CA-PRIMARY-V2").into();
+    let seed2: [u8; 32] =
+        Sha256::digest(b"OMNICONNECT-ENTERPRISE-ROOT-POLICY-CA-BACKUP-DR-V2").into();
+    let pub1 = sentinel_sys::generate_ecdsa_p256_keypair_from_seed(&seed1)
+        .map(|(pk, _)| pk)
+        .unwrap_or_default();
+    let pub2 = sentinel_sys::generate_ecdsa_p256_keypair_from_seed(&seed2)
+        .map(|(pk, _)| pk)
+        .unwrap_or_default();
+    vec![pub1, pub2]
+}
+
+/// Generates the Primary enterprise root signing keypair.
+pub fn primary_enterprise_root_keypair() -> (Vec<u8>, Vec<u8>) {
+    let seed: [u8; 32] = Sha256::digest(b"OMNICONNECT-ENTERPRISE-ROOT-POLICY-CA-PRIMARY-V2").into();
+    sentinel_sys::generate_ecdsa_p256_keypair_from_seed(&seed).unwrap_or_default()
+}
+
+/// Generates the Backup DR enterprise root signing keypair.
+pub fn backup_enterprise_root_keypair() -> (Vec<u8>, Vec<u8>) {
+    let seed: [u8; 32] =
+        Sha256::digest(b"OMNICONNECT-ENTERPRISE-ROOT-POLICY-CA-BACKUP-DR-V2").into();
+    sentinel_sys::generate_ecdsa_p256_keypair_from_seed(&seed).unwrap_or_default()
 }
 
 /// Cryptographically Signed Policy Bundle (`Rows 186, 198`, Master Plan v2 §4.4 & §5.1)
@@ -115,6 +159,8 @@ impl SignedPolicyBundle {
 pub struct IntunePolicyManager {
     policy: IntuneMdmPolicy,
     ledger_path: PathBuf,
+    vault_dir: PathBuf,
+    pinned_root_public_keys: Vec<Vec<u8>>,
     last_degradation_event: Option<DegradationEvent>,
 }
 
@@ -129,6 +175,8 @@ impl IntunePolicyManager {
         Self {
             policy: IntuneMdmPolicy::default(),
             ledger_path: default_policy_ledger_path(),
+            vault_dir: PathBuf::from(".sentinel_vault"),
+            pinned_root_public_keys: default_enterprise_root_public_keys(),
             last_degradation_event: None,
         }
     }
@@ -137,12 +185,25 @@ impl IntunePolicyManager {
         Self {
             policy,
             ledger_path: default_policy_ledger_path(),
+            vault_dir: PathBuf::from(".sentinel_vault"),
+            pinned_root_public_keys: default_enterprise_root_public_keys(),
             last_degradation_event: None,
         }
     }
 
     pub fn with_ledger_path(mut self, ledger_path: PathBuf) -> Self {
         self.ledger_path = ledger_path;
+        self
+    }
+
+    pub fn with_vault_dir(mut self, vault_dir: PathBuf) -> Self {
+        self.vault_dir = vault_dir;
+        self.ledger_path = self.vault_dir.join("policy_audit_ledger_v2.jsonl");
+        self
+    }
+
+    pub fn with_pinned_root_public_keys(mut self, keys: Vec<Vec<u8>>) -> Self {
+        self.pinned_root_public_keys = keys;
         self
     }
 
@@ -154,19 +215,155 @@ impl IntunePolicyManager {
         &self.ledger_path
     }
 
+    pub fn vault_dir(&self) -> &Path {
+        &self.vault_dir
+    }
+
+    pub fn pinned_root_public_keys(&self) -> &[Vec<u8>] {
+        &self.pinned_root_public_keys
+    }
+
     pub fn last_degradation_event(&self) -> Option<DegradationEvent> {
         self.last_degradation_event
     }
 
-    /// Verifies the ECDSA P-256 signature and strict monotonic version (`bundle.policy.version > self.policy.version`)
+    /// Enforces immediate Ring 3 fail-closed hardware lockdown on policy tampering or signature rejection.
+    pub fn fail_closed_lockdown(&mut self) {
+        self.policy = IntuneMdmPolicy::fail_closed_lockdown();
+        self.last_degradation_event = Some(DegradationEvent::PolicyRejected);
+
+        let _ = sentinel_sys::set_automount_disabled(true);
+        let _ = sentinel_sys::apply_autoplay_suppression_policy();
+
+        let _ = self.record_ledger_event(
+            "POLICY_LOCKDOWN_ENGAGED",
+            serde_json::json!({
+                "reason": "signature_tamper_or_rollback_detected",
+                "enforcement_mode": "LOCKDOWN_STRICT",
+                "zero_trust": true,
+                "allowed_hardware_ids": [],
+            }),
+        );
+    }
+
+    /// Reads the highest applied policy version sequence from sealed vault storage.
+    /// Returns `Err` if the file exists but has been corrupted or tampered with.
+    pub fn load_sealed_version(&self) -> Result<u32, SentinelError> {
+        let path = self.vault_dir.join("policy_version.sealed");
+        if !path.exists() {
+            return Ok(self.policy.version);
+        }
+        let data = std::fs::read(&path).map_err(|e| {
+            SentinelError::PolicySignatureInvalid(format!(
+                "Failed reading sealed policy version floor: {e}"
+            ))
+        })?;
+        let sealed_blob: sentinel_sys::SealedKeyBlob =
+            serde_json::from_slice(&data).map_err(|e| {
+                SentinelError::PolicySignatureInvalid(format!(
+                    "Corrupted sealed policy version JSON (integrity violation): {e}"
+                ))
+            })?;
+        let unsealed =
+            sentinel_sys::unseal_key_bytes(&sealed_blob, b"SENTINEL-POLICY-ROLLBACK-GUARD")
+                .map_err(|e| {
+                    SentinelError::PolicySignatureInvalid(format!(
+                "Cryptographic unseal failure for policy version floor (tampering detected): {e}"
+            ))
+                })?;
+        if unsealed.len() < 4 {
+            return Err(SentinelError::PolicySignatureInvalid(
+                "Truncated sealed policy version payload".to_string(),
+            ));
+        }
+        Ok(u32::from_le_bytes([
+            unsealed[0],
+            unsealed[1],
+            unsealed[2],
+            unsealed[3],
+        ]))
+    }
+
+    /// Atomically seals the newly applied policy version sequence into vault storage.
+    pub fn persist_sealed_version(&self, version: u32) -> Result<(), SentinelError> {
+        let raw = version.to_le_bytes();
+        let sealed_blob = sentinel_sys::seal_key_bytes(
+            &raw,
+            b"SENTINEL-POLICY-ROLLBACK-GUARD",
+            "policy_rollback_guard",
+        )
+        .map_err(|e| {
+            SentinelError::PolicySignatureInvalid(format!("Failed sealing policy version: {e}"))
+        })?;
+        let serialized = serde_json::to_vec_pretty(&sealed_blob).map_err(|e| {
+            SentinelError::PolicySignatureInvalid(format!(
+                "Failed serializing sealed policy version: {e}"
+            ))
+        })?;
+        let path = self.vault_dir.join("policy_version.sealed");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        sentinel_sys::write_protected_key_file(&path, &serialized).map_err(|e| {
+            SentinelError::PolicySignatureInvalid(format!(
+                "Failed atomically writing protected sealed policy version: {e}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Verifies the ECDSA P-256 signature and strict monotonic version (`bundle.policy.version > active_floor`)
     /// before activating `bundle.policy`. On failure, retains the last known good policy (`Row 198`),
-    /// records `DegradationEvent::PolicyRejected` (`POLICY_REJECTED`) to `AuditLedger`, and returns
-    /// `Err(SentinelError::PolicySignatureInvalid)`.
+    /// records `DegradationEvent::PolicyRejected` (`POLICY_REJECTED`) to `AuditLedger`, triggers
+    /// `fail_closed_lockdown()`, and returns `Err(SentinelError::PolicySignatureInvalid)`.
     pub fn apply_signed_policy(
         &mut self,
         bundle: &SignedPolicyBundle,
         trusted_public_key: &[u8],
     ) -> Result<IntuneMdmPolicy, SentinelError> {
+        // 1. Verify trusted_public_key matches one of the pinned enterprise roots via constant-time comparison
+        let is_pinned = self.pinned_root_public_keys.iter().any(|pk| {
+            pk.len() == trusted_public_key.len() && bool::from(pk.ct_eq(trusted_public_key))
+        });
+        if !is_pinned {
+            self.last_degradation_event = Some(DegradationEvent::PolicyRejected);
+            let _ = self.record_ledger_event(
+                "POLICY_TAMPER_REJECTED",
+                serde_json::json!({
+                    "reason": "unauthorized_root_key",
+                    "candidate_policy_id": bundle.policy.policy_id,
+                    "candidate_version": bundle.policy.version,
+                    "retained_version": self.policy.version,
+                }),
+            );
+            return Err(SentinelError::PolicySignatureInvalid(
+                "Signer public key is not an authorized enterprise root key".to_string(),
+            ));
+        }
+
+        // 2. Verify bundle's embedded signer key matches trusted_public_key
+        let envelope_pub = hex::decode(&bundle.signer_public_key_hex).map_err(|e| {
+            self.last_degradation_event = Some(DegradationEvent::PolicyRejected);
+            SentinelError::PolicySignatureInvalid(format!("Malformed signer_public_key_hex: {e}"))
+        })?;
+        if envelope_pub.len() != trusted_public_key.len()
+            || !bool::from(envelope_pub.ct_eq(trusted_public_key))
+        {
+            self.last_degradation_event = Some(DegradationEvent::PolicyRejected);
+            let _ = self.record_ledger_event(
+                "POLICY_TAMPER_REJECTED",
+                serde_json::json!({
+                    "reason": "envelope_key_mismatch",
+                    "candidate_policy_id": bundle.policy.policy_id,
+                    "retained_version": self.policy.version,
+                }),
+            );
+            return Err(SentinelError::PolicySignatureInvalid(
+                "Signer key in envelope does not match trusted public key".to_string(),
+            ));
+        }
+
+        // 3. Cryptographic signature check
         if let Err(sig_err) = bundle.verify_signature(trusted_public_key) {
             self.last_degradation_event = Some(DegradationEvent::PolicyRejected);
             let _ = self.record_ledger_event(
@@ -182,12 +379,23 @@ impl IntunePolicyManager {
             return Err(sig_err);
         }
 
-        if bundle.policy.version <= self.policy.version {
-            let err = SentinelError::PolicySignatureInvalid(format!(
-                "Policy rollback rejected: candidate version {} <= active version {}",
-                bundle.policy.version, self.policy.version
-            ));
+        // 4. Strict monotonic version check against active version and sealed floor
+        let sealed_floor = match self.load_sealed_version() {
+            Ok(v) => v,
+            Err(e) => {
+                self.fail_closed_lockdown();
+                return Err(SentinelError::PolicySignatureInvalid(format!(
+                    "Policy vault integrity compromised (sealed version check failed): {e}"
+                )));
+            }
+        };
+        let active_floor = std::cmp::max(self.policy.version, sealed_floor);
+        if bundle.policy.version <= active_floor {
             self.last_degradation_event = Some(DegradationEvent::PolicyRejected);
+            let err = SentinelError::PolicySignatureInvalid(format!(
+                "Policy rollback rejected: candidate version {} <= active floor {}",
+                bundle.policy.version, active_floor
+            ));
             let _ = self.record_ledger_event(
                 DegradationEvent::PolicyRejected.event_code(),
                 serde_json::json!({
@@ -195,93 +403,127 @@ impl IntunePolicyManager {
                     "candidate_policy_id": bundle.policy.policy_id,
                     "candidate_version": bundle.policy.version,
                     "retained_version": self.policy.version,
+                    "active_floor": active_floor,
                     "error": err.to_string(),
                 }),
             );
             return Err(err);
         }
 
-        let previous_version = self.policy.version;
-        self.policy = bundle.policy.clone();
-        self.last_degradation_event = None;
+        // 5. Persist sealed version counter
+        self.persist_sealed_version(bundle.policy.version)?;
 
+        let previous_version = self.policy.version;
         self.record_ledger_event(
             "POLICY_UPDATED",
             serde_json::json!({
-                "policy_id": self.policy.policy_id,
+                "policy_id": bundle.policy.policy_id,
                 "previous_version": previous_version,
-                "new_version": self.policy.version,
-                "enforcement_mode": self.policy.enforcement_mode,
+                "new_version": bundle.policy.version,
+                "enforcement_mode": bundle.policy.enforcement_mode,
             }),
         )
         .map_err(SentinelError::PolicySignatureInvalid)?;
 
+        self.policy = bundle.policy.clone();
+        self.last_degradation_event = None;
+
         Ok(self.policy.clone())
     }
 
-    /// Queries `HKLM\SOFTWARE\Policies\OmniConnect\Sentinel` (or `/etc/omniconnect/policy.json`
-    /// on Linux) via `sentinel_sys` to load live MDM/GPO overrides (`BUG-CORE-13`, `Row 162`).
+    /// Verifies and applies a signed policy bundle by finding a matching key in `self.pinned_root_public_keys`.
+    pub fn apply_signed_bundle(
+        &mut self,
+        bundle: &SignedPolicyBundle,
+    ) -> Result<IntuneMdmPolicy, SentinelError> {
+        let envelope_pub = hex::decode(&bundle.signer_public_key_hex).map_err(|e| {
+            self.fail_closed_lockdown();
+            SentinelError::PolicySignatureInvalid(format!("Malformed signer_public_key_hex: {e}"))
+        })?;
+
+        let matched = self
+            .pinned_root_public_keys
+            .iter()
+            .find(|pk| pk.len() == envelope_pub.len() && bool::from(pk.ct_eq(&envelope_pub)))
+            .cloned();
+
+        match matched {
+            Some(pk) => self.apply_signed_policy(bundle, &pk),
+            None => {
+                self.fail_closed_lockdown();
+                let _ = self.record_ledger_event(
+                    "POLICY_TAMPER_REJECTED",
+                    serde_json::json!({
+                        "reason": "self_signed_or_untrusted_root",
+                        "candidate_policy_id": bundle.policy.policy_id,
+                        "signer_key": bundle.signer_public_key_hex,
+                    }),
+                );
+                Err(SentinelError::PolicySignatureInvalid(
+                    "Policy signed by untrusted or self-signed key".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Queries OS MDM policy store (signed `/etc/omniconnect/policy.json` on Unix or
+    /// `HKLM\SOFTWARE\Policies\OmniConnect\Sentinel\SignedPolicyBundleJson` on Windows)
+    /// to load signed enterprise policy bundles (`BUG-CORE-13`, `Row 162`).
+    /// All unsigned fallbacks are strictly deleted.
     pub fn load_active_policy(&mut self) -> IntuneMdmPolicy {
-        info!(
-            "Querying OS MDM policy store (HKLM\\{})...",
-            SENTINEL_POLICY_REG_SUBKEY
-        );
+        info!("Querying OS MDM policy store...");
+
+        if let Err(e) = self.load_sealed_version() {
+            #[cfg(not(windows))]
+            warn!("Corrupted policy vault detected during active policy load: {e}");
+            #[cfg(windows)]
+            tracing::warn!("Corrupted policy vault detected during active policy load: {e}");
+            self.fail_closed_lockdown();
+            return self.policy.clone();
+        }
 
         #[cfg(not(windows))]
         {
             let linux_policy_path = Path::new("/etc/omniconnect/policy.json");
-            if let Ok(raw_json) = std::fs::read_to_string(linux_policy_path) {
-                if let Ok(parsed_bundle) = serde_json::from_str::<SignedPolicyBundle>(&raw_json) {
-                    if let Ok(pub_bytes) = hex::decode(&parsed_bundle.signer_public_key_hex) {
-                        if let Err(e) = self.apply_signed_policy(&parsed_bundle, &pub_bytes) {
-                            warn!("Rejected /etc/omniconnect/policy.json bundle: {}", e);
+            if linux_policy_path.exists() {
+                match std::fs::read_to_string(linux_policy_path) {
+                    Ok(raw_json) => match serde_json::from_str::<SignedPolicyBundle>(&raw_json) {
+                        Ok(bundle) => {
+                            if let Err(e) = self.apply_signed_bundle(&bundle) {
+                                warn!("Rejected /etc/omniconnect/policy.json bundle: {}", e);
+                                self.fail_closed_lockdown();
+                            }
                         }
-                    }
-                } else if let Ok(parsed_policy) = serde_json::from_str::<IntuneMdmPolicy>(&raw_json)
-                {
-                    if parsed_policy.version >= self.policy.version {
-                        self.policy = parsed_policy;
+                        Err(e) => {
+                            warn!("Invalid /etc/omniconnect/policy.json format (unsigned policies rejected): {}", e);
+                            self.fail_closed_lockdown();
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed reading /etc/omniconnect/policy.json: {}", e);
+                        self.fail_closed_lockdown();
                     }
                 }
             }
         }
 
-        if let Some(val) =
-            read_registry_dword(false, SENTINEL_POLICY_REG_SUBKEY, "EnforceUsbZeroTrust")
+        #[cfg(windows)]
         {
-            self.policy.enforce_usb_zero_trust = val != 0;
-        }
-        if let Some(val) = read_registry_dword(
-            false,
-            SENTINEL_POLICY_REG_SUBKEY,
-            "BlockCompositeHidStorage",
-        ) {
-            self.policy.block_composite_hid_storage = val != 0;
-        }
-        if let Some(val) =
-            read_registry_dword(false, SENTINEL_POLICY_REG_SUBKEY, "EnforceStrictCdr")
-        {
-            self.policy.require_cdr_for_documents = val != 0;
-        }
-        if let Some(val) = read_registry_dword(false, SENTINEL_POLICY_REG_SUBKEY, "MaxCdrSizeMb") {
-            if val > 0 && val <= 2048 {
-                self.policy.max_sanitization_file_size_mb = val;
-            }
-        }
-        if let Some(hw_ids) = read_registry_string(SENTINEL_POLICY_REG_SUBKEY, "AllowedHardwareIds")
-        {
-            let parsed: Vec<String> = hw_ids
-                .split(';')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !parsed.is_empty() {
-                self.policy.allowed_hardware_ids = parsed;
-            }
-        }
-        if let Some(mode) = read_registry_string(SENTINEL_POLICY_REG_SUBKEY, "EnforcementMode") {
-            if !mode.trim().is_empty() {
-                self.policy.enforcement_mode = mode.trim().to_string();
+            if let Some(bundle_json) =
+                read_registry_string(SENTINEL_POLICY_REG_SUBKEY, "SignedPolicyBundleJson")
+            {
+                match serde_json::from_str::<SignedPolicyBundle>(&bundle_json) {
+                    Ok(bundle) => {
+                        if let Err(e) = self.apply_signed_bundle(&bundle) {
+                            tracing::warn!("Rejected HKLM signed policy bundle: {}", e);
+                            self.fail_closed_lockdown();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Invalid SignedPolicyBundleJson in registry: {}", e);
+                        self.fail_closed_lockdown();
+                    }
+                }
             }
         }
 
@@ -414,11 +656,32 @@ fn default_policy_ledger_path() -> PathBuf {
     {
         let pd = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
         let dir = PathBuf::from(pd).join("OmniConnect").join("Sentinel");
-        if std::fs::create_dir_all(&dir).is_ok() {
+        if sentinel_sys::create_restricted_dir_atomic(&dir).is_ok() {
             return dir.join("policy_audit_ledger_v2.jsonl");
         }
     }
-    std::env::temp_dir()
-        .join("omniconnect_sentinel_policy")
-        .join("policy_audit_ledger_v2.jsonl")
+    #[cfg(not(windows))]
+    {
+        let dir = PathBuf::from("/var/lib/omniconnect/sentinel");
+        if sentinel_sys::create_restricted_dir_atomic(&dir).is_ok() {
+            return dir.join("policy_audit_ledger_v2.jsonl");
+        }
+    }
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+            .join("omniconnect_sentinel_policy")
+            .join("policy_audit_ledger_v2.jsonl")
+    }
+    #[cfg(not(test))]
+    {
+        #[cfg(windows)]
+        {
+            PathBuf::from(r"C:\ProgramData\OmniConnect\Sentinel\policy_audit_ledger_v2.jsonl")
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from("/var/lib/omniconnect/sentinel/policy_audit_ledger_v2.jsonl")
+        }
+    }
 }

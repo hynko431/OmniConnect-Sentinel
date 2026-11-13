@@ -708,8 +708,10 @@ fn test_intune_xml_escaping_and_falcon_cef_injection_immunity() {
     let (pub_key, priv_key) = sentinel_sys::generate_raw_ecdsa_p256_keypair()
         .expect("Generating ECDSA P-256 keypair must succeed");
 
-    let mut policy_mgr =
-        IntunePolicyManager::new().with_ledger_path(dir.path().join("policy_ledger.jsonl"));
+    let mut policy_mgr = IntunePolicyManager::new()
+        .with_ledger_path(dir.path().join("policy_ledger.jsonl"))
+        .with_vault_dir(dir.path().join(".sentinel_vault"))
+        .with_pinned_root_public_keys(vec![pub_key.clone()]);
     assert_eq!(policy_mgr.policy().version, 2);
 
     let mut v3_policy = policy_mgr.policy().clone();
