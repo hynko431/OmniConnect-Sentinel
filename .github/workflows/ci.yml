@@ -8,15 +8,13 @@ on:
 
 permissions:
   contents: read
-  id-token: write
-  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test-and-verify:
-    name: Test Matrix, Clippy & Fuzz Corpus Regression
+    name: Test Matrix, Clippy, Invariant Gates & Fuzz Regression
     strategy:
       fail-fast: false
       matrix:
@@ -24,10 +22,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@a54c7fe936446702c2e813137976e5d8ecf4e43e # stable
         with:
           components: clippy, rustfmt
 
@@ -38,32 +36,52 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Strict Invariant Gate - Zero unapproved allow() bypasses
+        shell: bash
+        run: |
+          if git grep -n "allow(" crates/ | grep -v "cold_eye" | grep -v "#!\[allow(unused_imports, unused_variables)\]"; then
+            echo "ERROR: Unapproved allow() compiler bypass detected in production crates!"
+            exit 1
+          fi
+
+      - name: Strict Invariant Gate - Zero thread_rng() calls in workspace crates
+        shell: bash
+        run: |
+          if git grep -n "thread_rng" crates/; then
+            echo "ERROR: Disallowed thread_rng() detected in crates! Use cryptographically secure OsRng."
+            exit 1
+          fi
+
       - name: Clippy strict lint gate (no unwrap/expect in production crates)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Execute full test pyramid (unit, property, invariant I1-I5, output oracles, chaos)
-        run: cargo test --workspace -- --nocapture
+        run: cargo test --workspace --locked -- --nocapture
 
   supply-chain-and-sbom:
-    name: Supply-Chain Gate (cargo-deny, cargo-audit, cargo-machete, CycloneDX SBOM, SLSA)
+    name: Supply-Chain Gate (cargo-deny, cargo-audit, cargo-machete, Trivy, CycloneDX SBOM, SLSA)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@a54c7fe936446702c2e813137976e5d8ecf4e43e # stable
 
       - name: Install Linux build prerequisites
         run: sudo apt-get update && sudo apt-get install -y pkg-config protobuf-compiler
 
       - name: Run cargo-deny (advisories, licenses, bans, sources)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3f4a782664881cfac704d5e94b2cb5ae7f5efca0 # v2.0.8
         with:
           command: check advisories licenses bans sources
 
       - name: Install prebuilt supply-chain security tools (cargo-audit, cargo-machete, cargo-cyclonedx)
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@b735db4db54b41300994fbc266fdbd42ea04652c # v2.49.20
         with:
           tool: cargo-audit,cargo-machete,cargo-cyclonedx
 
@@ -85,12 +103,31 @@ jobs:
           fi
           test -f sbom.cdx.json
 
+      - name: Run Trivy Vulnerability & Secret Scanner (Filesystem)
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.29.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+
+      - name: Run Trivy Scanner on CycloneDX SBOM
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.29.0
+        with:
+          scan-type: 'sbom'
+          scan-ref: 'sbom.cdx.json'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
       - name: Build release binaries for SLSA provenance & signing
         run: cargo build --workspace --release --locked
 
       - name: Attest SLSA Build Provenance & CycloneDX SBOM
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@efb9909247d86f78f8cb0a62abf717cf7b0e45c4 # v1.4.3
         with:
           subject-path: |
             target/release/sentinel

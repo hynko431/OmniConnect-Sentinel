@@ -4,6 +4,10 @@
 *.pdb
 .sentinel_vault/
 **/.sentinel_vault/
+sbom.cdx.json
+*.sealed
+*.escrow
+pending_challenge_*.token
 
 # IDE and OS files
 .DS_Store

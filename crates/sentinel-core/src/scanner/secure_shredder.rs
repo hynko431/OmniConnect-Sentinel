@@ -146,7 +146,7 @@ impl SecureShredder {
                     while remaining > 0 {
                         let to_write = std::cmp::min(remaining, chunk_capacity as u64) as usize;
                         if pass == effective_passes {
-                            rand::thread_rng().fill_bytes(&mut aligned_buf.data[..to_write]);
+                            rand::rngs::OsRng.fill_bytes(&mut aligned_buf.data[..to_write]);
                         } else if pass % 2 == 1 {
                             aligned_buf.data[..to_write].fill(0x00);
                         } else {
@@ -225,7 +225,7 @@ impl SecureShredder {
                     let to_write = std::cmp::min(remaining, chunk_capacity as u64) as usize;
 
                     if pass == effective_passes {
-                        rand::thread_rng().fill_bytes(&mut aligned_buf.data[..to_write]);
+                        rand::rngs::OsRng.fill_bytes(&mut aligned_buf.data[..to_write]);
                     } else if pass % 2 == 1 {
                         aligned_buf.data[..to_write].fill(0x00);
                     } else {
@@ -494,7 +494,7 @@ impl SecureShredder {
                     match pass {
                         1 => aligned_buf.data[..to_write].fill(0x00),
                         2 => aligned_buf.data[..to_write].fill(0xFF),
-                        _ => rand::thread_rng().fill_bytes(&mut aligned_buf.data[..to_write]),
+                        _ => rand::rngs::OsRng.fill_bytes(&mut aligned_buf.data[..to_write]),
                     }
                     stream_file
                         .write_all(&aligned_buf.data[..to_write])
@@ -618,7 +618,7 @@ impl SecureShredder {
             .map_err(|e| format!("Failed creating free-space balloon file: {e}"))?;
 
         let mut aligned_chunk = Box::new(AlignedSectorBuffer::new());
-        rand::thread_rng().fill_bytes(&mut aligned_chunk.data);
+        rand::rngs::OsRng.fill_bytes(&mut aligned_chunk.data);
         while written < target_limit {
             let to_write =
                 std::cmp::min(target_limit - written, aligned_chunk.data.len() as u64) as usize;

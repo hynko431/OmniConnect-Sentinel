@@ -376,7 +376,7 @@ impl QuarantineVault {
 
         // First-time provisioning of a new Quarantine Vault
         let mut fresh_kek = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut fresh_kek);
+        rand::rngs::OsRng.fill_bytes(&mut fresh_kek);
         let zeroizing = ZeroizingBytes::new(fresh_kek);
         zeroize_slice(&mut fresh_kek);
         let kek_id = Self::compute_kek_id(zeroizing.as_slice());
@@ -503,7 +503,7 @@ impl QuarantineVault {
         );
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(wrapping_key.as_slice()));
         let mut wrap_nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut wrap_nonce);
+        rand::rngs::OsRng.fill_bytes(&mut wrap_nonce);
         let wrapped_ct = cipher
             .encrypt(
                 Nonce::from_slice(&wrap_nonce),
@@ -809,9 +809,9 @@ impl QuarantineVault {
         let mut file_salt = [0u8; 32];
         let mut nonce = [0u8; 12];
         let mut raw_entry_dek = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut file_salt);
-        rand::thread_rng().fill_bytes(&mut nonce);
-        rand::thread_rng().fill_bytes(&mut raw_entry_dek);
+        rand::rngs::OsRng.fill_bytes(&mut file_salt);
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::rngs::OsRng.fill_bytes(&mut raw_entry_dek);
 
         let entry_dek = ZeroizingBytes::new(raw_entry_dek);
         zeroize_slice(&mut raw_entry_dek);

@@ -1,11 +1,24 @@
 [build]
 incremental = false
 
-[target.'cfg(windows)']
-rustflags = ["-C", "control-flow-guard=yes", "-D", "warnings"]
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "control-flow-guard=checks",
+    "-C", "link-arg=/CETCOMPAT",
+    "-C", "link-arg=/HIGHENTROPYVA",
+    "-C", "link-arg=/DYNAMICBASE",
+    "-C", "link-arg=/NXCOMPAT",
+    "-C", "link-arg=/GUARD:CF",
+    "-D", "warnings",
+]
 
-[target.'cfg(not(windows))']
-rustflags = ["-D", "warnings"]
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-Wl,-z,relro,-z,now",
+    "-C", "link-arg=-Wl,-z,noexecstack",
+    "-D", "warnings",
+]
 
 [env]
 CARGO_INCREMENTAL = "0"
