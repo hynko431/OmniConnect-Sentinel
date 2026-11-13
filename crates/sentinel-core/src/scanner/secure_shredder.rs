@@ -14,7 +14,7 @@ use sentinel_sys::{
     to_verbatim_path, AlignedSectorBuffer,
 };
 
-use crate::enterprise::ledger::AuditLedger;
+use crate::enterprise::ledger::{AuditLedger, AuditSubsystem, SharedAuditLedger};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShredMethod {
@@ -58,7 +58,11 @@ pub struct ShredReceipt {
 pub struct SecureShredder;
 
 impl SecureShredder {
-    pub fn shred_file(path: &Path, method: ShredMethod) -> Result<ShredReceipt, String> {
+    pub fn shred_file_with_shared_ledger(
+        path: &Path,
+        method: ShredMethod,
+        shared_ledger: Option<&SharedAuditLedger>,
+    ) -> Result<ShredReceipt, String> {
         // Refuse symlinks and NTFS reparse points before touching attributes or opening handles (`Critical #1`, Row 67)
         ensure_not_symlink_or_reparse_point(path).map_err(|e| {
             format!(
@@ -360,12 +364,20 @@ impl SecureShredder {
             verify_read_ok: verification_passed,
         };
 
-        Self::record_shred_receipt_to_ledger(
-            &default_shred_ledger_path(),
-            "SHRED_RECEIPT",
-            &receipt,
-        )?;
+        if let Some(sl) = shared_ledger {
+            Self::record_shred_receipt_to_shared_ledger(sl, "SHRED_RECEIPT", &receipt)?;
+        } else {
+            Self::record_shred_receipt_to_ledger(
+                &default_shred_ledger_path(),
+                "SHRED_RECEIPT",
+                &receipt,
+            )?;
+        }
         Ok(receipt)
+    }
+
+    pub fn shred_file(path: &Path, method: ShredMethod) -> Result<ShredReceipt, String> {
+        Self::shred_file_with_shared_ledger(path, method, None)
     }
 
     pub fn shred_file_with_ledger(
@@ -378,6 +390,20 @@ impl SecureShredder {
         Ok(receipt)
     }
 
+    pub fn record_shred_receipt_to_shared_ledger(
+        shared_ledger: &SharedAuditLedger,
+        event_type: &str,
+        receipt: &ShredReceipt,
+    ) -> Result<(), String> {
+        let mut guard = shared_ledger
+            .lock()
+            .map_err(|e| format!("SharedAuditLedger lock poisoned: {e}"))?;
+        let payload = serde_json::to_value(receipt)
+            .map_err(|e| format!("Failed serializing ShredReceipt for AuditLedger: {e}"))?;
+        guard.append_subsystem_event(AuditSubsystem::SecureShredder, event_type, payload)?;
+        Ok(())
+    }
+
     fn record_shred_receipt_to_ledger(
         ledger_path: &Path,
         event_type: &str,
@@ -386,11 +412,9 @@ impl SecureShredder {
         static SHRED_LEDGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = SHRED_LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut ledger = AuditLedger::open(ledger_path);
-        ledger.append_event(
-            event_type,
-            serde_json::to_value(receipt)
-                .map_err(|e| format!("Failed serializing ShredReceipt for AuditLedger: {e}"))?,
-        )?;
+        let payload = serde_json::to_value(receipt)
+            .map_err(|e| format!("Failed serializing ShredReceipt for AuditLedger: {e}"))?;
+        ledger.append_subsystem_event(AuditSubsystem::SecureShredder, event_type, payload)?;
         Ok(())
     }
 
@@ -407,7 +431,11 @@ impl SecureShredder {
 
     /// Surgically overwrites and unlinks an NTFS Alternate Data Stream (`host_path:stream_name`)
     /// without harming the primary `$DATA` stream of `host_path` (`BUG-CORE-06` #7).
-    pub fn shred_ntfs_stream(host_path: &Path, stream_name: &str) -> Result<ShredReceipt, String> {
+    pub fn shred_ntfs_stream_with_shared_ledger(
+        host_path: &Path,
+        stream_name: &str,
+        shared_ledger: Option<&SharedAuditLedger>,
+    ) -> Result<ShredReceipt, String> {
         ensure_not_symlink_or_reparse_point(host_path).map_err(|e| {
             format!(
                 "Refusing NTFS ADS shred on symlink or reparse point '{}': {}",
@@ -546,12 +574,20 @@ impl SecureShredder {
             verify_read_ok: verification_passed,
         };
 
-        Self::record_shred_receipt_to_ledger(
-            &default_shred_ledger_path(),
-            "SHRED_ADS_RECEIPT",
-            &receipt,
-        )?;
+        if let Some(sl) = shared_ledger {
+            Self::record_shred_receipt_to_shared_ledger(sl, "SHRED_ADS_RECEIPT", &receipt)?;
+        } else {
+            Self::record_shred_receipt_to_ledger(
+                &default_shred_ledger_path(),
+                "SHRED_ADS_RECEIPT",
+                &receipt,
+            )?;
+        }
         Ok(receipt)
+    }
+
+    pub fn shred_ntfs_stream(host_path: &Path, stream_name: &str) -> Result<ShredReceipt, String> {
+        Self::shred_ntfs_stream_with_shared_ledger(host_path, stream_name, None)
     }
 
     /// Best-effort unallocated free-space fill (`--fill-free-space`, Master Plan v2 §1.2).
@@ -601,21 +637,13 @@ impl SecureShredder {
 }
 
 fn default_shred_ledger_path() -> std::path::PathBuf {
-    #[cfg(windows)]
-    {
-        let pd = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
-        let dir = std::path::PathBuf::from(pd)
-            .join("OmniConnect")
-            .join("Sentinel")
-            .join("ShredAudit");
-        if fs::create_dir_all(&dir).is_ok() {
-            return dir.join("shred_audit_ledger_v2.jsonl");
+    if let Ok(custom) = std::env::var("SENTINEL_SHRED_LEDGER_PATH") {
+        let pb = std::path::PathBuf::from(custom);
+        if let Some(parent) = pb.parent() {
+            let _ = sentinel_sys::create_restricted_dir_atomic(parent);
         }
+        return pb;
     }
-    std::env::temp_dir()
-        .join(format!(
-            "omniconnect_sentinel_shred_ledger_{}",
-            std::process::id()
-        ))
-        .join("shred_audit_ledger_v2.jsonl")
+
+    crate::enterprise::ledger::default_unified_ledger_path()
 }

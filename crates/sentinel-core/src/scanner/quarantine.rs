@@ -19,7 +19,7 @@ use sentinel_sys::{
     zeroize_slice, KeyProtectionPosture, SealedKeyBlob, SocEscrowBlob, ZeroizingBytes,
 };
 
-use crate::enterprise::ledger::AuditLedger;
+use crate::enterprise::ledger::{AuditLedger, AuditSubsystem, SharedAuditLedger};
 use crate::error::{DegradationEvent, SentinelError};
 use crate::scanner::secure_shredder::{SecureShredder, ShredMethod};
 
@@ -113,6 +113,7 @@ pub struct QuarantineVault {
     posture: KeyProtectionPosture,
     degradation_event: Option<DegradationEvent>,
     init_error: Option<String>,
+    shared_ledger: Option<SharedAuditLedger>,
 }
 
 impl std::fmt::Debug for QuarantineVault {
@@ -160,7 +161,14 @@ impl QuarantineVault {
             posture,
             degradation_event,
             init_error: None,
+            shared_ledger: None,
         })
+    }
+
+    /// Attaches a unified `SharedAuditLedger` to the Quarantine Vault (`CSE-13`).
+    pub fn with_shared_ledger(mut self, shared_ledger: SharedAuditLedger) -> Self {
+        self.shared_ledger = Some(shared_ledger);
+        self
     }
 
     /// Convenience constructor that preserves fail-closed semantics: if `open()` fails
@@ -179,6 +187,7 @@ impl QuarantineVault {
                     posture: KeyProtectionPosture::DpapiLocalMachine,
                     degradation_event: Some(DegradationEvent::VaultIntegrityFail),
                     init_error: Some(err),
+                    shared_ledger: None,
                 }
             }
         }
@@ -240,6 +249,7 @@ impl QuarantineVault {
             posture,
             degradation_event,
             init_error: None,
+            shared_ledger: None,
         };
         vault.append_ledger_event(
             "VAULT_ESCROW_RECOVERED",
@@ -272,8 +282,23 @@ impl QuarantineVault {
     }
 
     fn append_ledger_event(&self, event: &str, data: &str) -> Result<(), String> {
+        if let Some(shared) = &self.shared_ledger {
+            if let Ok(mut guard) = shared.lock() {
+                guard.append_subsystem_event(
+                    AuditSubsystem::Quarantine,
+                    event,
+                    serde_json::Value::String(data.to_string()),
+                )?;
+                return Ok(());
+            }
+        }
         let mut ledger = AuditLedger::open_result(self.ledger_file_path())?;
-        ledger.append_event(event, data).map(|_| ())
+        ledger.append_subsystem_event(
+            AuditSubsystem::Quarantine,
+            event,
+            serde_json::Value::String(data.to_string()),
+        )?;
+        Ok(())
     }
 
     fn load_or_init_master_kek(
@@ -614,7 +639,11 @@ impl QuarantineVault {
 
         // Shred the original plaintext carrier from the source volume after verifying `.quar` (`BUG-CLI-01` #2)
         // Propagate errors with `?` — never ignore shred errors!
-        SecureShredder::shred_file(file_path, ShredMethod::ClearMultiPass { passes: 3 })?;
+        SecureShredder::shred_file_with_shared_ledger(
+            file_path,
+            ShredMethod::ClearMultiPass { passes: 3 },
+            self.shared_ledger.as_ref(),
+        )?;
 
         self.append_ledger_event(
             "QUARANTINE_CREATED",
@@ -678,7 +707,11 @@ impl QuarantineVault {
             ));
         }
 
-        SecureShredder::shred_file(file_path, ShredMethod::ClearMultiPass { passes: 3 })?;
+        SecureShredder::shred_file_with_shared_ledger(
+            file_path,
+            ShredMethod::ClearMultiPass { passes: 3 },
+            self.shared_ledger.as_ref(),
+        )?;
         Ok(entry)
     }
 
@@ -735,7 +768,11 @@ impl QuarantineVault {
         self.verify_entry(&entry.entry_id)?;
 
         // Surgically Clear and delete ONLY the NTFS Alternate Data Stream, preserving `host_path`
-        SecureShredder::shred_ntfs_stream(host_path, clean_stream)?;
+        SecureShredder::shred_ntfs_stream_with_shared_ledger(
+            host_path,
+            clean_stream,
+            self.shared_ledger.as_ref(),
+        )?;
 
         self.append_ledger_event(
             "QUARANTINE_ADS_CREATED",
@@ -1027,11 +1064,19 @@ impl QuarantineVault {
         // Step 1: True Cryptographic Erasure — overwrite and destroy the wrapped per-entry DEK (`<entry_id>.dek`)
         let dek_path = self.vault_dir.join(format!("{entry_id}.dek"));
         if dek_path.exists() {
-            SecureShredder::shred_file(&dek_path, ShredMethod::ClearMultiPass { passes: 3 })?;
+            SecureShredder::shred_file_with_shared_ledger(
+                &dek_path,
+                ShredMethod::ClearMultiPass { passes: 3 },
+                self.shared_ledger.as_ref(),
+            )?;
         }
 
         // Step 2: Overwrite and unlink the `.quar` ciphertext envelope and sync the directory
-        SecureShredder::shred_file(&vault_file_path, ShredMethod::CryptoErase)?;
+        SecureShredder::shred_file_with_shared_ledger(
+            &vault_file_path,
+            ShredMethod::CryptoErase,
+            self.shared_ledger.as_ref(),
+        )?;
         sync_directory(&self.vault_dir)
             .map_err(|e| format!("Failed syncing quarantine directory after purge: {e}"))?;
 
@@ -1166,14 +1211,16 @@ impl QuarantineVault {
                         })?;
                     }
                     LegacyMigrationAction::Delete => {
-                        SecureShredder::shred_file(
+                        SecureShredder::shred_file_with_shared_ledger(
                             &path,
                             ShredMethod::ClearMultiPass { passes: 3 },
+                            self.shared_ledger.as_ref(),
                         )?;
                         if json_sidecar.exists() {
-                            SecureShredder::shred_file(
+                            SecureShredder::shred_file_with_shared_ledger(
                                 &json_sidecar,
                                 ShredMethod::ClearMultiPass { passes: 3 },
+                                self.shared_ledger.as_ref(),
                             )?;
                         }
                     }

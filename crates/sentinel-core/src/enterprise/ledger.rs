@@ -4,15 +4,158 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::warn;
 
 use sentinel_sys::{
-    apply_system_admin_dacl, create_sealed_ecdsa_p256_keypair, sign_with_sealed_ecdsa_p256,
-    sync_directory, verify_ecdsa_p256_digest, write_protected_key_file, KeyProtectionPosture,
-    SealedEcdsaKeyPair,
+    create_restricted_dir_atomic, create_restricted_file_handle_atomic,
+    create_sealed_ecdsa_p256_keypair, sign_with_sealed_ecdsa_p256, sync_directory,
+    verify_ecdsa_p256_digest, write_protected_key_file, KeyProtectionPosture, SealedEcdsaKeyPair,
 };
 
 const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Subsystem classification for the unified single-root Audit Ledger (`Master Plan v2 §4.2`, `CSE-13`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuditSubsystem {
+    Quarantine,
+    VfsShadow,
+    Tier3Sandbox,
+    SiemFalcon,
+    SecureShredder,
+    Intune,
+    Kiosk,
+    System,
+}
+
+impl std::fmt::Display for AuditSubsystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Quarantine => write!(f, "Quarantine"),
+            Self::VfsShadow => write!(f, "VfsShadow"),
+            Self::Tier3Sandbox => write!(f, "Tier3Sandbox"),
+            Self::SiemFalcon => write!(f, "SiemFalcon"),
+            Self::SecureShredder => write!(f, "SecureShredder"),
+            Self::Intune => write!(f, "Intune"),
+            Self::Kiosk => write!(f, "Kiosk"),
+            Self::System => write!(f, "System"),
+        }
+    }
+}
+
+/// Thread-safe shared handle to the unified Audit Ledger (`Master Plan v2 §4.2`, `CSE-13`).
+pub type SharedAuditLedger = Arc<Mutex<AuditLedger>>;
+
+static GLOBAL_UNIFIED_LEDGER: OnceLock<SharedAuditLedger> = OnceLock::new();
+
+/// Resolves the default path for the unified single-root Audit Ledger.
+pub fn default_unified_ledger_path() -> PathBuf {
+    if let Ok(custom) = std::env::var("SENTINEL_UNIFIED_AUDIT_LEDGER") {
+        return PathBuf::from(custom);
+    }
+    if let Ok(custom) = std::env::var("SENTINEL_AUDIT_LEDGER_PATH") {
+        return PathBuf::from(custom);
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(pd) = std::env::var("ProgramData") {
+            let dir = PathBuf::from(pd).join("OmniConnect").join("AuditLedger");
+            if create_restricted_dir_atomic(&dir).is_ok() {
+                return dir.join("sentinel_unified_audit.jsonl");
+            }
+        }
+        if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+            let dir = PathBuf::from(lad).join("OmniConnect").join("AuditLedger");
+            if create_restricted_dir_atomic(&dir).is_ok() {
+                return dir.join("sentinel_unified_audit.jsonl");
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = PathBuf::from("/var/lib/omniconnect/audit_ledger");
+        if create_restricted_dir_atomic(&dir).is_ok() {
+            return dir.join("sentinel_unified_audit.jsonl");
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let dir = PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("omniconnect")
+                .join("audit_ledger");
+            if create_restricted_dir_atomic(&dir).is_ok() {
+                return dir.join("sentinel_unified_audit.jsonl");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+            .join(format!("sentinel_unified_ledger_{}", std::process::id()))
+            .join("sentinel_unified_audit.jsonl")
+    }
+    #[cfg(not(test))]
+    {
+        if let Ok(cwd) = std::env::current_dir() {
+            let dir = cwd.join(".sentinel_audit");
+            if create_restricted_dir_atomic(&dir).is_ok() {
+                return dir.join("sentinel_unified_audit.jsonl");
+            }
+        }
+        #[cfg(windows)]
+        {
+            PathBuf::from(r"C:\ProgramData\OmniConnect\AuditLedger\sentinel_unified_audit.jsonl")
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from("/var/lib/omniconnect/audit_ledger/sentinel_unified_audit.jsonl")
+        }
+    }
+}
+
+/// Creates a new thread-safe `SharedAuditLedger` wrapping an `AuditLedger` at the given path.
+pub fn create_shared_audit_ledger(
+    ledger_path: impl Into<PathBuf>,
+) -> Result<SharedAuditLedger, String> {
+    let ledger = AuditLedger::open_result(ledger_path)?;
+    Ok(Arc::new(Mutex::new(ledger)))
+}
+
+/// Returns or initializes the global unified `SharedAuditLedger` singleton.
+pub fn get_or_init_global_shared_ledger(explicit_path: Option<PathBuf>) -> SharedAuditLedger {
+    GLOBAL_UNIFIED_LEDGER
+        .get_or_init(|| {
+            let path = explicit_path.unwrap_or_else(default_unified_ledger_path);
+            let ledger = AuditLedger::open(path);
+            Arc::new(Mutex::new(ledger))
+        })
+        .clone()
+}
+
+/// Computes an HMAC-SHA256 pseudonymized token for sensitive file paths (GDPR/DPDP compliance, `Master Plan v2 §4.2`).
+pub fn tokenize_path_for_privacy(hmac_key: &[u8], raw_path: &Path) -> String {
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = match HmacSha256::new_from_slice(hmac_key) {
+        Ok(m) => m,
+        Err(_) => {
+            let digest = Sha256::digest(hmac_key);
+            match HmacSha256::new_from_slice(&digest) {
+                Ok(m) => m,
+                Err(_) => {
+                    let mut fallback = Sha256::new();
+                    fallback.update(hmac_key);
+                    fallback.update(raw_path.to_string_lossy().as_bytes());
+                    return hex::encode(fallback.finalize());
+                }
+            }
+        }
+    };
+    mac.update(raw_path.to_string_lossy().as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
 
 /// Append-only Audit Ledger JSONL Record (`Master Plan v2 §4.2`, Invariant I5).
 ///
@@ -68,16 +211,9 @@ impl AuditLedger {
         let ledger_path = ledger_path.into();
         if let Some(parent) = ledger_path.parent() {
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).map_err(|e| {
+                create_restricted_dir_atomic(parent).map_err(|e| {
                     format!(
-                        "Failed creating audit ledger directory {}: {}",
-                        parent.display(),
-                        e
-                    )
-                })?;
-                apply_system_admin_dacl(parent).map_err(|e| {
-                    format!(
-                        "Failed applying SYSTEM/Admin DACL to audit ledger directory {}: {}",
+                        "Failed creating atomic restricted audit ledger directory {}: {}",
                         parent.display(),
                         e
                     )
@@ -275,9 +411,21 @@ impl AuditLedger {
         line.push('\n');
 
         let is_new_file = !self.ledger_path.exists();
-        {
+        if is_new_file {
+            let mut file = create_restricted_file_handle_atomic(&self.ledger_path)
+                .map_err(|e| format!("Failed creating atomic restricted audit ledger: {e}"))?;
+            file.write_all(line.as_bytes())
+                .map_err(|e| format!("Failed appending to audit ledger: {e}"))?;
+            file.sync_all()
+                .map_err(|e| format!("Failed syncing audit ledger: {e}"))?;
+            if let Some(parent) = self.ledger_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    sync_directory(parent)
+                        .map_err(|e| format!("Failed syncing ledger parent directory: {e}"))?;
+                }
+            }
+        } else {
             let mut file = OpenOptions::new()
-                .create(true)
                 .append(true)
                 .open(&self.ledger_path)
                 .map_err(|e| format!("Failed opening audit ledger: {e}"))?;
@@ -285,21 +433,6 @@ impl AuditLedger {
                 .map_err(|e| format!("Failed appending to audit ledger: {e}"))?;
             file.sync_all()
                 .map_err(|e| format!("Failed syncing audit ledger: {e}"))?;
-        }
-        if is_new_file {
-            apply_system_admin_dacl(&self.ledger_path).map_err(|e| {
-                format!(
-                    "Failed applying SYSTEM/Admin DACL to audit ledger {}: {}",
-                    self.ledger_path.display(),
-                    e
-                )
-            })?;
-            if let Some(parent) = self.ledger_path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    sync_directory(parent)
-                        .map_err(|e| format!("Failed syncing ledger parent directory: {e}"))?;
-                }
-            }
         }
 
         self.next_seq = seq + 1;
@@ -309,6 +442,40 @@ impl AuditLedger {
         self.sign_chain_head()?;
 
         Ok(record)
+    }
+
+    /// Appends a subsystem-tagged JSONL record to the unified Audit Ledger (`CSE-13`).
+    pub fn append_subsystem_event(
+        &mut self,
+        subsystem: AuditSubsystem,
+        event: &str,
+        event_data: serde_json::Value,
+    ) -> Result<LedgerRecord, String> {
+        let payload = serde_json::json!({
+            "subsystem": subsystem.to_string(),
+            "payload": event_data,
+        });
+        self.append_event(event, payload)
+    }
+
+    /// Emits a signed WORM checkpoint to the Audit Ledger (`Master Plan v2 §4.2`, `CSE-13`).
+    pub fn emit_worm_checkpoint(&mut self) -> Result<SignedChainHead, String> {
+        if self.next_seq <= 1 {
+            self.append_event(
+                "LEDGER_GENESIS_INIT",
+                serde_json::json!({ "subsystem": "System", "status": "INITIALIZED" }),
+            )?;
+        }
+        let head = self.sign_chain_head()?;
+        let checkpoint_data = serde_json::json!({
+            "subsystem": "System",
+            "checkpoint_type": "WORM_PERIODIC_60S",
+            "head_seq": head.head_seq,
+            "head_hash": head.head_hash,
+            "signed_at_utc": head.signed_at_utc,
+        });
+        self.append_event("LEDGER_WORM_CHECKPOINT", checkpoint_data)?;
+        Ok(head)
     }
 
     /// Explicitly signs the current chain head (`head_seq|head_hash`) with the asymmetric
@@ -411,6 +578,13 @@ impl AuditLedger {
         }
 
         if count == 0 {
+            let head_path = Self::head_sig_path(&self.ledger_path);
+            if head_path.exists() {
+                return Err(format!(
+                    "LEDGER_CHAIN_BROKEN: Ledger file is empty while signed chain-head checkpoint {} exists (total tail-truncation detected)",
+                    head_path.display()
+                ));
+            }
             return Ok(0);
         }
 
