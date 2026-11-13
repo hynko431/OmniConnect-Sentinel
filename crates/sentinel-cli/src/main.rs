@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -164,7 +164,7 @@ enum Commands {
         #[arg(long)]
         device_id: String,
 
-        /// 8-character hex user-presence confirmation challenge code
+        /// 128-bit hex user-presence confirmation challenge code or path to local .token file
         #[arg(long)]
         challenge: String,
     },
@@ -766,7 +766,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = bridge.emit_alert(&ev);
         }
         Commands::Kiosk { media } => {
-            let scratch = std::env::temp_dir().join("sentinel_kiosk_scratch");
+            let scratch = {
+                #[cfg(test)]
+                {
+                    std::env::temp_dir().join("sentinel_kiosk_scratch")
+                }
+                #[cfg(not(test))]
+                {
+                    #[cfg(windows)]
+                    let p = PathBuf::from(r"C:\ProgramData\OmniConnect\KioskScratch");
+                    #[cfg(not(windows))]
+                    let p = PathBuf::from("/var/lib/omniconnect/kiosk_scratch");
+                    let _ = sentinel_sys::create_restricted_dir_atomic(&p);
+                    p
+                }
+            };
             let mut kiosk = AirGappedKioskManager::from_terminal_id(
                 "KIOSK-TERMINAL-SCADA-01".to_string(),
                 scratch.clone(),
@@ -904,10 +918,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             device_id,
             challenge,
         } => {
+            let trimmed = challenge.trim();
+            let resolved_token = if Path::new(trimmed).is_file() {
+                fs::read_to_string(trimmed)
+                    .map_err(|e| format!("Failed to read challenge token file {trimmed}: {e}"))?
+                    .trim()
+                    .to_string()
+            } else {
+                trimmed.to_string()
+            };
             let mgr = PendingDeviceConfirmationManager::new(
                 PendingDeviceConfirmationManager::default_state_file(),
             );
-            mgr.confirm_device_with_challenge(&device_id, &challenge)?;
+            mgr.confirm_device_with_challenge(&device_id, &resolved_token)?;
             let mut ledger = AuditLedger::open(PathBuf::from(".sentinel_vault/audit.jsonl"));
             let _ = ledger.append_event(
                 "DEVICE_CONFIRMED_BY_USER",

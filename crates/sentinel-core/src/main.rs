@@ -202,9 +202,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Err(e) = interceptor.sever_data_lines(&device_id).await {
                                 warn!("sever_data_lines failed for {}: {}", device_id, e);
                             }
-                            let challenge = confirmation_mgr
-                                .request_user_presence_confirmation(&device_id)
-                                .unwrap_or_else(|_| "CHALLENGE-ERR".to_string());
+                            let challenge_info = confirmation_mgr
+                                .request_user_presence_challenge_extended(&device_id);
+                            let challenge_id = challenge_info
+                                .as_ref()
+                                .map(|c| c.challenge_id.as_str())
+                                .unwrap_or("CHALLENGE-ERR");
                             let _ = falcon_bridge.emit_alert(&FalconTelemetryEvent {
                                 severity: 10,
                                 signature_id: "BADUSB-COMPOSITE-001".to_string(),
@@ -215,13 +218,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 file_sha256: None,
                                 action_taken: "SEVER_DATA_LINES_AWAITING_CONFIRMATION".to_string(),
                                 details: format!(
-                                    "Blocked composite device {device_id}; run 'sentinel confirm-device --device-id \"{device_id}\" --challenge {challenge}' to authorize"
+                                    "Blocked composite device {device_id}; challenge_id={challenge_id}; physical console authorization token required (see pending_challenge_{challenge_id}.token)"
                                 ),
                             });
                             let _ = audit_ledger.append_event(
                                 "BADUSB_BLOCKED",
                                 format!(
-                                    "Severed data lines for composite device {device_id}; challenge={challenge} issued"
+                                    "Severed data lines for composite device {device_id}; challenge_id={challenge_id} issued"
                                 ),
                             );
                         } else if let Some(raw_mount) = &event.raw_mount_point {

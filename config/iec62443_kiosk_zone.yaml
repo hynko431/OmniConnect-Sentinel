@@ -1,0 +1,64 @@
+# IEC 62443-3-3 Security Level 3 (SL-3) Kiosk Security Zone Definition
+# Zone Identifier: Z4-DMZ-KIOSK
+# Boundary: Untrusted Removable Media (Zone 0) <-> Operational Technology / Enterprise Network (Zone 3/4)
+
+zone:
+  id: "Z4-DMZ-KIOSK"
+  name: "Air-Gapped Removable Media Inspection & Sanitization Kiosk"
+  security_level: "SL-3"
+  fail_closed: true
+  conduit_isolation: "Physical Air-Gap & Bounded Userspace ProjFS Virtual File System"
+  regulatory_frameworks:
+    - "IEC 62443-3-3:2013 (System security requirements and security levels)"
+    - "IEC 62443-4-2:2019 (Technical security requirements for IACS components)"
+    - "NIST SP 800-82 Rev. 3 (Guide to Operational Technology Security)"
+    - "CERT-In Cyber Security Directions (Directions under sub-section (6) of section 70B)"
+
+security_controls:
+  # FR 1 - Identification and Authentication Control (IAC)
+  iac:
+    badusb_hardware_gate:
+      enabled: true
+      challenge_entropy_bits: 128
+      hashing_algorithm: "SHA-256"
+      token_ttl_seconds: 300
+      max_failed_attempts: 3
+      lockout_policy: "Immediate entry purge and device node severance upon strike 3"
+      siem_redaction: "challenge_id reference only; secret token stored solely in restricted local console token file"
+
+  # FR 2 - Use Control (UC)
+  uc:
+    path_traversal_containment:
+      enforced_sanitizer: "sanitize_strict_relative_subpath"
+      rejected_patterns:
+        - "Parent directory traversal ('..')"
+        - "Absolute paths, drive letters, and UNC prefixes"
+        - "NTFS Alternate Data Streams (':')"
+        - "ASCII control characters (0x00..=0x1F, 0x7F)"
+        - "Unicode bidirectional override characters (U+202A..=U+202E, U+2066..=U+2069)"
+        - "Legacy DOS device names (CON, PRN, AUX, NUL, COM1..9, LPT1..9)"
+      media_id_pattern: "^[A-Za-z0-9_-]{1,64}$"
+
+  # FR 3 - System Integrity (SI)
+  si:
+    ephemeral_session_sandbox:
+      max_session_duration_minutes: 15
+      cryptographic_key_lifecycle:
+        algorithm: "AES-256-GCM"
+        key_size_bits: 256
+        storage: "In-memory ZeroizingBytes<32> with immediate volatile wipe on session termination"
+      unplug_wipe_policy:
+        enabled: true
+        method: "NIST SP 800-88 Rev. 2 Clear (3-pass overwrite + handle-locked unlink)"
+        bottom_up_walk: true
+        symlink_traversal: "Prohibited; links unlinked without following target"
+
+  # FR 6 - Timely Response to Events (TRE)
+  tre:
+    audit_logging:
+      ledger: "SharedAuditLedger"
+      hash_chain: "SHA-256 append-only"
+      head_signature: "ECDSA P-256 detached signature (.head.sig)"
+      fail_closed_on_truncation: true
+      privacy: "HMAC-SHA256 filename and path tokenization"
+
