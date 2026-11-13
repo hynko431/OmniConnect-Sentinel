@@ -35,6 +35,11 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 aes-gcm = "0.10"
 rand = "0.8"
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "arithmetic", "pkcs8"] }
+hkdf = "0.12"
+hmac = "0.12"
+subtle = "2.6"
+rsa = { version = "0.10", default-features = false, features = ["std"] }
 
 # Observability & Tracing
 tracing = "0.1"
@@ -45,7 +50,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Threading",
 ] }
+
+# TLS & Networking
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = { version = "1.10", features = ["std"] }
+webpki-roots = "0.26"
+url = "2.5"
 
 # Internal workspace crates
 sentinel-proto = { version = "0.1.0", path = "crates/sentinel-proto" }

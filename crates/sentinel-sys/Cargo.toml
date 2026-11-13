@@ -10,6 +10,11 @@ description = "Isolated OS FFI boundary for OmniConnect Sentinel (MountMgr, DPAP
 tracing.workspace = true
 serde.workspace = true
 sha2.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+p256.workspace = true
+hkdf.workspace = true
+rsa.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
