@@ -341,9 +341,17 @@ extern "system" {
         lpExeName: *mut u16,
         lpdwSize: *mut u32,
     ) -> i32;
-    fn GetStdHandle(nStdHandle: u32) -> isize;
     fn CloseHandle(hObject: isize) -> i32;
     fn LocalFree(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn CreateFileW(
+        lpFileName: *const u16,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: *const core::ffi::c_void,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: isize,
+    ) -> isize;
 }
 
 #[cfg(windows)]
@@ -426,6 +434,25 @@ fn assign_raw_handle_to_sandbox_job(
         }
         return Err(err);
     }
+
+    // Apply strict UI restrictions (deny handles, clipboard, desktop, window hooks, global atoms)
+    #[repr(C)]
+    struct JobObjectBasicUiRestrictions {
+        ui_restrictions_class: u32,
+    }
+    const JOB_OBJECT_BASIC_UI_RESTRICTIONS_CLASS: i32 = 4;
+    const JOB_OBJECT_UILIMIT_ALL: u32 = 0x0000_00FF; // Deny all 8 desktop UI interactions
+    let ui_restrictions = JobObjectBasicUiRestrictions {
+        ui_restrictions_class: JOB_OBJECT_UILIMIT_ALL,
+    };
+    let _ = unsafe {
+        SetInformationJobObject(
+            job,
+            JOB_OBJECT_BASIC_UI_RESTRICTIONS_CLASS,
+            &ui_restrictions as *const _ as *const core::ffi::c_void,
+            core::mem::size_of::<JobObjectBasicUiRestrictions>() as u32,
+        )
+    };
 
     let ok_assign = unsafe { AssignProcessToJobObject(job, proc_handle) };
     if ok_assign == 0 {
@@ -534,8 +561,8 @@ pub fn spawn_sandboxed_worker_process(
         const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
         const CREATE_SUSPENDED: u32 = 0x0000_0004;
         const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
-        const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4; // (DWORD)-12
 
+        const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
         const PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY: usize = 0x0002_0007;
         const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: usize = 0x0002_0009;
         const PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY: usize = 0x0002_000E;
@@ -601,21 +628,34 @@ pub fn spawn_sandboxed_worker_process(
         let cmd_str = format!("\"{}\"", exe_path.display());
 
         let appcontainer_sid = if config.enable_appcontainer {
-            obtain_zero_capability_appcontainer_sid()
+            let sid_opt = obtain_zero_capability_appcontainer_sid();
+            if sid_opt.is_none() {
+                unsafe {
+                    let _ = CloseHandle(stdin_read);
+                    let _ = CloseHandle(stdin_write);
+                    let _ = CloseHandle(stdout_read);
+                    let _ = CloseHandle(stdout_write);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Fail-closed: AppContainer profile creation or derivation failed",
+                ));
+            }
+            sid_opt
         } else {
             None
         };
 
-        // Attempt creation in strict tier order:
+        // Attempt creation in strict fail-closed tier order:
         // Tier 1: Full AppContainer + CIG + ACG + ChildProcessRestricted
-        // Tier 2 (when binary resides in a developer profile dir where S-1-15-2-1 lacks traverse ACL):
-        //         ACG + ExtensionPointDisable + ImageLoadNoRemote/NoLowLabel + ChildProcessRestricted
+        // Tier 2: Full AppContainer + ACG + ExtensionPointDisable + ImageLoadNoRemote/NoLowLabel + ChildProcessRestricted (CIG disabled for unsigned/debug binaries)
+        // Under no circumstances is AppContainer omitted when config.enable_appcontainer is true!
         let tiers: [(bool, bool); 2] = [
             (
                 appcontainer_sid.is_some(),
                 config.enforce_microsoft_signed_dlls,
             ),
-            (false, false),
+            (appcontainer_sid.is_some(), false),
         ];
 
         let mut spawned_pi: Option<(ProcessInformation, JobSandboxGuard, bool, bool)> = None;
@@ -628,7 +668,7 @@ pub fn spawn_sandboxed_worker_process(
                 .chain(Some(0))
                 .collect();
 
-            let attr_count: u32 = if use_appcontainer { 3 } else { 2 };
+            let attr_count: u32 = if use_appcontainer { 4 } else { 3 };
             let mut attr_list_size: usize = 0;
             unsafe {
                 let _ = InitializeProcThreadAttributeList(
@@ -666,6 +706,19 @@ pub fn spawn_sandboxed_worker_process(
                 capabilities: core::ptr::null_mut(),
                 capability_count: 0,
                 reserved: 0,
+            };
+
+            let mut handles_to_inherit: [isize; 2] = [stdin_read, stdout_write];
+            let ok_h = unsafe {
+                UpdateProcThreadAttribute(
+                    attr_ptr,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    handles_to_inherit.as_mut_ptr() as *mut core::ffi::c_void,
+                    handles_to_inherit.len() * core::mem::size_of::<isize>(),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                )
             };
 
             let ok_m = unsafe {
@@ -706,7 +759,7 @@ pub fn spawn_sandboxed_worker_process(
                 1
             };
 
-            if ok_m == 0 || ok_c == 0 || ok_ac == 0 {
+            if ok_m == 0 || ok_c == 0 || ok_h == 0 || ok_ac == 0 {
                 last_spawn_err = Some(io::Error::last_os_error());
                 unsafe {
                     DeleteProcThreadAttributeList(attr_ptr);
@@ -714,7 +767,6 @@ pub fn spawn_sandboxed_worker_process(
                 continue;
             }
 
-            let stderr_handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
             let si_ex = StartupInfoExW {
                 startup_info: StartupInfoW {
                     cb: core::mem::size_of::<StartupInfoExW>() as u32,
@@ -734,7 +786,7 @@ pub fn spawn_sandboxed_worker_process(
                     lp_reserved2: core::ptr::null_mut(),
                     h_std_input: stdin_read,
                     h_std_output: stdout_write,
-                    h_std_error: stderr_handle,
+                    h_std_error: stdout_write,
                 },
                 lp_attribute_list: attr_ptr,
             };
@@ -975,21 +1027,24 @@ pub fn apply_worker_process_mitigations() -> io::Result<()> {
 }
 
 /// Creates a local Named Pipe server handle (`\\.\pipe\OmniConnectSentinel`) protected by an explicit
-/// SDDL DACL (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)`) and `PIPE_REJECT_REMOTE_CLIENTS` (`Row 26, 27`).
+/// SDDL DACL (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AC)`), `FILE_FLAG_FIRST_PIPE_INSTANCE` (anti-squatting),
+/// and `PIPE_REJECT_REMOTE_CLIENTS` (`Row 26, 27`, Master Plan v2 §3.2.1.b.i).
 pub fn create_acl_named_pipe_server(pipe_name: &str) -> io::Result<isize> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
         const SDDL_REVISION_1: u32 = 1;
         const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+        const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
         const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
         const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
         const PIPE_WAIT: u32 = 0x0000_0000;
         const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
-        const PIPE_UNLIMITED_INSTANCES: u32 = 255;
         const INVALID_HANDLE_VALUE: isize = -1;
 
-        let sddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)";
+        // Tightened SDDL DACL: SYSTEM (SY), Administrators (BA), and AppContainer packages (AC).
+        // Authenticated Users (AU) is strictly removed to prevent unprivileged local IPC tampering.
+        let sddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AC)";
         let sddl_wide: Vec<u16> = std::ffi::OsStr::new(sddl)
             .encode_wide()
             .chain(Some(0))
@@ -1020,9 +1075,9 @@ pub fn create_acl_named_pipe_server(pipe_name: &str) -> io::Result<isize> {
         let handle = unsafe {
             CreateNamedPipeW(
                 pipe_wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                PIPE_UNLIMITED_INSTANCES,
+                8, // Max instances bound to 8
                 64 * 1024,
                 64 * 1024,
                 5_000,
@@ -1048,7 +1103,9 @@ pub fn create_acl_named_pipe_server(pipe_name: &str) -> io::Result<isize> {
 }
 
 /// Verifies the Authenticode digital signature of an executable using `WinVerifyTrust`
-/// (`WINTRUST_ACTION_GENERIC_VERIFY_V2`) on Windows (`Row 28`).
+/// (`WINTRUST_ACTION_GENERIC_VERIFY_V2`) on Windows (`Row 28`, Master Plan v2 §3.2.1.b.ii).
+/// Locks the binary file handle with `FILE_SHARE_READ` and enforces `WTD_REVOKE_WHOLECHAIN`
+/// and `WTD_CACHE_ONLY_URL_RETRIEVAL` to prevent TOCTOU renaming and air-gapped network hangs.
 pub fn verify_binary_authenticode_signature(exe_path: &Path) -> io::Result<bool> {
     if !exe_path.exists() {
         return Err(io::Error::new(
@@ -1063,11 +1120,35 @@ pub fn verify_binary_authenticode_signature(exe_path: &Path) -> io::Result<bool>
     {
         use std::os::windows::ffi::OsStrExt;
         const WTD_UI_NONE: u32 = 2;
-        const WTD_REVOKE_NONE: u32 = 0;
+        const WTD_REVOKE_WHOLECHAIN: u32 = 1;
         const WTD_CHOICE_FILE: u32 = 1;
         const WTD_STATEACTION_VERIFY: u32 = 1;
         const WTD_STATEACTION_CLOSE: u32 = 2;
         const WTD_CACHE_ONLY_URL_RETRIEVAL: u32 = 0x0000_1000;
+
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const OPEN_EXISTING: u32 = 3;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+        const INVALID_HANDLE_VALUE: isize = -1;
+
+        let wide_path: Vec<u16> = exe_path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+        // Lock the binary handle to prevent TOCTOU swap/rename attacks during verification
+        let h_file = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                core::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                0,
+            )
+        };
+        if h_file == INVALID_HANDLE_VALUE || h_file == 0 {
+            return Err(io::Error::last_os_error());
+        }
 
         let action_guid = Guid {
             data1: 0x00AAC56B,
@@ -1075,11 +1156,10 @@ pub fn verify_binary_authenticode_signature(exe_path: &Path) -> io::Result<bool>
             data3: 0x11D0,
             data4: [0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE],
         };
-        let wide_path: Vec<u16> = exe_path.as_os_str().encode_wide().chain(Some(0)).collect();
         let file_info = WinTrustFileInfo {
             cb_struct: core::mem::size_of::<WinTrustFileInfo>() as u32,
             pcwsz_file_path: wide_path.as_ptr(),
-            h_file: 0,
+            h_file,
             pg_known_subject: core::ptr::null(),
         };
         let mut wvt_data = WinTrustData {
@@ -1087,7 +1167,7 @@ pub fn verify_binary_authenticode_signature(exe_path: &Path) -> io::Result<bool>
             p_policy_callback_data: core::ptr::null_mut(),
             p_sip_client_data: core::ptr::null_mut(),
             dw_ui_choice: WTD_UI_NONE,
-            fdw_revocation_checks: WTD_REVOKE_NONE,
+            fdw_revocation_checks: WTD_REVOKE_WHOLECHAIN,
             dw_union_choice: WTD_CHOICE_FILE,
             p_file: &file_info,
             dw_state_action: WTD_STATEACTION_VERIFY,
@@ -1102,6 +1182,7 @@ pub fn verify_binary_authenticode_signature(exe_path: &Path) -> io::Result<bool>
         wvt_data.dw_state_action = WTD_STATEACTION_CLOSE;
         unsafe {
             let _ = WinVerifyTrust(0, &action_guid, &mut wvt_data);
+            let _ = CloseHandle(h_file);
         }
         Ok(status == 0)
     }
@@ -1161,16 +1242,33 @@ pub fn verify_named_pipe_client_pid(pipe_handle: isize) -> io::Result<u32> {
 
 /// Resolves the connected Named Pipe client's PID, queries its executable path via
 /// `QueryFullProcessImageNameW` (or `/proc/<pid>/exe`), and verifies its Authenticode
-/// signature via `WinVerifyTrust` (`Row 28`).
+/// signature via `WinVerifyTrust` (`Row 28`, Master Plan v2 §3.2.1.b.ii).
 pub fn verify_named_pipe_peer_credentials(pipe_handle: isize) -> io::Result<PeerCredentials> {
     let pid = verify_named_pipe_client_pid(pipe_handle)?;
     #[cfg(windows)]
     {
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-        let h_proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const WAIT_TIMEOUT: u32 = 0x0000_0102;
+
+        let h_proc =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
         if h_proc == 0 {
             return Err(io::Error::last_os_error());
         }
+
+        // Verify that the peer process is still active and alive (blocks PID-reuse TOCTOU)
+        let wait_res = unsafe { WaitForSingleObject(h_proc, 0) };
+        if wait_res != WAIT_TIMEOUT {
+            unsafe {
+                let _ = CloseHandle(h_proc);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Named Pipe client process terminated or PID was reused before verification",
+            ));
+        }
+
         let mut buf = [0u16; 1024];
         let mut size = buf.len() as u32;
         let ok = unsafe { QueryFullProcessImageNameW(h_proc, 0, buf.as_mut_ptr(), &mut size) };
