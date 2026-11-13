@@ -5,11 +5,19 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod bpf_sandbox;
 pub mod crypto_seal;
 pub mod fs_lowlevel;
 pub mod mem_guard;
 pub mod mount_control;
 pub mod sandbox_worker;
+
+pub use bpf_sandbox::{
+    generate_seccomp_bpf_filter_aarch64, generate_seccomp_bpf_filter_x86_64,
+    landlock_handled_access_fs, simulate_seccomp_filter, SeccompData, SockFilter, SockFprog,
+    AARCH64_ALLOWED_SIMPLE_SYSCALLS, AUDIT_ARCH_AARCH64, AUDIT_ARCH_X86_64, PROT_EXEC,
+    SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS, X32_SYSCALL_BIT, X86_64_ALLOWED_SIMPLE_SYSCALLS,
+};
 
 pub use crypto_seal::{
     create_sealed_ecdsa_p256_keypair, decrypt_kek_from_soc_escrow,
