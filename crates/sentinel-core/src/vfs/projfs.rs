@@ -125,9 +125,23 @@ impl VirtualFileSystemProvider for ProjFsProvider {
                 if let Ok(mut d_guard) = self.degraded_no_projfs.lock() {
                     *d_guard = true;
                 }
+                #[cfg(test)]
                 let ledger_path = std::env::temp_dir()
                     .join("OmniConnect_ShadowCache")
                     .join("shadow_cache_audit.jsonl");
+                #[cfg(not(test))]
+                let ledger_path = {
+                    #[cfg(windows)]
+                    {
+                        PathBuf::from(
+                            r"C:\ProgramData\OmniConnect\AuditLedger\shadow_cache_audit.jsonl",
+                        )
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        PathBuf::from("/var/lib/omniconnect/audit_ledger/shadow_cache_audit.jsonl")
+                    }
+                };
                 let mut ledger = AuditLedger::open(ledger_path);
                 let _ = ledger.append_event(
                     code,

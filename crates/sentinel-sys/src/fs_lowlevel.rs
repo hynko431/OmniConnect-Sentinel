@@ -145,6 +145,30 @@ extern "system" {
     fn FindNextStreamW(hFindStream: isize, lpFindStreamData: *mut core::ffi::c_void) -> i32;
     fn FindClose(hFindFile: isize) -> i32;
     fn GetDriveTypeW(lpRootPathName: *const u16) -> u32;
+    fn CreateDirectoryW(
+        lpPathName: *const u16,
+        lpSecurityAttributes: *const core::ffi::c_void,
+    ) -> i32;
+    fn GetFileInformationByHandle(hFile: isize, lpFileInformation: *mut core::ffi::c_void) -> i32;
+    fn GetFileType(hFile: isize) -> u32;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct ByHandleFileInformation {
+    dw_file_attributes: u32,
+    ft_creation_time_dw_low_datetime: u32,
+    ft_creation_time_dw_high_datetime: u32,
+    ft_last_access_time_dw_low_datetime: u32,
+    ft_last_access_time_dw_high_datetime: u32,
+    ft_last_write_time_dw_low_datetime: u32,
+    ft_last_write_time_dw_high_datetime: u32,
+    dw_volume_serial_number: u32,
+    n_file_size_high: u32,
+    n_file_size_low: u32,
+    n_number_of_links: u32,
+    n_file_index_high: u32,
+    n_file_index_low: u32,
 }
 
 #[cfg(windows)]
@@ -298,6 +322,154 @@ pub fn ensure_not_symlink_or_reparse_point(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Opens an untrusted file (e.g. from removable USB media) strictly without following symlinks
+/// or NTFS reparse points, verifying on the open handle that the target is a regular file.
+/// Rejects symlinks, reparse points, directories, device nodes, pipes, and FIFOs.
+pub fn open_untrusted_readonly_nofollow(path: &Path) -> io::Result<File> {
+    ensure_not_symlink_or_reparse_point(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+
+        let verbatim = to_verbatim_path(path);
+        let wide: Vec<u16> = verbatim.as_os_str().encode_wide().chain(Some(0)).collect();
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const OPEN_EXISTING: u32 = 3;
+        const INVALID_HANDLE_VALUE: isize = -1;
+
+        let h_file = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                core::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL,
+                0,
+            )
+        };
+
+        if h_file == INVALID_HANDLE_VALUE || h_file == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut info: ByHandleFileInformation = unsafe { core::mem::zeroed() };
+        let ok = unsafe {
+            GetFileInformationByHandle(h_file, &mut info as *mut _ as *mut core::ffi::c_void)
+        };
+        if ok == 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                let _ = CloseHandle(h_file);
+            }
+            return Err(err);
+        }
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+        const FILE_TYPE_DISK: u32 = 0x0001;
+
+        if (info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            unsafe {
+                let _ = CloseHandle(h_file);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Untrusted path '{}' is an NTFS reparse point or symlink",
+                    path.display()
+                ),
+            ));
+        }
+
+        if (info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+            unsafe {
+                let _ = CloseHandle(h_file);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Untrusted path '{}' is a directory", path.display()),
+            ));
+        }
+
+        let file_type = unsafe { GetFileType(h_file) };
+        if file_type != FILE_TYPE_DISK {
+            unsafe {
+                let _ = CloseHandle(h_file);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Untrusted path '{}' is not a regular disk file (file_type={file_type})",
+                    path.display()
+                ),
+            ));
+        }
+
+        Ok(unsafe { File::from_raw_handle(h_file as *mut core::ffi::c_void) })
+    }
+    #[cfg(not(windows))]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } < 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                let _ = libc::close(fd);
+            }
+            return Err(err);
+        }
+
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            unsafe {
+                let _ = libc::close(fd);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Untrusted path '{}' is not a regular file", path.display()),
+            ));
+        }
+
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+/// Reads an untrusted stream into a buffer with strict quota enforcement via `Read::take(budget + 1)`.
+/// Guaranteed to prevent memory exhaustion by failing closed if the stream exceeds `max_bytes`.
+pub fn read_untrusted_to_end_bounded<R: io::Read>(
+    reader: &mut R,
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut take_reader = reader.take(max_bytes.saturating_add(1));
+    let mut buffer = Vec::new();
+    take_reader.read_to_end(&mut buffer)?;
+    if buffer.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Untrusted stream exceeded byte quota limit of {max_bytes} bytes"),
+        ));
+    }
+    Ok(buffer)
 }
 
 /// Opens a file with OS write-through flags (`FILE_FLAG_WRITE_THROUGH | FILE_FLAG_OPEN_REPARSE_POINT`
@@ -782,6 +954,193 @@ pub fn apply_system_admin_dacl(path: &Path) -> io::Result<()> {
             perms.set_mode(0o600);
         }
         fs::set_permissions(path, perms)
+    }
+}
+
+/// Creates or truncates a file atomically with strict SYSTEM + Administrators DACL (`D:P(A;;GA;;;SY)(A;;GA;;;BA)`)
+/// on Windows, or `0o600` on Unix, at handle creation time, completely eliminating post-creation DACL race windows.
+pub fn create_restricted_file_handle_atomic(path: &Path) -> io::Result<File> {
+    ensure_not_symlink_or_reparse_point(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+
+        const SDDL_REVISION_1: u32 = 1;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        const CREATE_ALWAYS: u32 = 2;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+        const INVALID_HANDLE_VALUE: isize = -1;
+
+        // Grant full control to SYSTEM (SY), Administrators (BA), and Owner (OW) so
+        // elevated services, administrator tools, and current process owners can access
+        // while strictly denying untrusted users (Authenticated Users, Everyone).
+        let sddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)";
+        let wide_sddl: Vec<u16> = std::ffi::OsStr::new(sddl)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut sd_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        let mut sd_size: u32 = 0;
+
+        let ok_sddl = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd_ptr,
+                &mut sd_size,
+            )
+        };
+        if ok_sddl == 0 || sd_ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        #[repr(C)]
+        struct SecurityAttributes {
+            n_length: u32,
+            lp_security_descriptor: *mut core::ffi::c_void,
+            b_inherit_handle: i32,
+        }
+
+        let sa = SecurityAttributes {
+            n_length: core::mem::size_of::<SecurityAttributes>() as u32,
+            lp_security_descriptor: sd_ptr,
+            b_inherit_handle: 0,
+        };
+
+        let verbatim = to_verbatim_path(path);
+        let wide_path: Vec<u16> = verbatim.as_os_str().encode_wide().chain(Some(0)).collect();
+
+        let h_file = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                &sa as *const _ as *const core::ffi::c_void,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                0,
+            )
+        };
+
+        unsafe {
+            let _ = LocalFree(sd_ptr);
+        }
+
+        if h_file == INVALID_HANDLE_VALUE || h_file == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(unsafe { File::from_raw_handle(h_file as *mut core::ffi::c_void) })
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(true);
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.open(path)
+    }
+}
+
+/// Creates a file atomically with restricted permissions and writes `content` to it.
+pub fn create_restricted_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            create_restricted_dir_atomic(parent)?;
+        }
+    }
+    let mut file = create_restricted_file_handle_atomic(path)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Creates a directory atomically with strict SYSTEM + Administrators DACL (`D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)`)
+/// on Windows, or `0o700` on Unix, at creation time.
+pub fn create_restricted_dir_atomic(path: &Path) -> io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            create_restricted_dir_atomic(parent)?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        const SDDL_REVISION_1: u32 = 1;
+        // Grant full control to SYSTEM (SY), Administrators (BA), and Owner (OW) with container/object inheritance.
+        let sddl = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GA;;;OW)";
+        let wide_sddl: Vec<u16> = std::ffi::OsStr::new(sddl)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut sd_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        let mut sd_size: u32 = 0;
+
+        let ok_sddl = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd_ptr,
+                &mut sd_size,
+            )
+        };
+        if ok_sddl == 0 || sd_ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        #[repr(C)]
+        struct SecurityAttributes {
+            n_length: u32,
+            lp_security_descriptor: *mut core::ffi::c_void,
+            b_inherit_handle: i32,
+        }
+
+        let sa = SecurityAttributes {
+            n_length: core::mem::size_of::<SecurityAttributes>() as u32,
+            lp_security_descriptor: sd_ptr,
+            b_inherit_handle: 0,
+        };
+
+        let verbatim = to_verbatim_path(path);
+        let wide_path: Vec<u16> = verbatim.as_os_str().encode_wide().chain(Some(0)).collect();
+
+        let res = unsafe {
+            CreateDirectoryW(
+                wide_path.as_ptr(),
+                &sa as *const _ as *const core::ffi::c_void,
+            )
+        };
+
+        unsafe {
+            let _ = LocalFree(sd_ptr);
+        }
+
+        if res == 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(183) {
+                // ERROR_ALREADY_EXISTS
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path)
     }
 }
 

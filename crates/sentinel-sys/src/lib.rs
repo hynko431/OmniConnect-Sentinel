@@ -20,12 +20,15 @@ pub use crypto_seal::{
     SocEscrowBlob,
 };
 pub use fs_lowlevel::{
-    apply_system_admin_dacl, classify_media_characteristics, ensure_not_symlink_or_reparse_point,
-    enumerate_ntfs_ads, flush_hardware_buffers, is_projfs_available, is_reparse_point_or_symlink,
-    issue_file_level_trim, normalize_file_attributes, open_no_buffering_write_through,
+    apply_system_admin_dacl, classify_media_characteristics, create_restricted_dir_atomic,
+    create_restricted_file_atomic, create_restricted_file_handle_atomic,
+    ensure_not_symlink_or_reparse_point, enumerate_ntfs_ads, flush_hardware_buffers,
+    is_projfs_available, is_reparse_point_or_symlink, issue_file_level_trim,
+    normalize_file_attributes, open_no_buffering_write_through, open_untrusted_readonly_nofollow,
     open_write_through, prj_start_virtualizing_root, prj_write_file_data, query_media_type,
-    query_sector_alignment, query_sector_alignment_for_path, sync_directory, to_verbatim_path,
-    write_mark_of_the_web, AlignedSectorBuffer, MediaType, ProjFsInstanceHandle,
+    query_sector_alignment, query_sector_alignment_for_path, read_untrusted_to_end_bounded,
+    sync_directory, to_verbatim_path, write_mark_of_the_web, AlignedSectorBuffer, MediaType,
+    ProjFsInstanceHandle,
 };
 pub use mem_guard::{zeroize_slice, ZeroizingBytes};
 pub use mount_control::{

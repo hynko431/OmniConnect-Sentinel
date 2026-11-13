@@ -379,12 +379,25 @@ impl Default for Tier0YaraScanner {
 impl Tier0YaraScanner {
     pub fn new() -> Self {
         let rules = compile_yara_source(DEFAULT_YARA_RULES_SOURCE).unwrap_or_default();
+        #[cfg(test)]
+        let ledger_path = std::env::temp_dir()
+            .join(format!("omniconnect_sentinel_yara_{}", std::process::id()))
+            .join("yara_rulepack_ledger.jsonl");
+        #[cfg(not(test))]
+        let ledger_path = {
+            #[cfg(windows)]
+            {
+                PathBuf::from(r"C:\ProgramData\OmniConnect\AuditLedger\yara_rulepack_ledger.jsonl")
+            }
+            #[cfg(not(windows))]
+            {
+                PathBuf::from("/var/lib/omniconnect/audit_ledger/yara_rulepack_ledger.jsonl")
+            }
+        };
         Self {
             rules,
             rule_pack_version: 1,
-            ledger_path: std::env::temp_dir()
-                .join(format!("omniconnect_sentinel_yara_{}", std::process::id()))
-                .join("yara_rulepack_ledger.jsonl"),
+            ledger_path,
             intel_bloom: ThreatIntelBloomFilter::new(),
         }
     }

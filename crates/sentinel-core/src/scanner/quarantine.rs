@@ -13,10 +13,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use sentinel_sys::{
-    apply_system_admin_dacl, decrypt_kek_from_soc_escrow, default_soc_rsa_public_blob,
-    encrypt_kek_for_soc_escrow, seal_key_bytes, sync_directory, to_verbatim_path, unseal_key_bytes,
-    write_protected_key_file, zeroize_slice, KeyProtectionPosture, SealedKeyBlob, SocEscrowBlob,
-    ZeroizingBytes,
+    create_restricted_dir_atomic, create_restricted_file_handle_atomic,
+    decrypt_kek_from_soc_escrow, default_soc_rsa_public_blob, encrypt_kek_for_soc_escrow,
+    seal_key_bytes, sync_directory, to_verbatim_path, unseal_key_bytes, write_protected_key_file,
+    zeroize_slice, KeyProtectionPosture, SealedKeyBlob, SocEscrowBlob, ZeroizingBytes,
 };
 
 use crate::enterprise::ledger::AuditLedger;
@@ -141,16 +141,9 @@ impl QuarantineVault {
         vault_dir: PathBuf,
         soc_rsa_pub_blob: &[u8],
     ) -> Result<Self, String> {
-        fs::create_dir_all(&vault_dir).map_err(|e| {
+        create_restricted_dir_atomic(&vault_dir).map_err(|e| {
             format!(
                 "Failed creating quarantine vault directory {}: {}",
-                vault_dir.display(),
-                e
-            )
-        })?;
-        apply_system_admin_dacl(&vault_dir).map_err(|e| {
-            format!(
-                "Failed applying SYSTEM/Admin DACL to quarantine vault directory {}: {}",
                 vault_dir.display(),
                 e
             )
@@ -817,8 +810,10 @@ impl QuarantineVault {
 
         // Exact layout (`Plan v2 §1.1 #4`): `[header_len: u32 LE][header JSON][ciphertext]`
         {
-            let mut vault_file = File::create(&tmp_file_path)
-                .map_err(|e| format!("Failed creating temporary vault file: {e}"))?;
+            let mut vault_file =
+                create_restricted_file_handle_atomic(&tmp_file_path).map_err(|e| {
+                    format!("Failed creating atomic restricted temporary vault file: {e}")
+                })?;
             let header_len = header_json.len() as u32;
             vault_file
                 .write_all(&header_len.to_le_bytes())
@@ -834,13 +829,6 @@ impl QuarantineVault {
 
         fs::rename(&tmp_file_path, &vault_file_path)
             .map_err(|e| format!("Atomic rename into quarantine vault failed: {e}"))?;
-        apply_system_admin_dacl(&vault_file_path).map_err(|e| {
-            format!(
-                "Failed applying SYSTEM/Admin DACL to {}: {}",
-                vault_file_path.display(),
-                e
-            )
-        })?;
         sync_directory(&self.vault_dir)
             .map_err(|e| format!("Failed syncing quarantine vault directory: {e}"))?;
 

@@ -1,22 +1,19 @@
+pub mod chunked_cache;
 pub mod fuse;
 pub mod projfs;
 #[cfg(feature = "vfs-winfsp")]
 pub mod winfsp;
 
+pub use chunked_cache::{decrypt_chunked_stream, encrypt_chunked_stream, ChunkedCacheError};
 pub use fuse::FuseVfsProvider as FuseProvider;
 pub use projfs::ProjFsProvider;
 pub type VfsProvider = dyn VirtualFileSystemProvider;
 
-use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Key, Nonce,
-};
 use async_trait::async_trait;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -25,7 +22,8 @@ use walkdir::WalkDir;
 
 use sentinel_cdr::{SanitizationPolicy, WorkerLauncher, WorkerRequest};
 use sentinel_sys::{
-    apply_system_admin_dacl, is_reparse_point_or_symlink, normalize_file_attributes,
+    create_restricted_dir_atomic, create_restricted_file_atomic, is_reparse_point_or_symlink,
+    normalize_file_attributes, open_untrusted_readonly_nofollow, read_untrusted_to_end_bounded,
     set_volume_offline, set_volume_online_readonly, write_mark_of_the_web, ZeroizingBytes,
 };
 
@@ -156,14 +154,37 @@ impl ShadowCacheManager {
             let p =
                 PathBuf::from(r"C:\ProgramData\OmniConnect\AuditLedger\shadow_cache_audit.jsonl");
             if let Some(parent) = p.parent() {
-                if fs::create_dir_all(parent).is_ok() {
+                if create_restricted_dir_atomic(parent).is_ok() {
                     return p;
                 }
             }
         }
-        std::env::temp_dir()
-            .join(format!("OmniConnect_ShadowCache_{}", std::process::id()))
-            .join("shadow_cache_audit.jsonl")
+        #[cfg(not(windows))]
+        {
+            let p = PathBuf::from("/var/lib/omniconnect/audit_ledger/shadow_cache_audit.jsonl");
+            if let Some(parent) = p.parent() {
+                if create_restricted_dir_atomic(parent).is_ok() {
+                    return p;
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            std::env::temp_dir()
+                .join(format!("OmniConnect_ShadowCache_{}", std::process::id()))
+                .join("shadow_cache_audit.jsonl")
+        }
+        #[cfg(not(test))]
+        {
+            #[cfg(windows)]
+            {
+                PathBuf::from(r"C:\ProgramData\OmniConnect\AuditLedger\shadow_cache_audit.jsonl")
+            }
+            #[cfg(not(windows))]
+            {
+                PathBuf::from("/var/lib/omniconnect/audit_ledger/shadow_cache_audit.jsonl")
+            }
+        }
     }
 
     fn resolve_session_cipher_dir(&self, session_id: &str) -> Result<PathBuf, String> {
@@ -173,36 +194,49 @@ impl ShadowCacheManager {
             #[cfg(windows)]
             {
                 let prog_data = PathBuf::from(r"C:\ProgramData\OmniConnect\ShadowCache");
-                if fs::create_dir_all(&prog_data).is_ok() {
+                if create_restricted_dir_atomic(&prog_data).is_ok() {
                     prog_data
                 } else {
-                    std::env::temp_dir().join("OmniConnect").join("ShadowCache")
+                    #[cfg(test)]
+                    {
+                        std::env::temp_dir().join("OmniConnect").join("ShadowCache")
+                    }
+                    #[cfg(not(test))]
+                    {
+                        return Err(
+                            "Production shadow cache path 'C:\\ProgramData\\OmniConnect\\ShadowCache' is inaccessible"
+                                .to_string(),
+                        );
+                    }
                 }
             }
             #[cfg(not(windows))]
             {
                 let var_lib = PathBuf::from("/var/lib/omniconnect/shadow_cache");
-                if fs::create_dir_all(&var_lib).is_ok() {
+                if create_restricted_dir_atomic(&var_lib).is_ok() {
                     var_lib
                 } else {
-                    std::env::temp_dir()
-                        .join("omniconnect")
-                        .join("shadow_cache")
+                    #[cfg(test)]
+                    {
+                        std::env::temp_dir()
+                            .join("omniconnect")
+                            .join("shadow_cache")
+                    }
+                    #[cfg(not(test))]
+                    {
+                        return Err(
+                            "Production shadow cache path '/var/lib/omniconnect/shadow_cache' is inaccessible"
+                                .to_string(),
+                        );
+                    }
                 }
             }
         };
 
         let session_dir = base_dir.join(session_id);
-        fs::create_dir_all(&session_dir).map_err(|e| {
+        create_restricted_dir_atomic(&session_dir).map_err(|e| {
             format!(
-                "Failed creating encrypted shadow cache directory '{}': {}",
-                session_dir.display(),
-                e
-            )
-        })?;
-        apply_system_admin_dacl(&session_dir).map_err(|e| {
-            format!(
-                "Failed applying SYSTEM/Administrators DACL to shadow cache directory '{}': {}",
+                "Failed creating atomic restricted shadow cache directory '{}': {}",
                 session_dir.display(),
                 e
             )
@@ -284,10 +318,9 @@ impl ShadowCacheManager {
         }
 
         let mut raw_key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut raw_key);
+        rand::rngs::OsRng.fill_bytes(&mut raw_key);
         let session_key = ZeroizingBytes::new(raw_key);
         sentinel_sys::zeroize_slice(&mut raw_key);
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(session_key.as_slice()));
 
         let worker_launcher = WorkerLauncher::new();
         let default_policy = SanitizationPolicy::default();
@@ -394,22 +427,41 @@ impl ShadowCacheManager {
                 return Err(msg);
             }
 
-            // Read file from USB device ONCE into memory (`Invariant I2`, `Row 7, 70` TOCTOU defense)
-            let raw_bytes = match fs::read(path) {
-                Ok(b) => b,
-                Err(read_err) => {
-                    Self::cleanup_cipher_dir(&shadow_cipher_dir);
-                    if is_volume_device {
-                        let _ = set_volume_offline(raw_volume_path, true);
+            // Open untrusted file strictly without following symlinks/reparse points, and bounded by quota (`CSE-07`, `CSE-10`)
+            let raw_bytes = {
+                let mut untrusted_file = match open_untrusted_readonly_nofollow(path) {
+                    Ok(f) => f,
+                    Err(open_err) => {
+                        Self::cleanup_cipher_dir(&shadow_cipher_dir);
+                        if is_volume_device {
+                            let _ = set_volume_offline(raw_volume_path, true);
+                        }
+                        let msg = SentinelError::WalkAccessDenied(format!(
+                            "ShadowCache non-following open failed for '{}': {}",
+                            path.display(),
+                            open_err
+                        ))
+                        .to_string();
+                        self.append_ledger("SHADOW_CACHE_INGEST_INCOMPLETE", &msg);
+                        return Err(msg);
                     }
-                    let msg = SentinelError::WalkAccessDenied(format!(
-                        "ShadowCache single-read failed for '{}': {}",
-                        path.display(),
-                        read_err
-                    ))
-                    .to_string();
-                    self.append_ledger("SHADOW_CACHE_INGEST_INCOMPLETE", &msg);
-                    return Err(msg);
+                };
+                match read_untrusted_to_end_bounded(&mut untrusted_file, self.max_cache_bytes) {
+                    Ok(b) => b,
+                    Err(read_err) => {
+                        Self::cleanup_cipher_dir(&shadow_cipher_dir);
+                        if is_volume_device {
+                            let _ = set_volume_offline(raw_volume_path, true);
+                        }
+                        let msg = SentinelError::WalkAccessDenied(format!(
+                            "ShadowCache bounded single-read failed for '{}': {}",
+                            path.display(),
+                            read_err
+                        ))
+                        .to_string();
+                        self.append_ledger("SHADOW_CACHE_INGEST_INCOMPLETE", &msg);
+                        return Err(msg);
+                    }
                 }
             };
 
@@ -487,55 +539,19 @@ impl ShadowCacheManager {
             let sanitized_sha256 = hex::encode(Sha256::digest(&release_bytes));
             let rel_str = rel_path.to_string_lossy();
 
-            // Encrypt sanitized output with AES-256-GCM bound to relative_path AAD (`Row 147, 223`)
-            let mut nonce_bytes = [0u8; 12];
-            rand::thread_rng().fill_bytes(&mut nonce_bytes);
-            let ciphertext = cipher
-                .encrypt(
-                    Nonce::from_slice(&nonce_bytes),
-                    Payload {
-                        msg: release_bytes.as_slice(),
-                        aad: rel_str.as_bytes(),
-                    },
-                )
-                .map_err(|e| format!("ShadowCache AES-256-GCM encryption failed: {e}"))?;
-
             let entry_id_hash = hex::encode(Sha256::digest(rel_str.as_bytes()));
-            let enc_path = shadow_cipher_dir.join(format!("{}.enc", &entry_id_hash[..32]));
-            let mut enc_payload = Vec::with_capacity(12 + ciphertext.len());
-            enc_payload.extend_from_slice(&nonce_bytes);
-            enc_payload.extend_from_slice(&ciphertext);
+            let mut file_id = [0u8; 16];
+            let hash_bytes = Sha256::digest(rel_str.as_bytes());
+            file_id.copy_from_slice(&hash_bytes[..16]);
 
-            {
-                let mut enc_f = File::create(&enc_path).map_err(|e| {
-                    format!(
-                        "ShadowCache failed creating encrypted entry '{}': {}",
-                        enc_path.display(),
-                        e
-                    )
-                })?;
-                enc_f.write_all(&enc_payload).map_err(|e| {
-                    format!(
-                        "ShadowCache failed writing encrypted entry '{}': {}",
-                        enc_path.display(),
-                        e
-                    )
-                })?;
-                enc_f.sync_all().map_err(|e| {
-                    format!(
-                        "ShadowCache failed syncing encrypted entry '{}': {}",
-                        enc_path.display(),
-                        e
-                    )
-                })?;
-            }
-            apply_system_admin_dacl(&enc_path).map_err(|e| {
-                format!(
-                    "ShadowCache failed applying DACL to encrypted entry '{}': {}",
-                    enc_path.display(),
-                    e
-                )
-            })?;
+            let enc_path = shadow_cipher_dir.join(format!("{}.enc", &entry_id_hash[..32]));
+            encrypt_chunked_stream(
+                session_key.as_slice(),
+                &file_id,
+                release_bytes.as_slice(),
+                &enc_path,
+            )
+            .map_err(|e| format!("ShadowCache 64 KiB chunked streaming encryption failed: {e}"))?;
 
             projected_count += 1;
             entries.insert(
@@ -628,37 +644,19 @@ impl ShadowCacheManager {
             )
         })?;
 
-        let enc_payload = fs::read(enc_path).map_err(|e| {
-            format!(
-                "Failed reading encrypted shadow cache entry '{}': {}",
-                enc_path.display(),
-                e
-            )
-        })?;
-        if enc_payload.len() < 12 + 16 {
-            return Err(format!(
-                "SHADOW_CACHE_INTEGRITY_FAILURE: Truncated ciphertext in '{}'",
-                enc_path.display()
-            ));
-        }
-
-        let (nonce_bytes, ciphertext) = enc_payload.split_at(12);
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(session.session_key.as_slice()));
         let rel_str = relative_path.to_string_lossy();
-        let plaintext = cipher
-            .decrypt(
-                Nonce::from_slice(nonce_bytes),
-                Payload {
-                    msg: ciphertext,
-                    aad: rel_str.as_bytes(),
-                },
-            )
-            .map_err(|_| {
-                format!(
-                    "SHADOW_CACHE_INTEGRITY_FAILURE: AES-256-GCM authentication tag verification failed for '{}'",
-                    relative_path.display()
-                )
-            })?;
+        let mut file_id = [0u8; 16];
+        let hash_bytes = Sha256::digest(rel_str.as_bytes());
+        file_id.copy_from_slice(&hash_bytes[..16]);
+
+        let mut plaintext = Vec::new();
+        decrypt_chunked_stream(
+            session.session_key.as_slice(),
+            &file_id,
+            enc_path,
+            &mut plaintext,
+        )
+        .map_err(|e| format!("SHADOW_CACHE_INTEGRITY_FAILURE: {e}"))?;
 
         let actual_sha256 = hex::encode(Sha256::digest(&plaintext));
         if actual_sha256 != entry.sanitized_sha256 {
@@ -819,35 +817,23 @@ impl ShadowCacheManager {
         let rel_str = relative_path.to_string_lossy();
 
         let mut raw_key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut raw_key);
+        rand::rngs::OsRng.fill_bytes(&mut raw_key);
         let session_key = ZeroizingBytes::new(raw_key);
         sentinel_sys::zeroize_slice(&mut raw_key);
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(session_key.as_slice()));
-
-        let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: release_bytes.as_slice(),
-                    aad: rel_str.as_bytes(),
-                },
-            )
-            .map_err(|e| format!("ShadowCache AES-256-GCM encryption failed: {e}"))?;
 
         let entry_id_hash = hex::encode(Sha256::digest(rel_str.as_bytes()));
-        let enc_path = shadow_cipher_dir.join(format!("{}.enc", &entry_id_hash[..32]));
-        let mut enc_payload = Vec::with_capacity(12 + ciphertext.len());
-        enc_payload.extend_from_slice(&nonce_bytes);
-        enc_payload.extend_from_slice(&ciphertext);
+        let mut file_id = [0u8; 16];
+        let hash_bytes = Sha256::digest(rel_str.as_bytes());
+        file_id.copy_from_slice(&hash_bytes[..16]);
 
-        {
-            let mut enc_f = File::create(&enc_path).map_err(|e| e.to_string())?;
-            enc_f.write_all(&enc_payload).map_err(|e| e.to_string())?;
-            enc_f.sync_all().map_err(|e| e.to_string())?;
-        }
-        apply_system_admin_dacl(&enc_path).map_err(|e| e.to_string())?;
+        let enc_path = shadow_cipher_dir.join(format!("{}.enc", &entry_id_hash[..32]));
+        encrypt_chunked_stream(
+            session_key.as_slice(),
+            &file_id,
+            release_bytes.as_slice(),
+            &enc_path,
+        )
+        .map_err(|e| format!("ShadowCache 64 KiB chunked streaming encryption failed: {e}"))?;
 
         let v_entry = VirtualFileEntry {
             relative_path: relative_path.to_path_buf(),
@@ -892,7 +878,7 @@ impl ShadowCacheManager {
         let verified_bytes = self.read_projected_file(virtual_mount_point, relative_path)?;
         let projected_path = virtual_mount_point.join(relative_path);
         if let Some(parent) = projected_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
+            create_restricted_dir_atomic(parent).map_err(|e| {
                 format!(
                     "Failed creating parent directory for projected file '{}': {}",
                     projected_path.display(),
@@ -903,29 +889,13 @@ impl ShadowCacheManager {
         if projected_path.exists() {
             let _ = normalize_file_attributes(&projected_path);
         }
-        {
-            let mut out_f = File::create(&projected_path).map_err(|e| {
-                format!(
-                    "Failed creating hydrated file '{}': {}",
-                    projected_path.display(),
-                    e
-                )
-            })?;
-            out_f.write_all(&verified_bytes).map_err(|e| {
-                format!(
-                    "Failed writing hydrated file '{}': {}",
-                    projected_path.display(),
-                    e
-                )
-            })?;
-            out_f.sync_all().map_err(|e| {
-                format!(
-                    "Failed syncing hydrated file '{}': {}",
-                    projected_path.display(),
-                    e
-                )
-            })?;
-        }
+        create_restricted_file_atomic(&projected_path, &verified_bytes).map_err(|e| {
+            format!(
+                "Failed creating atomic restricted hydrated file '{}': {}",
+                projected_path.display(),
+                e
+            )
+        })?;
 
         // Propagate Mark-of-the-Web (`ZoneId=3`) errors (`Row 136`)
         write_mark_of_the_web(&projected_path, 3).map_err(|e| {
