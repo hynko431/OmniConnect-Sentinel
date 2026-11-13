@@ -4,7 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="OmniConnect Sentinel — Enterprise USB Threat Interceptor & Ring 3 Deep CDR Engine">
-  <meta name="sentinel-bearer-token" content="">
   <title>OmniConnect Sentinel | Enterprise Hardware Interceptor & CDR Dashboard</title>
   <link rel="stylesheet" href="style.css">
 </head>
@@ -459,6 +458,55 @@
               NIST SP 800-53 Rev. 5: MP-6, MP-7 (Media Sanitization & Use) · CIS Control 8.4
             </p>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal 3: Shred Confirmation Modal (Accessible Dialog) -->
+  <div class="modal-backdrop" id="shredModal" role="dialog" aria-modal="true" aria-labelledby="shredModalTitle" aria-hidden="true">
+    <div class="modal-sheet">
+      <header class="modal-header">
+        <h3 class="modal-title" id="shredModalTitle">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          Confirm NIST 800-88 File Sanitization
+        </h3>
+        <button type="button" class="modal-close-btn" id="btnCloseShredModal" aria-label="Close dialog">✕</button>
+      </header>
+      <div class="modal-body">
+        <p class="modal-lead-text">
+          Are you sure you want to execute a permanent 3-pass logical clear overwrite (0x00, 0xFF, CSPRNG)?
+        </p>
+        <p class="mitre-modal-desc">
+          This operation is irreversible. Staging target canary data will be completely eradicated and unlinked.
+        </p>
+        <div class="modal-actions">
+          <button type="button" class="card-action-btn" id="btnCancelShred">Cancel</button>
+          <button type="button" class="card-action-btn btn-danger" id="btnConfirmShred">Confirm & Shred</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal 4: Session Bootstrap Prompt Modal (Accessible Dialog) -->
+  <div class="modal-backdrop" id="sessionPromptModal" role="dialog" aria-modal="true" aria-labelledby="sessionPromptTitle" aria-hidden="true">
+    <div class="modal-sheet">
+      <header class="modal-header">
+        <h3 class="modal-title" id="sessionPromptTitle">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          Session Authentication Required
+        </h3>
+      </header>
+      <div class="modal-body">
+        <p class="modal-lead-text">
+          Your browser session is not authenticated with the Sentinel Agent.
+        </p>
+        <p class="mitre-modal-desc">
+          Launch Sentinel via <code>sentinel ui</code> to receive a secure one-time bootstrap link, or paste your one-time bootstrap code below:
+        </p>
+        <div class="modal-input-row">
+          <input type="text" id="manualBootstrapInput" placeholder="Enter bootstrap code" class="modal-input-field" />
+          <button type="button" class="card-action-btn" id="btnSubmitBootstrap">Authenticate</button>
         </div>
       </div>
     </div>

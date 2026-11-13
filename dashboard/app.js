@@ -1,35 +1,117 @@
 /**
  * OmniConnect Sentinel — Enterprise Dashboard Logic (Master Plan v2 §4.3, Sub-Phase 5.1)
  * Security:
+ * - Strict IIFE encapsulation: zero leaked global state
+ * - One-time bootstrap hash exchange (#bootstrap=...) scrubbed immediately via history.replaceState
+ * - Session credentials stored strictly in closure memory & HttpOnly SameSite=Strict cookies
  * - Safe DOM construction via createElement/textContent (DOM XSS immunity - BUG-UI-01)
  * - Zero hardcoded mock device/threat/stream arrays or fake setTimeout loops
- * - Bearer authentication via Authorization: Bearer <token> header & X-Sentinel-CSRF header
- * - Explicit Disconnected (exponential backoff), Scan Incomplete, and Empty states
+ * - Distinct CSRF token protection (X-Sentinel-CSRF header != session_id)
+ * - Explicit Disconnected, Scan Incomplete, and Empty states with Accessible Modals
  */
 
-document.addEventListener('DOMContentLoaded', () => {
-  // Extract per-session bearer token from hydrated meta tag or #token= fragment (never sent in query URLs)
-  const metaTokenEl = document.querySelector('meta[name="sentinel-bearer-token"]');
-  let sessionBearerToken = metaTokenEl ? (metaTokenEl.getAttribute('content') || '').trim() : '';
-  if (!sessionBearerToken && window.location.hash.startsWith('#token=')) {
-    sessionBearerToken = decodeURIComponent(window.location.hash.slice(7)).trim();
-    if (window.history && window.history.replaceState) {
-      window.history.replaceState(null, '', window.location.pathname);
-    }
-  }
+(() => {
+  'use strict';
 
-  function buildAuthHeaders(includeCsrf) {
-    const headers = {
-      'Accept': 'application/json'
-    };
-    if (sessionBearerToken) {
-      headers['Authorization'] = `Bearer ${sessionBearerToken}`;
-      if (includeCsrf) {
-        headers['X-Sentinel-CSRF'] = sessionBearerToken;
+  document.addEventListener('DOMContentLoaded', () => {
+    let sessionBearerToken = '';
+    let csrfToken = '';
+    let reconnectDelayMs = 1000;
+
+    // Accessible Modals
+    const shredModal = document.getElementById('shredModal');
+    const btnCloseShredModal = document.getElementById('btnCloseShredModal');
+    const btnCancelShred = document.getElementById('btnCancelShred');
+    const btnConfirmShred = document.getElementById('btnConfirmShred');
+
+    const sessionPromptModal = document.getElementById('sessionPromptModal');
+    const manualBootstrapInput = document.getElementById('manualBootstrapInput');
+    const btnSubmitBootstrap = document.getElementById('btnSubmitBootstrap');
+
+    function openShredModal() {
+      if (shredModal) {
+        shredModal.classList.add('open');
+        shredModal.setAttribute('aria-hidden', 'false');
       }
     }
-    return headers;
-  }
+
+    function closeShredModal() {
+      if (shredModal) {
+        shredModal.classList.remove('open');
+        shredModal.setAttribute('aria-hidden', 'true');
+      }
+    }
+
+    if (btnCloseShredModal) btnCloseShredModal.addEventListener('click', closeShredModal);
+    if (btnCancelShred) btnCancelShred.addEventListener('click', closeShredModal);
+
+    function openSessionModal() {
+      if (sessionPromptModal) {
+        sessionPromptModal.classList.add('open');
+        sessionPromptModal.setAttribute('aria-hidden', 'false');
+      }
+    }
+
+    function closeSessionModal() {
+      if (sessionPromptModal) {
+        sessionPromptModal.classList.remove('open');
+        sessionPromptModal.setAttribute('aria-hidden', 'true');
+      }
+    }
+
+    async function exchangeBootstrapCode(code) {
+      if (!code) return false;
+      try {
+        const res = await fetch('/api/v1/session/exchange', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          credentials: 'same-origin',
+          body: JSON.stringify({ bootstrap_token: code })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          csrfToken = (data && data.csrf_token) || '';
+          if (data && data.session_token) {
+            sessionBearerToken = data.session_token;
+          }
+          closeSessionModal();
+          return true;
+        }
+      } catch (_) {}
+      return false;
+    }
+
+    if (btnSubmitBootstrap && manualBootstrapInput) {
+      btnSubmitBootstrap.addEventListener('click', async () => {
+        const code = manualBootstrapInput.value.trim();
+        if (code) {
+          const ok = await exchangeBootstrapCode(code);
+          if (ok) {
+            manualBootstrapInput.value = '';
+            reconnectDelayMs = 1000;
+            pollLiveAgentStatus();
+          } else {
+            alert('Authentication failed: Invalid, expired, or already-used bootstrap code.');
+          }
+        }
+      });
+    }
+
+    function buildAuthHeaders(includeCsrf) {
+      const headers = {
+        'Accept': 'application/json'
+      };
+      if (sessionBearerToken) {
+        headers['Authorization'] = `Bearer ${sessionBearerToken}`;
+      }
+      if (includeCsrf && csrfToken) {
+        headers['X-Sentinel-CSRF'] = csrfToken;
+      }
+      return headers;
+    }
 
   // DOM Elements
   const systemHealthBadge = document.getElementById('systemHealthBadge');
@@ -157,8 +239,6 @@ document.addEventListener('DOMContentLoaded', () => {
         - Scan Incomplete state (volume held offline)
         - Empty / Live state from backend data only
      ========================================================================== */
-  let reconnectDelayMs = 1000;
-
   function renderDisconnectedState() {
     if (systemHealthBadge) {
       systemHealthBadge.replaceChildren();
@@ -326,8 +406,16 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       const statusRes = await fetch('/api/v1/status', {
         method: 'GET',
-        headers: buildAuthHeaders(false)
+        headers: buildAuthHeaders(false),
+        credentials: 'same-origin'
       });
+      if (statusRes.status === 401) {
+        openSessionModal();
+        renderDisconnectedState();
+        reconnectDelayMs = Math.min(reconnectDelayMs * 2, 16000);
+        setTimeout(pollLiveAgentStatus, reconnectDelayMs);
+        return;
+      }
       if (!statusRes.ok) {
         renderDisconnectedState();
         reconnectDelayMs = Math.min(reconnectDelayMs * 2, 16000);
@@ -335,11 +423,15 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
       const statusData = await statusRes.json();
+      if (statusData && statusData.csrf_token) {
+        csrfToken = statusData.csrf_token;
+      }
 
       let wsEvents = [];
       const wsRes = await fetch('/api/v1/ws', {
         method: 'GET',
-        headers: buildAuthHeaders(false)
+        headers: buildAuthHeaders(false),
+        credentials: 'same-origin'
       });
       if (wsRes.ok) {
         const wsData = await wsRes.json();
@@ -356,8 +448,6 @@ document.addEventListener('DOMContentLoaded', () => {
       setTimeout(pollLiveAgentStatus, reconnectDelayMs);
     }
   }
-
-  pollLiveAgentStatus();
 
   /* ==========================================================================
      1. Safe Charging Interlock Logic
@@ -435,8 +525,15 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   if (btnInitiateSanitize) {
-    btnInitiateSanitize.addEventListener('click', async () => {
-      btnInitiateSanitize.disabled = true;
+    btnInitiateSanitize.addEventListener('click', () => {
+      openShredModal();
+    });
+  }
+
+  if (btnConfirmShred) {
+    btnConfirmShred.addEventListener('click', async () => {
+      closeShredModal();
+      if (btnInitiateSanitize) btnInitiateSanitize.disabled = true;
       setSanitizeStatus('Executing Backend NIST 800-88 Clear (/api/v1/shred)...', 'status-pass1');
       try {
         const headers = buildAuthHeaders(true);
@@ -444,6 +541,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const res = await fetch('/api/v1/shred', {
           method: 'POST',
           headers,
+          credentials: 'same-origin',
           body: JSON.stringify({ create_ephemeral_canary: true })
         });
         if (!res.ok) {
@@ -456,7 +554,7 @@ document.addEventListener('DOMContentLoaded', () => {
       } catch (_) {
         renderDisconnectedState();
       } finally {
-        btnInitiateSanitize.disabled = false;
+        if (btnInitiateSanitize) btnInitiateSanitize.disabled = false;
       }
     });
   }
@@ -471,7 +569,8 @@ document.addEventListener('DOMContentLoaded', () => {
       const res = await fetch('/api/v1/scan', {
         method: 'POST',
         headers,
-        body: JSON.stringify({ path: '.sentinel_vault', max_files: 500 })
+        credentials: 'same-origin',
+        body: JSON.stringify({ max_files: 500 })
       });
       if (!res.ok) {
         renderDisconnectedState();
@@ -661,4 +760,37 @@ document.addEventListener('DOMContentLoaded', () => {
       btnKioskEject.disabled = true;
     });
   }
+
+  // Initialize session via one-time bootstrap hash or prompt
+  async function initSession() {
+    // 1. Inspect window.location.hash for #bootstrap=
+    const hash = (typeof window !== 'undefined' && window.location && window.location.hash) || '';
+    let code = '';
+    if (hash.startsWith('#bootstrap=')) {
+      code = decodeURIComponent(hash.slice(11)).trim();
+      // 2. Immediately scrub the hash fragment from browser address bar and history
+      try {
+        if (window.history && window.history.replaceState) {
+          window.history.replaceState(null, '', window.location.pathname + window.location.search);
+        } else {
+          window.location.hash = '';
+        }
+      } catch (_) {}
+    }
+
+    if (code) {
+      const ok = await exchangeBootstrapCode(code);
+      if (ok) {
+        reconnectDelayMs = 1000;
+        pollLiveAgentStatus();
+        return;
+      }
+    }
+
+    // If no bootstrap code or exchange failed, poll status (session cookie might already exist)
+    pollLiveAgentStatus();
+  }
+
+  initSession();
 });
+})();

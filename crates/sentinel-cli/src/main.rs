@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::Semaphore;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -1036,8 +1037,12 @@ pub const STRICT_DASHBOARD_CSP: &str =
 pub struct DashboardAppState {
     pub port: u16,
     pub demo_mode: bool,
-    pub session_token: String,
+    pub bootstrap_token: Mutex<Option<(String, std::time::Instant)>>,
+    pub session_id: String,
+    pub csrf_token: String,
     pub dashboard_dir: PathBuf,
+    pub ui_staging_root: PathBuf,
+    pub shred_scan_semaphore: Arc<Semaphore>,
     pub last_scan_complete: AtomicBool,
     pub last_scan_errors: Mutex<Vec<String>>,
     pub recent_events: Mutex<VecDeque<serde_json::Value>>,
@@ -1045,7 +1050,15 @@ pub struct DashboardAppState {
 }
 
 impl DashboardAppState {
-    pub fn new(port: u16, demo_mode: bool, session_token: String, dashboard_dir: PathBuf) -> Self {
+    pub fn new(
+        port: u16,
+        demo_mode: bool,
+        bootstrap_token: String,
+        session_id: String,
+        csrf_token: String,
+        dashboard_dir: PathBuf,
+        ui_staging_root: PathBuf,
+    ) -> Self {
         let mut events = VecDeque::new();
         events.push_back(serde_json::json!({
             "event": "AGENT_STATUS_SYNC",
@@ -1057,13 +1070,38 @@ impl DashboardAppState {
         Self {
             port,
             demo_mode,
-            session_token,
+            bootstrap_token: Mutex::new(Some((bootstrap_token, std::time::Instant::now()))),
+            session_id,
+            csrf_token,
             dashboard_dir,
+            ui_staging_root,
+            shred_scan_semaphore: Arc::new(Semaphore::new(2)),
             last_scan_complete: AtomicBool::new(true),
             last_scan_errors: Mutex::new(Vec::new()),
             recent_events: Mutex::new(events),
             last_shred_receipt: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new_with_token(
+        port: u16,
+        demo_mode: bool,
+        token: String,
+        dashboard_dir: PathBuf,
+    ) -> Self {
+        let staging = std::env::temp_dir().join(format!("sentinel_test_staging_{}", port));
+        let _ = fs::create_dir_all(&staging);
+        let csrf = format!("csrf_{token}");
+        Self::new(
+            port,
+            demo_mode,
+            token.clone(),
+            token,
+            csrf,
+            dashboard_dir,
+            staging,
+        )
     }
 
     pub fn push_event(&self, event: serde_json::Value) {
@@ -1104,7 +1142,7 @@ pub fn is_valid_local_origin_header(origin: &str, port: u16) -> bool {
         || trimmed == format!("http://localhost:{port}")
 }
 
-/// Constant-time validation of the `Authorization: Bearer <token>` header using `subtle::ConstantTimeEq` (`Row 173`).
+/// Constant-time validation of bearer token / session token using `subtle::ConstantTimeEq` (`Row 173`).
 pub fn verify_bearer_token_constant_time(auth_header: Option<&str>, expected_token: &str) -> bool {
     let Some(raw) = auth_header else {
         return false;
@@ -1121,7 +1159,7 @@ pub fn verify_bearer_token_constant_time(auth_header: Option<&str>, expected_tok
     bool::from(provided.ct_eq(expected))
 }
 
-/// Constant-time validation of the `X-Sentinel-CSRF` header against the session token (`Rows 175, 227`).
+/// Constant-time validation of the `X-Sentinel-CSRF` header against expected CSRF token (`Rows 175, 227`).
 pub fn verify_csrf_token_constant_time(csrf_header: Option<&str>, expected_token: &str) -> bool {
     let Some(raw) = csrf_header else {
         return false;
@@ -1182,6 +1220,15 @@ fn with_security_headers(
         header::CONTENT_SECURITY_POLICY,
         header::HeaderValue::from_static(STRICT_DASHBOARD_CSP),
     );
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    headers.insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
+    headers.insert(
+        header::HeaderName::from_static("referrer-policy"),
+        header::HeaderValue::from_static("no-referrer"),
+    );
     resp.into_response()
 }
 
@@ -1212,23 +1259,56 @@ fn check_host_and_origin(headers: &HeaderMap, port: u16) -> Result<(), Box<Respo
     Ok(())
 }
 
-fn check_bearer_auth(headers: &HeaderMap, expected_token: &str) -> Result<(), Box<Response>> {
+pub fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    for pair in cookie_header.split(';') {
+        let mut parts = pair.trim().splitn(2, '=');
+        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+            if k.trim() == name {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn check_session_auth(
+    headers: &HeaderMap,
+    expected_session_id: &str,
+) -> Result<(), Box<Response>> {
+    // 1. Check Authorization: Bearer <session_id>
     let auth_str = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if !verify_bearer_token_constant_time(auth_str, expected_token) {
-        return Err(Box::new(with_security_headers(
-            StatusCode::UNAUTHORIZED,
-            "application/json; charset=utf-8",
-            br#"{"error":"UNAUTHORIZED","message":"Missing or invalid Authorization: Bearer token"}"#.to_vec(),
-        )));
+    if verify_bearer_token_constant_time(auth_str, expected_session_id) {
+        return Ok(());
     }
-    Ok(())
+
+    // 2. Check sentinel_sid cookie
+    if let Some(cookie_sid) = extract_cookie_value(headers, "sentinel_sid") {
+        let provided = cookie_sid.trim().as_bytes();
+        let expected = expected_session_id.as_bytes();
+        if provided.len() == expected.len()
+            && !expected.is_empty()
+            && bool::from(provided.ct_eq(expected))
+        {
+            return Ok(());
+        }
+    }
+
+    Err(Box::new(with_security_headers(
+        StatusCode::UNAUTHORIZED,
+        "application/json; charset=utf-8",
+        br#"{"error":"UNAUTHORIZED","message":"Missing or invalid session credentials"}"#.to_vec(),
+    )))
 }
 
-fn check_csrf_header(headers: &HeaderMap, expected_token: &str) -> Result<(), Box<Response>> {
+pub fn check_csrf_header(
+    headers: &HeaderMap,
+    expected_csrf_token: &str,
+) -> Result<(), Box<Response>> {
     let csrf_str = headers.get("x-sentinel-csrf").and_then(|v| v.to_str().ok());
-    if !verify_csrf_token_constant_time(csrf_str, expected_token) {
+    if !verify_csrf_token_constant_time(csrf_str, expected_csrf_token) {
         return Err(Box::new(with_security_headers(
             StatusCode::FORBIDDEN,
             "application/json; charset=utf-8",
@@ -1238,6 +1318,181 @@ fn check_csrf_header(headers: &HeaderMap, expected_token: &str) -> Result<(), Bo
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct SessionExchangeRequest {
+    bootstrap_token: String,
+}
+
+async fn handle_session_exchange(
+    State(state): State<Arc<DashboardAppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Err(resp) = check_host_and_origin(&headers, state.port) {
+        return *resp;
+    }
+    let req: Result<SessionExchangeRequest, _> = serde_json::from_slice(&body);
+    let Ok(req) = req else {
+        return with_security_headers(
+            StatusCode::BAD_REQUEST,
+            "application/json; charset=utf-8",
+            br#"{"error":"BAD_REQUEST","message":"Invalid JSON payload"}"#.to_vec(),
+        );
+    };
+
+    let mut guard = match state.bootstrap_token.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    let valid = if let Some((ref expected, created_at)) = *guard {
+        if created_at.elapsed().as_secs() > 120 {
+            false
+        } else {
+            let provided = req.bootstrap_token.trim().as_bytes();
+            let exp_bytes = expected.as_bytes();
+            if provided.len() == exp_bytes.len() && !exp_bytes.is_empty() {
+                bool::from(provided.ct_eq(exp_bytes))
+            } else {
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if !valid {
+        return with_security_headers(
+            StatusCode::UNAUTHORIZED,
+            "application/json; charset=utf-8",
+            br#"{"error":"INVALID_BOOTSTRAP_TOKEN","message":"Bootstrap code invalid, expired, or already used"}"#.to_vec(),
+        );
+    }
+
+    // Single-use: consume it immediately
+    let _ = guard.take();
+
+    let cookie_val = format!(
+        "sentinel_sid={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400",
+        state.session_id
+    );
+    let body_json = serde_json::json!({
+        "status": "AUTHENTICATED",
+        "csrf_token": state.csrf_token,
+        "session_token": state.session_id
+    });
+
+    let mut resp = with_security_headers(
+        StatusCode::OK,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&body_json).unwrap_or_default(),
+    );
+    if let Ok(hv) = header::HeaderValue::from_str(&cookie_val) {
+        resp.headers_mut().insert(header::SET_COOKIE, hv);
+    }
+    resp
+}
+
+pub fn resolve_contained_ui_target(
+    user_path: &Path,
+    staging_root: &Path,
+) -> Result<PathBuf, (StatusCode, &'static str)> {
+    // 1. Inspect raw path string immediately for sensitive vault keywords before any filesystem access
+    let raw_lower = user_path.to_string_lossy().to_lowercase();
+    if raw_lower.contains(".sentinel_vault")
+        || raw_lower.contains("audit.jsonl")
+        || raw_lower.contains("vault_kek")
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Access to Sentinel vault infrastructure is prohibited",
+        ));
+    }
+
+    // 2. Reject path traversal ('..')
+    for comp in user_path.components() {
+        if matches!(comp, std::path::Component::ParentDir) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Path traversal ('..') is strictly prohibited",
+            ));
+        }
+    }
+
+    let canonical_root = match staging_root.canonicalize() {
+        Ok(r) => r,
+        Err(_) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed resolving UI staging root",
+            ))
+        }
+    };
+
+    // 3. Absolute path containment check: verify boundary BEFORE probing exists()
+    // to eliminate arbitrary host disk file existence/enumeration oracles
+    if user_path.is_absolute() {
+        let is_within_staging =
+            user_path.starts_with(staging_root) || user_path.starts_with(&canonical_root);
+        if !is_within_staging {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Target path is outside the designated UI staging root",
+            ));
+        }
+    }
+
+    let candidate = if user_path.is_absolute() {
+        user_path.to_path_buf()
+    } else {
+        staging_root.join(user_path)
+    };
+
+    if !candidate.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Target path does not exist in UI staging root",
+        ));
+    }
+
+    if sentinel_sys::ensure_not_symlink_or_reparse_point(&candidate).is_err() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Reparse points and symbolic links are prohibited",
+        ));
+    }
+
+    let canonical_target = match candidate.canonicalize() {
+        Ok(t) => t,
+        Err(_) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Failed resolving canonical target path",
+            ))
+        }
+    };
+
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Target path is outside the designated UI staging root",
+        ));
+    }
+
+    let s_lossy = canonical_target.to_string_lossy().to_lowercase();
+    if s_lossy.contains(".sentinel_vault")
+        || s_lossy.contains("audit.jsonl")
+        || s_lossy.contains("vault_kek")
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Access to Sentinel vault infrastructure is prohibited",
+        ));
+    }
+
+    Ok(canonical_target)
+}
+
 async fn handle_index(
     State(state): State<Arc<DashboardAppState>>,
     headers: HeaderMap,
@@ -1245,19 +1500,8 @@ async fn handle_index(
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
         return *resp;
     }
-    let raw_html = fs::read_to_string(state.dashboard_dir.join("index.html")).unwrap_or_default();
-    let hydrated_html = raw_html.replace(
-        r#"<meta name="sentinel-bearer-token" content="">"#,
-        &format!(
-            r#"<meta name="sentinel-bearer-token" content="{}">"#,
-            state.session_token
-        ),
-    );
-    with_security_headers(
-        StatusCode::OK,
-        "text/html; charset=utf-8",
-        hydrated_html.into_bytes(),
-    )
+    let raw_html = fs::read(state.dashboard_dir.join("index.html")).unwrap_or_default();
+    with_security_headers(StatusCode::OK, "text/html; charset=utf-8", raw_html)
 }
 
 async fn handle_style(
@@ -1295,7 +1539,7 @@ async fn handle_api_status(
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
         return *resp;
     }
-    if let Err(resp) = check_bearer_auth(&headers, &state.session_token) {
+    if let Err(resp) = check_session_auth(&headers, &state.session_id) {
         return *resp;
     }
 
@@ -1334,6 +1578,7 @@ async fn handle_api_status(
         "demo_mode": state.demo_mode,
         "architecture": "Option B Hardened (Zero Custom Kernel Driver)",
         "session_authenticated": true,
+        "csrf_token": state.csrf_token,
         "posture": {
             "automount_disabled": posture.automount_disabled,
             "user_deny_policy_present": posture.user_deny_policy_present,
@@ -1378,7 +1623,7 @@ async fn handle_api_ws(
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
         return *resp;
     }
-    if let Err(resp) = check_bearer_auth(&headers, &state.session_token) {
+    if let Err(resp) = check_session_auth(&headers, &state.session_id) {
         return *resp;
     }
 
@@ -1434,25 +1679,66 @@ async fn handle_api_scan(
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
         return *resp;
     }
-    if let Err(resp) = check_bearer_auth(&headers, &state.session_token) {
+    if let Err(resp) = check_session_auth(&headers, &state.session_id) {
         return *resp;
     }
-    if let Err(resp) = check_csrf_header(&headers, &state.session_token) {
+    if let Err(resp) = check_csrf_header(&headers, &state.csrf_token) {
         return *resp;
     }
 
     let req: ScanApiRequest = serde_json::from_slice(&body).unwrap_or_default();
-    let target_path = req
-        .path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".sentinel_vault"));
+    let target_path = if let Some(ref p) = req.path {
+        match resolve_contained_ui_target(&PathBuf::from(p), &state.ui_staging_root) {
+            Ok(t) => t,
+            Err((status, msg)) => {
+                return with_security_headers(
+                    status,
+                    "application/json; charset=utf-8",
+                    serde_json::to_vec(&serde_json::json!({
+                        "error": "UNAUTHORIZED_SCAN_TARGET",
+                        "message": msg,
+                    }))
+                    .unwrap_or_default(),
+                );
+            }
+        }
+    } else {
+        state.ui_staging_root.clone()
+    };
     let max_files = req.max_files.unwrap_or(500).clamp(1, 5000);
 
-    if !target_path.exists() {
-        let _ = fs::create_dir_all(&target_path);
-    }
+    let permit = match state.shred_scan_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return with_security_headers(
+                StatusCode::TOO_MANY_REQUESTS,
+                "application/json; charset=utf-8",
+                br#"{"error":"CONCURRENCY_LIMIT_EXCEEDED","message":"Maximum concurrent operations reached (limit: 2)"}"#.to_vec(),
+            );
+        }
+    };
 
-    let report = UniversalScanner::scan_directory_detailed(&target_path, max_files);
+    let target_clone = target_path.clone();
+    let report = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        UniversalScanner::scan_directory_detailed(&target_clone, max_files)
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return with_security_headers(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&serde_json::json!({
+                    "error": "SCAN_WORKER_PANIC",
+                    "message": e.to_string(),
+                }))
+                .unwrap_or_default(),
+            );
+        }
+    };
+
     state
         .last_scan_complete
         .store(report.complete, Ordering::Relaxed);
@@ -1501,20 +1787,34 @@ async fn handle_api_shred(
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
         return *resp;
     }
-    if let Err(resp) = check_bearer_auth(&headers, &state.session_token) {
+    if let Err(resp) = check_session_auth(&headers, &state.session_id) {
         return *resp;
     }
-    if let Err(resp) = check_csrf_header(&headers, &state.session_token) {
+    if let Err(resp) = check_csrf_header(&headers, &state.csrf_token) {
         return *resp;
     }
 
     let req: ShredApiRequest = serde_json::from_slice(&body).unwrap_or_default();
     let target_path = if let Some(ref p) = req.path {
-        PathBuf::from(p)
+        match resolve_contained_ui_target(&PathBuf::from(p), &state.ui_staging_root) {
+            Ok(t) => t,
+            Err((status, msg)) => {
+                tracing::warn!("UNAUTHORIZED_SHRED_BLOCKED: path '{p}' rejected: {msg}");
+                return with_security_headers(
+                    status,
+                    "application/json; charset=utf-8",
+                    serde_json::to_vec(&serde_json::json!({
+                        "error": "UNAUTHORIZED_SHRED_TARGET",
+                        "message": msg,
+                    }))
+                    .unwrap_or_default(),
+                );
+            }
+        }
     } else if req.create_ephemeral_canary.unwrap_or(true) {
-        let vault_dir = PathBuf::from(".sentinel_vault");
-        let _ = fs::create_dir_all(&vault_dir);
-        let canary = vault_dir.join(format!("shred_canary_{}.bin", uuid::Uuid::new_v4()));
+        let canary = state
+            .ui_staging_root
+            .join(format!("shred_canary_{}.bin", uuid::Uuid::new_v4()));
         if let Err(e) = fs::write(&canary, vec![0xA5u8; 64 * 1024]) {
             return with_security_headers(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1536,42 +1836,73 @@ async fn handle_api_shred(
         );
     };
 
-    match SecureShredder::shred_file(&target_path, ShredMethod::ClearMultiPass { passes: 3 }) {
-        Ok(receipt) => {
-            if let Ok(mut guard) = state.last_shred_receipt.lock() {
-                *guard = Some(receipt.clone());
-            }
-            let mut ledger = AuditLedger::open(PathBuf::from(".sentinel_vault/audit.jsonl"));
-            let _ = ledger.append_event(
-                "SHRED_RECEIPT",
-                serde_json::to_string(&receipt).unwrap_or_default(),
-            );
-            state.push_event(serde_json::json!({
-                "event": "SHRED_COMPLETE",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-                "original_path": receipt.original_path,
-                "passes_completed": receipt.passes_completed,
-                "rename_cycles_completed": receipt.rename_cycles_completed,
-                "flush_succeeded": receipt.flush_succeeded,
-                "media_type": receipt.media_type,
-                "sanitization_level": receipt.sanitization_level,
-            }));
-            with_security_headers(
-                StatusCode::OK,
+    let permit = match state.shred_scan_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return with_security_headers(
+                StatusCode::TOO_MANY_REQUESTS,
                 "application/json; charset=utf-8",
-                serde_json::to_vec(&receipt).unwrap_or_default(),
-            )
+                br#"{"error":"CONCURRENCY_LIMIT_EXCEEDED","message":"Maximum concurrent operations reached (limit: 2)"}"#.to_vec(),
+            );
         }
-        Err(err) => with_security_headers(
-            StatusCode::BAD_REQUEST,
-            "application/json; charset=utf-8",
-            serde_json::to_vec(&serde_json::json!({
-                "error": "SHRED_OPERATION_FAILED",
-                "message": err,
-            }))
-            .unwrap_or_default(),
-        ),
+    };
+
+    let target_clone = target_path.clone();
+    let shred_result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        SecureShredder::shred_file(&target_clone, ShredMethod::ClearMultiPass { passes: 3 })
+    })
+    .await;
+
+    let receipt = match shred_result {
+        Ok(Ok(r)) => r,
+        Ok(Err(err)) => {
+            return with_security_headers(
+                StatusCode::BAD_REQUEST,
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&serde_json::json!({
+                    "error": "SHRED_OPERATION_FAILED",
+                    "message": err,
+                }))
+                .unwrap_or_default(),
+            );
+        }
+        Err(e) => {
+            return with_security_headers(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "application/json; charset=utf-8",
+                serde_json::to_vec(&serde_json::json!({
+                    "error": "SHRED_WORKER_PANIC",
+                    "message": e.to_string(),
+                }))
+                .unwrap_or_default(),
+            );
+        }
+    };
+
+    if let Ok(mut guard) = state.last_shred_receipt.lock() {
+        *guard = Some(receipt.clone());
     }
+    let mut ledger = AuditLedger::open(PathBuf::from(".sentinel_vault/audit.jsonl"));
+    let _ = ledger.append_event(
+        "SHRED_RECEIPT",
+        serde_json::to_string(&receipt).unwrap_or_default(),
+    );
+    state.push_event(serde_json::json!({
+        "event": "SHRED_COMPLETE",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "original_path": receipt.original_path,
+        "passes_completed": receipt.passes_completed,
+        "rename_cycles_completed": receipt.rename_cycles_completed,
+        "flush_succeeded": receipt.flush_succeeded,
+        "media_type": receipt.media_type,
+        "sanitization_level": receipt.sanitization_level,
+    }));
+    with_security_headers(
+        StatusCode::OK,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&receipt).unwrap_or_default(),
+    )
 }
 
 async fn handle_api_metrics(
@@ -1581,7 +1912,7 @@ async fn handle_api_metrics(
     if let Err(resp) = check_host_and_origin(&headers, state.port) {
         return *resp;
     }
-    if let Err(resp) = check_bearer_auth(&headers, &state.session_token) {
+    if let Err(resp) = check_session_auth(&headers, &state.session_id) {
         return *resp;
     }
 
@@ -1617,6 +1948,7 @@ pub fn build_dashboard_router(state: Arc<DashboardAppState>) -> Router {
         .route("/style.css", get(handle_style))
         .route("/styles.css", get(handle_style))
         .route("/app.js", get(handle_app_js))
+        .route("/api/v1/session/exchange", post(handle_session_exchange))
         .route("/api/v1/status", get(handle_api_status))
         .route("/api/v1/ws", get(handle_api_ws))
         .route("/api/v1/scan", post(handle_api_scan))
@@ -1628,9 +1960,10 @@ pub fn build_dashboard_router(state: Arc<DashboardAppState>) -> Router {
 
 /// Serves the Sentinel Web Dashboard on `127.0.0.1:{port}` via `axum::Router` (`Sub-Phase 5.1`):
 /// - Binds strictly to `127.0.0.1:{port}` (`Row 172`)
-/// - Generates a per-session bearer token validated in constant time via `Authorization: Bearer <token>` (`Row 173`)
+/// - Generates a single-use bootstrap code via `#bootstrap=<token>` exchange -> HttpOnly cookie + distinct CSRF token
 /// - Enforces exact `Host` and `Origin` header validation (`127.0.0.1:{port}` / `localhost:{port}`) to block DNS rebinding (`High #9`, `Row 174`)
 /// - Enforces CSRF validation (`X-Sentinel-CSRF`) on `POST /api/v1/scan` and `POST /api/v1/shred` (`Rows 175, 227`)
+/// - Restricts scanning and shredding to `ui_staging_root` with bounded concurrency (`Semaphore::new(2)`)
 /// - Exports all 7 labeled Prometheus metrics on `GET /api/v1/metrics` (`Row 206`)
 async fn serve_dashboard_ui(port: u16, demo_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -1638,8 +1971,28 @@ async fn serve_dashboard_ui(port: u16, demo_mode: bool) -> Result<(), Box<dyn st
     std_listener.set_nonblocking(true)?;
     let actual_port = std_listener.local_addr()?.port();
 
-    let session_token = uuid::Uuid::new_v4().to_string();
-    let launch_url = format!("http://127.0.0.1:{actual_port}/");
+    let bootstrap_token = format!("boot_{}", uuid::Uuid::new_v4().simple());
+    let session_id = format!("sid_{}", uuid::Uuid::new_v4().simple());
+    let csrf_token = format!("csrf_{}", uuid::Uuid::new_v4().simple());
+
+    let ui_staging_root = {
+        #[cfg(test)]
+        {
+            std::env::temp_dir().join(format!("sentinel_ui_staging_{actual_port}"))
+        }
+        #[cfg(not(test))]
+        {
+            #[cfg(windows)]
+            let base = PathBuf::from(r"C:\ProgramData\OmniConnect\UIStaging");
+            #[cfg(not(windows))]
+            let base = PathBuf::from("/var/lib/omniconnect/ui_staging");
+            let _ = sentinel_sys::create_restricted_dir_atomic(&base);
+            base.join(format!("sentinel_ui_staging_{actual_port}"))
+        }
+    };
+    let _ = sentinel_sys::create_restricted_dir_atomic(&ui_staging_root);
+
+    let launch_url = format!("http://127.0.0.1:{actual_port}/#bootstrap={bootstrap_token}");
     if !is_valid_dashboard_launch_url(&launch_url) {
         return Err("Refusing to launch browser: URL failed strict ^http://127\\.0\\.0\\.1:\\d+/ validation".into());
     }
@@ -1648,8 +2001,12 @@ async fn serve_dashboard_ui(port: u16, demo_mode: bool) -> Result<(), Box<dyn st
     info!("   OmniConnect Sentinel - Localhost Web GUI Dashboard      ");
     info!("===========================================================");
     println!("\n🖥️ [SENTINEL DASHBOARD SERVER ACTIVE (AXUM)]");
-    println!("   Bound Address: {launch_url}");
-    println!("   Bearer Auth:   Required via Authorization: Bearer <token> header");
+    println!("   Bound Address:  http://127.0.0.1:{actual_port}/");
+    println!("   One-Time URL:   {launch_url}");
+    println!(
+        "   Auth Model:     Single-Use Bootstrap (#bootstrap=...) -> HttpOnly Cookie + CSRF Header"
+    );
+    println!("   Staging Root:   {}", ui_staging_root.display());
 
     #[cfg(target_os = "windows")]
     {
@@ -1673,8 +2030,11 @@ async fn serve_dashboard_ui(port: u16, demo_mode: bool) -> Result<(), Box<dyn st
     let state = Arc::new(DashboardAppState::new(
         actual_port,
         demo_mode,
-        session_token,
+        bootstrap_token,
+        session_id,
+        csrf_token,
         dashboard_dir,
+        ui_staging_root,
     ));
     let app = build_dashboard_router(state);
 
@@ -1696,12 +2056,22 @@ mod tests {
             .map(|p| p.join("dashboard"))
             .unwrap_or_else(|| PathBuf::from("dashboard"));
 
-        let token = "test-session-bearer-token-9f8e7d6c".to_string();
+        let staging_root =
+            std::env::temp_dir().join(format!("sentinel_test_staging_{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&staging_root);
+
+        let bootstrap_token = "boot-test-token-12345".to_string();
+        let session_id = "sid-test-session-67890".to_string();
+        let csrf_token = "csrf-test-token-abcde".to_string();
+
         let state = Arc::new(DashboardAppState::new(
             8088,
             false,
-            token.clone(),
+            bootstrap_token.clone(),
+            session_id.clone(),
+            csrf_token.clone(),
             dashboard_dir.clone(),
+            staging_root.clone(),
         ));
         let app = build_dashboard_router(state);
 
@@ -1709,7 +2079,7 @@ mod tests {
         let req_rebind = Request::builder()
             .uri("/api/v1/status")
             .header(header::HOST, "127.0.0.1.attacker.tld")
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::AUTHORIZATION, format!("Bearer {session_id}"))
             .body(Body::empty())
             .unwrap_or_else(|_| Request::new(Body::empty()));
         let resp_rebind = app
@@ -1719,9 +2089,9 @@ mod tests {
             .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
         assert_eq!(resp_rebind.status(), StatusCode::FORBIDDEN);
 
-        // 2. Missing Authorization header on /api/v1/status MUST return 401 Unauthorized (even if token is in URL query)
+        // 2. Missing credentials on /api/v1/status MUST return 401 Unauthorized
         let req_unauth = Request::builder()
-            .uri(format!("/api/v1/status?token={token}"))
+            .uri("/api/v1/status")
             .header(header::HOST, "127.0.0.1:8088")
             .body(Body::empty())
             .unwrap_or_else(|_| Request::new(Body::empty()));
@@ -1732,12 +2102,105 @@ mod tests {
             .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
         assert_eq!(resp_unauth.status(), StatusCode::UNAUTHORIZED);
 
-        // 3. Valid Host + Authorization: Bearer <token> on /api/v1/status MUST return 200 OK + strict CSP
+        // 3. GET / MUST return 200 OK, strict CSP, Cache-Control: no-store, and ZERO sentinel-bearer-token meta
+        let req_index = Request::builder()
+            .uri("/")
+            .header(header::HOST, "127.0.0.1:8088")
+            .body(Body::empty())
+            .unwrap_or_else(|_| Request::new(Body::empty()));
+        let resp_index = app
+            .clone()
+            .oneshot(req_index)
+            .await
+            .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
+        assert_eq!(resp_index.status(), StatusCode::OK);
+        let index_body_bytes = axum::body::to_bytes(resp_index.into_body(), 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        let index_html = String::from_utf8_lossy(&index_body_bytes);
+        assert!(
+            !index_html.contains("sentinel-bearer-token"),
+            "HTML must never contain sentinel-bearer-token meta tag"
+        );
+
+        // 4. Session Exchange: Invalid bootstrap code returns 401
+        let req_bad_exchange = Request::builder()
+            .method("POST")
+            .uri("/api/v1/session/exchange")
+            .header(header::HOST, "127.0.0.1:8088")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"bootstrap_token":"wrong-code"}"#))
+            .unwrap_or_else(|_| Request::new(Body::empty()));
+        let resp_bad_exchange = app
+            .clone()
+            .oneshot(req_bad_exchange)
+            .await
+            .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
+        assert_eq!(resp_bad_exchange.status(), StatusCode::UNAUTHORIZED);
+
+        // 5. Session Exchange: Valid bootstrap code returns 200 OK + Set-Cookie + distinct csrf_token
+        let req_good_exchange = Request::builder()
+            .method("POST")
+            .uri("/api/v1/session/exchange")
+            .header(header::HOST, "127.0.0.1:8088")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"bootstrap_token":"{bootstrap_token}"}}"#
+            )))
+            .unwrap_or_else(|_| Request::new(Body::empty()));
+        let resp_good_exchange = app
+            .clone()
+            .oneshot(req_good_exchange)
+            .await
+            .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
+        assert_eq!(resp_good_exchange.status(), StatusCode::OK);
+        let set_cookie = resp_good_exchange
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(set_cookie.contains("sentinel_sid="));
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Strict"));
+
+        let exchange_bytes = axum::body::to_bytes(resp_good_exchange.into_body(), 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        let exchange_json: serde_json::Value =
+            serde_json::from_slice(&exchange_bytes).unwrap_or_default();
+        assert_eq!(exchange_json["csrf_token"], csrf_token);
+        assert_ne!(
+            csrf_token, session_id,
+            "CSRF token must be distinct from session ID"
+        );
+
+        // 6. Replay attack on single-use bootstrap code MUST return 401
+        let req_replay_exchange = Request::builder()
+            .method("POST")
+            .uri("/api/v1/session/exchange")
+            .header(header::HOST, "127.0.0.1:8088")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"bootstrap_token":"{bootstrap_token}"}}"#
+            )))
+            .unwrap_or_else(|_| Request::new(Body::empty()));
+        let resp_replay_exchange = app
+            .clone()
+            .oneshot(req_replay_exchange)
+            .await
+            .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
+        assert_eq!(
+            resp_replay_exchange.status(),
+            StatusCode::UNAUTHORIZED,
+            "Replay of bootstrap code must fail"
+        );
+
+        // 7. GET /api/v1/status with Cookie: sentinel_sid returns 200 OK + strict CSP + Cache-Control: no-store
         let req_ok = Request::builder()
             .uri("/api/v1/status")
             .header(header::HOST, "127.0.0.1:8088")
             .header(header::ORIGIN, "http://127.0.0.1:8088")
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
             .body(Body::empty())
             .unwrap_or_else(|_| Request::new(Body::empty()));
         let resp_ok = app
@@ -1753,13 +2216,19 @@ mod tests {
             .unwrap_or("");
         assert!(!csp.contains("unsafe-inline"));
         assert!(!csp.contains("fonts.googleapis.com"));
+        let cc = resp_ok
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(cc.contains("no-store"));
 
-        // 4. POST /api/v1/shred without X-Sentinel-CSRF MUST return 403 Forbidden
+        // 8. POST /api/v1/shred without X-Sentinel-CSRF MUST return 403 Forbidden
         let req_no_csrf = Request::builder()
             .method("POST")
             .uri("/api/v1/shred")
             .header(header::HOST, "127.0.0.1:8088")
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
             .body(Body::from(r#"{"create_ephemeral_canary":true}"#))
             .unwrap_or_else(|_| Request::new(Body::empty()));
         let resp_no_csrf = app
@@ -1769,13 +2238,113 @@ mod tests {
             .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
         assert_eq!(resp_no_csrf.status(), StatusCode::FORBIDDEN);
 
-        // 5. POST /api/v1/shred with valid Bearer + X-Sentinel-CSRF executes real SecureShredder and returns 200 OK
+        // 9. POST /api/v1/shred with session_id passed as CSRF token MUST return 403 Forbidden (CSRF token separation)
+        let req_wrong_csrf = Request::builder()
+            .method("POST")
+            .uri("/api/v1/shred")
+            .header(header::HOST, "127.0.0.1:8088")
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+            .header("x-sentinel-csrf", &session_id)
+            .body(Body::from(r#"{"create_ephemeral_canary":true}"#))
+            .unwrap_or_else(|_| Request::new(Body::empty()));
+        let resp_wrong_csrf = app
+            .clone()
+            .oneshot(req_wrong_csrf)
+            .await
+            .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
+        assert_eq!(resp_wrong_csrf.status(), StatusCode::FORBIDDEN);
+
+        // 10a. POST /api/v1/shred attempting path traversal outside staging root MUST return 403 Forbidden
+        let req_traversal = Request::builder()
+            .method("POST")
+            .uri("/api/v1/shred")
+            .header(header::HOST, "127.0.0.1:8088")
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+            .header("x-sentinel-csrf", &csrf_token)
+            .body(Body::from(r#"{"path":"../.sentinel_vault/audit.jsonl"}"#))
+            .unwrap_or_else(|_| Request::new(Body::empty()));
+        let resp_traversal = app
+            .clone()
+            .oneshot(req_traversal)
+            .await
+            .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
+        assert_eq!(resp_traversal.status(), StatusCode::FORBIDDEN);
+
+        // 10b. Sensitive vault path keyword rejection MUST return 403 Forbidden even if file does not exist on disk (CEA-DEFECT-01)
+        let req_vault_keyword = Request::builder()
+            .method("POST")
+            .uri("/api/v1/shred")
+            .header(header::HOST, "127.0.0.1:8088")
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+            .header("x-sentinel-csrf", &csrf_token)
+            .body(Body::from(r#"{"path":".sentinel_vault/audit.jsonl"}"#))
+            .unwrap_or_else(|_| Request::new(Body::empty()));
+        let resp_vault_keyword = app
+            .clone()
+            .oneshot(req_vault_keyword)
+            .await
+            .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
+        assert_eq!(resp_vault_keyword.status(), StatusCode::FORBIDDEN);
+
+        // 10c. Absolute external host paths MUST return 403 Forbidden with zero existence oracle (CEA-DEFECT-02)
+        for host_path in &[
+            "C:\\Windows\\System32\\drivers\\etc\\hosts",
+            "C:\\Windows\\System32\\drivers\\etc\\nonexistent_secret.sys",
+        ] {
+            let req_oracle = Request::builder()
+                .method("POST")
+                .uri("/api/v1/scan")
+                .header(header::HOST, "127.0.0.1:8088")
+                .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+                .header("x-sentinel-csrf", &csrf_token)
+                .body(Body::from(format!(
+                    r#"{{"path":"{}"}}"#,
+                    host_path.replace('\\', "\\\\")
+                )))
+                .unwrap_or_else(|_| Request::new(Body::empty()));
+            let resp_oracle = app
+                .clone()
+                .oneshot(req_oracle)
+                .await
+                .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
+            assert_eq!(
+                resp_oracle.status(),
+                StatusCode::FORBIDDEN,
+                "Host path must return 403 Forbidden: {host_path}"
+            );
+        }
+
+        // 10d. Reload / Status CSRF token synchronization (CEA-DEFECT-03)
+        let req_status_reload = Request::builder()
+            .uri("/api/v1/status")
+            .header(header::HOST, "127.0.0.1:8088")
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+            .body(Body::empty())
+            .unwrap_or_else(|_| Request::new(Body::empty()));
+        let resp_status_reload = app
+            .clone()
+            .oneshot(req_status_reload)
+            .await
+            .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
+        assert_eq!(resp_status_reload.status(), StatusCode::OK);
+        let status_body = axum::body::to_bytes(resp_status_reload.into_body(), 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        let status_parsed: serde_json::Value =
+            serde_json::from_slice(&status_body).unwrap_or_default();
+        assert_eq!(
+            status_parsed.get("csrf_token").and_then(|v| v.as_str()),
+            Some(csrf_token.as_str()),
+            "GET /api/v1/status must return current CSRF token to prevent client lockout on reload"
+        );
+
+        // 11. POST /api/v1/shred with valid cookie + valid CSRF executes canary shred inside staging root and returns 200 OK
         let req_shred = Request::builder()
             .method("POST")
             .uri("/api/v1/shred")
             .header(header::HOST, "127.0.0.1:8088")
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header("x-sentinel-csrf", &token)
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+            .header("x-sentinel-csrf", &csrf_token)
             .body(Body::from(r#"{"create_ephemeral_canary":true}"#))
             .unwrap_or_else(|_| Request::new(Body::empty()));
         let resp_shred = app
@@ -1785,11 +2354,11 @@ mod tests {
             .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
         assert_eq!(resp_shred.status(), StatusCode::OK);
 
-        // 6. GET /api/v1/metrics exports all 7 Prometheus metric families
+        // 12. GET /api/v1/metrics exports all 7 Prometheus metric families
         let req_metrics = Request::builder()
             .uri("/api/v1/metrics")
             .header(header::HOST, "127.0.0.1:8088")
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
             .body(Body::empty())
             .unwrap_or_else(|_| Request::new(Body::empty()));
         let resp_metrics = app
@@ -1810,7 +2379,7 @@ mod tests {
         assert!(prom_text.contains("sentinel_posture{feature="));
         assert!(prom_text.contains("sentinel_policy_drift_total"));
 
-        // 7. Verify dashboard/app.js and dashboard/index.html have zero mock arrays or inline styles
+        // 13. Verify dashboard/app.js and dashboard/index.html have zero mock arrays or inline styles
         let app_js = fs::read_to_string(dashboard_dir.join("app.js")).unwrap_or_default();
         assert!(!app_js.contains("const DEVICES ="));
         assert!(!app_js.contains("STRESS_STREAM_ITEMS"));
@@ -1818,10 +2387,341 @@ mod tests {
         assert!(!app_js.contains("4,812"));
         assert!(app_js.contains("DISCONNECTED — NO LIVE DATA"));
         assert!(app_js.contains("SCAN INCOMPLETE — VOLUME HELD OFFLINE"));
+        assert!(app_js.contains("initSession"));
+        assert!(app_js.contains("window.history.replaceState"));
+        assert!(app_js.contains("#bootstrap="));
+        assert!(app_js.contains("exchangeBootstrapCode"));
+
+        let _ = fs::remove_dir_all(&staging_root);
     }
 
     #[test]
     fn ui_disconnected_state() {
-        test_dashboard_axum_router_dns_rebinding_bearer_auth_csrf_and_metrics();
+        // Simple sanity check that the binary target compiles and tests link properly
+    }
+
+    #[tokio::test]
+    async fn test_adversarial_cold_eye_dashboard_security_and_containment_probe(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dashboard_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("dashboard"))
+            .unwrap_or_else(|| PathBuf::from("dashboard"));
+
+        let staging_root =
+            std::env::temp_dir().join(format!("sentinel_adv_staging_{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&staging_root);
+
+        let bootstrap_token = format!("boot_adv_{}", uuid::Uuid::new_v4().simple());
+        let session_id = format!("sid_adv_{}", uuid::Uuid::new_v4().simple());
+        let csrf_token = format!("csrf_adv_{}", uuid::Uuid::new_v4().simple());
+
+        let state = Arc::new(DashboardAppState::new(
+            9191,
+            false,
+            bootstrap_token.clone(),
+            session_id.clone(),
+            csrf_token.clone(),
+            dashboard_dir.clone(),
+            staging_root.clone(),
+        ));
+        let app = build_dashboard_router(state.clone());
+
+        // Probe 1: Expired Bootstrap Token Attack (TTL > 120s)
+        {
+            let mut guard = state
+                .bootstrap_token
+                .lock()
+                .map_err(|e| format!("mutex poisoned: {e}"))?;
+            *guard = Some((
+                bootstrap_token.clone(),
+                std::time::Instant::now() - std::time::Duration::from_secs(125),
+            ));
+        }
+        let req_expired = Request::builder()
+            .method("POST")
+            .uri("/api/v1/session/exchange")
+            .header(header::HOST, "127.0.0.1:9191")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"bootstrap_token":"{bootstrap_token}"}}"#
+            )))?;
+        let resp_expired = app.clone().oneshot(req_expired).await?;
+        assert_eq!(
+            resp_expired.status(),
+            StatusCode::UNAUTHORIZED,
+            "Expired bootstrap token (>120s) must be rejected with 401"
+        );
+
+        // Reset bootstrap token with fresh timestamp
+        {
+            let mut guard = state
+                .bootstrap_token
+                .lock()
+                .map_err(|e| format!("mutex poisoned: {e}"))?;
+            *guard = Some((bootstrap_token.clone(), std::time::Instant::now()));
+        }
+
+        // Probe 2: Token Prefix & Length Bypass Probes
+        for bad_code in &[
+            "",
+            &bootstrap_token[..5],
+            &format!("{bootstrap_token}extra"),
+            "wrong_token_1234567890",
+        ] {
+            let req_bad = Request::builder()
+                .method("POST")
+                .uri("/api/v1/session/exchange")
+                .header(header::HOST, "127.0.0.1:9191")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"bootstrap_token":"{bad_code}"}}"#)))?;
+            let resp_bad = app.clone().oneshot(req_bad).await?;
+            assert_eq!(
+                resp_bad.status(),
+                StatusCode::UNAUTHORIZED,
+                "Malformed/mismatched bootstrap code '{bad_code}' must return 401"
+            );
+        }
+
+        // Probe 3: Legitimate Bootstrap Exchange & Immediate Anti-Replay
+        let req_exchange = Request::builder()
+            .method("POST")
+            .uri("/api/v1/session/exchange")
+            .header(header::HOST, "127.0.0.1:9191")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"bootstrap_token":"{bootstrap_token}"}}"#
+            )))?;
+        let resp_exchange = app.clone().oneshot(req_exchange).await?;
+        assert_eq!(resp_exchange.status(), StatusCode::OK);
+        let set_cookie = resp_exchange
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(set_cookie.contains(&format!("sentinel_sid={session_id}")));
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Strict"));
+
+        // Attempt replay attack immediately
+        let req_replay = Request::builder()
+            .method("POST")
+            .uri("/api/v1/session/exchange")
+            .header(header::HOST, "127.0.0.1:9191")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"bootstrap_token":"{bootstrap_token}"}}"#
+            )))?;
+        let resp_replay = app.clone().oneshot(req_replay).await?;
+        assert_eq!(
+            resp_replay.status(),
+            StatusCode::UNAUTHORIZED,
+            "Replaying consumed bootstrap token must fail with 401"
+        );
+
+        // Probe 4: CSRF Cross-Substitution Attack (Submit session_id as CSRF token)
+        let req_subst = Request::builder()
+            .method("POST")
+            .uri("/api/v1/scan")
+            .header(header::HOST, "127.0.0.1:9191")
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+            .header("x-sentinel-csrf", &session_id)
+            .body(Body::from(r#"{"max_files":10}"#))?;
+        let resp_subst = app.clone().oneshot(req_subst).await?;
+        assert_eq!(
+            resp_subst.status(),
+            StatusCode::FORBIDDEN,
+            "Submitting session_id as CSRF token must fail with 403 Forbidden"
+        );
+
+        // Probe 5: CSRF Missing / Altered Probes
+        for bad_csrf in &["", "csrf_invalid_token", "csrf_adv_truncated", "null"] {
+            let req_csrf_bad = Request::builder()
+                .method("POST")
+                .uri("/api/v1/shred")
+                .header(header::HOST, "127.0.0.1:9191")
+                .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+                .header("x-sentinel-csrf", *bad_csrf)
+                .body(Body::from(r#"{"create_ephemeral_canary":true}"#))?;
+            let resp_csrf_bad = app.clone().oneshot(req_csrf_bad).await?;
+            assert_eq!(
+                resp_csrf_bad.status(),
+                StatusCode::FORBIDDEN,
+                "Bad CSRF token '{bad_csrf}' must return 403 Forbidden"
+            );
+        }
+
+        // Probe 6: Zero File Existence Oracle Probe
+        let existing_host_file = "C:\\Windows\\System32\\cmd.exe";
+        let non_existing_host_file =
+            "C:\\Windows\\System32\\definitely_nonexistent_secret_probe_9999.xyz";
+
+        let req_exist = Request::builder()
+            .method("POST")
+            .uri("/api/v1/scan")
+            .header(header::HOST, "127.0.0.1:9191")
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+            .header("x-sentinel-csrf", &csrf_token)
+            .body(Body::from(format!(
+                r#"{{"path":"{}"}}"#,
+                existing_host_file.replace('\\', "\\\\")
+            )))?;
+        let resp_exist = app.clone().oneshot(req_exist).await?;
+        let status_exist = resp_exist.status();
+        let body_exist = axum::body::to_bytes(resp_exist.into_body(), 64 * 1024).await?;
+
+        let req_nonexist = Request::builder()
+            .method("POST")
+            .uri("/api/v1/scan")
+            .header(header::HOST, "127.0.0.1:9191")
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+            .header("x-sentinel-csrf", &csrf_token)
+            .body(Body::from(format!(
+                r#"{{"path":"{}"}}"#,
+                non_existing_host_file.replace('\\', "\\\\")
+            )))?;
+        let resp_nonexist = app.clone().oneshot(req_nonexist).await?;
+        let status_nonexist = resp_nonexist.status();
+        let body_nonexist = axum::body::to_bytes(resp_nonexist.into_body(), 64 * 1024).await?;
+
+        assert_eq!(status_exist, StatusCode::FORBIDDEN);
+        assert_eq!(status_nonexist, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body_exist, body_nonexist,
+            "Responses for existing and non-existing host paths outside staging root must be byte-for-byte identical (Zero Existence Oracle)"
+        );
+
+        // Probe 7: Sensitive Vault Keyword Probes (Must be 403 even for non-existent files)
+        for vault_target in &[
+            ".sentinel_vault",
+            ".sentinel_vault/audit.jsonl",
+            "audit.jsonl",
+            "vault_kek",
+            "subdir/.sentinel_vault/nonexistent.bin",
+            ".SENTINEL_VAULT",
+            "SUBDIR/AUDIT.JSONL",
+            "VAULT_KEK.ESCROW",
+        ] {
+            let req_vault = Request::builder()
+                .method("POST")
+                .uri("/api/v1/shred")
+                .header(header::HOST, "127.0.0.1:9191")
+                .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+                .header("x-sentinel-csrf", &csrf_token)
+                .body(Body::from(format!(r#"{{"path":"{vault_target}"}}"#)))?;
+            let resp_vault = app.clone().oneshot(req_vault).await?;
+            assert_eq!(
+                resp_vault.status(),
+                StatusCode::FORBIDDEN,
+                "Vault sensitive keyword '{vault_target}' must return 403 Forbidden unconditionally"
+            );
+        }
+
+        // Probe 8: Directory Traversal Attacks ('..')
+        for traversal in &[
+            "../outside.txt",
+            "..\\outside.txt",
+            "sub/../../outside.txt",
+            "sub\\..\\..\\outside.txt",
+        ] {
+            let req_trav = Request::builder()
+                .method("POST")
+                .uri("/api/v1/shred")
+                .header(header::HOST, "127.0.0.1:9191")
+                .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+                .header("x-sentinel-csrf", &csrf_token)
+                .body(Body::from(format!(
+                    r#"{{"path":"{}"}}"#,
+                    traversal.replace('\\', "\\\\")
+                )))?;
+            let resp_trav = app.clone().oneshot(req_trav).await?;
+            assert_eq!(
+                resp_trav.status(),
+                StatusCode::FORBIDDEN,
+                "Traversal '{traversal}' must return 403 Forbidden"
+            );
+        }
+
+        // Probe 9: Semaphore Saturation / Concurrency Limiting (DoS Defense)
+        let permit1 = state
+            .shred_scan_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|e| format!("permit1: {e}"))?;
+        let permit2 = state
+            .shred_scan_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|e| format!("permit2: {e}"))?;
+
+        let req_sat_scan = Request::builder()
+            .method("POST")
+            .uri("/api/v1/scan")
+            .header(header::HOST, "127.0.0.1:9191")
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+            .header("x-sentinel-csrf", &csrf_token)
+            .body(Body::from(r#"{"max_files":10}"#))?;
+        let resp_sat_scan = app.clone().oneshot(req_sat_scan).await?;
+        assert_eq!(
+            resp_sat_scan.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "Scan operation with saturated semaphore must return 429 Too Many Requests"
+        );
+
+        let req_sat_shred = Request::builder()
+            .method("POST")
+            .uri("/api/v1/shred")
+            .header(header::HOST, "127.0.0.1:9191")
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+            .header("x-sentinel-csrf", &csrf_token)
+            .body(Body::from(r#"{"create_ephemeral_canary":true}"#))?;
+        let resp_sat_shred = app.clone().oneshot(req_sat_shred).await?;
+        assert_eq!(
+            resp_sat_shred.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "Shred operation with saturated semaphore must return 429 Too Many Requests"
+        );
+
+        drop(permit1);
+        drop(permit2);
+
+        // Probe 10: Status CSRF synchronization
+        let req_stat_unauth = Request::builder()
+            .uri("/api/v1/status")
+            .header(header::HOST, "127.0.0.1:9191")
+            .body(Body::empty())?;
+        let resp_stat_unauth = app.clone().oneshot(req_stat_unauth).await?;
+        assert_eq!(resp_stat_unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let req_stat_auth = Request::builder()
+            .uri("/api/v1/status")
+            .header(header::HOST, "127.0.0.1:9191")
+            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+            .body(Body::empty())?;
+        let resp_stat_auth = app.clone().oneshot(req_stat_auth).await?;
+        assert_eq!(resp_stat_auth.status(), StatusCode::OK);
+        let stat_bytes = axum::body::to_bytes(resp_stat_auth.into_body(), 1024 * 1024).await?;
+        let stat_val: serde_json::Value = serde_json::from_slice(&stat_bytes)?;
+        assert_eq!(stat_val["csrf_token"], csrf_token);
+
+        // Probe 11: DOM Secret Eradication in index.html
+        let req_idx = Request::builder()
+            .uri("/")
+            .header(header::HOST, "127.0.0.1:9191")
+            .body(Body::empty())?;
+        let resp_idx = app.clone().oneshot(req_idx).await?;
+        assert_eq!(resp_idx.status(), StatusCode::OK);
+        let idx_bytes = axum::body::to_bytes(resp_idx.into_body(), 1024 * 1024).await?;
+        let idx_str = String::from_utf8_lossy(&idx_bytes);
+        assert!(!idx_str.contains("sentinel-bearer-token"));
+        assert!(!idx_str.contains(&session_id));
+        assert!(!idx_str.contains(&bootstrap_token));
+        assert!(!idx_str.contains(&csrf_token));
+        assert!(!idx_str.contains("style="));
+        assert!(!idx_str.contains("fonts.googleapis.com"));
+
+        let _ = fs::remove_dir_all(&staging_root);
+        Ok(())
     }
 }
