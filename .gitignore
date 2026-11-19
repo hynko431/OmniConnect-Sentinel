@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+/sentinel-ui/target/
 **/*.rs.bk
 *.pdb
 .sentinel_vault/

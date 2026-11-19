@@ -124,15 +124,23 @@ enum Commands {
         #[arg(short = 'i', long, default_value_t = 1000)]
         interval_ms: u64,
     },
-    /// Launch the interactive Web & Desktop Dashboard GUI over 127.0.0.1 with bearer auth
+    /// Launch the interactive Web & Native Rune Desktop Dashboard over 127.0.0.1 with session auth
     Ui {
-        /// Port to serve the dashboard on (binds strictly to 127.0.0.1)
+        /// Port to serve the dashboard API on (binds strictly to 127.0.0.1)
         #[arg(short, long, default_value_t = 8088)]
         port: u16,
 
         /// Serve watermarked demo fixture data for sales demos (Master Plan v2 §4.3)
         #[arg(long, default_value_t = false)]
         demo: bool,
+
+        /// Launch the native GPU-rendered Rune Framework desktop UI (`sentinel-ui`) instead of opening a browser
+        #[arg(long, default_value_t = false)]
+        native: bool,
+
+        /// Start the localhost API server without auto-launching a browser or native window
+        #[arg(long, default_value_t = false)]
+        no_browser: bool,
     },
     /// Manage Microsoft Intune OMA-URI deployment profiles
     Intune {
@@ -732,9 +740,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await;
         }
-        Commands::Ui { port, demo } => {
-            // Serve the dashboard over localhost (127.0.0.1:{port}) with bearer token & live /api/v1/status (`BUG-CLI-02` #2)
-            serve_dashboard_ui(port, demo).await?;
+        Commands::Ui {
+            port,
+            demo,
+            native,
+            no_browser,
+        } => {
+            // Serve the dashboard over localhost (127.0.0.1:{port}) with session auth & live /api/v1/status (`BUG-CLI-02` #2)
+            serve_dashboard_ui(port, demo, native, no_browser).await?;
         }
         Commands::Intune { export } => {
             let shared_ledger = get_or_init_global_shared_ledger(None);
@@ -2395,7 +2408,71 @@ fn resolve_restricted_runtime_dir(subpath: &str, fallback_cwd: &str) -> PathBuf 
     std::env::temp_dir().join(fallback_cwd)
 }
 
-async fn serve_dashboard_ui(port: u16, demo_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn resolve_dashboard_dir() -> PathBuf {
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("dashboard");
+        if candidate.join("index.html").is_file() {
+            return candidate;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().skip(1).take(4) {
+            let candidate = ancestor.join("dashboard");
+            if candidate.join("index.html").is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("dashboard")
+}
+
+fn resolve_native_rune_ui_binary() -> Option<PathBuf> {
+    let bin_name = if cfg!(windows) {
+        "sentinel-ui.exe"
+    } else {
+        "sentinel-ui"
+    };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join(bin_name);
+            if sibling.is_file() {
+                return Some(sibling);
+            }
+        }
+        for ancestor in exe.ancestors().skip(1).take(4) {
+            roots.push(ancestor.to_path_buf());
+        }
+    }
+    for root in roots {
+        for rel in [
+            PathBuf::from("sentinel-ui")
+                .join("target")
+                .join("release")
+                .join(bin_name),
+            PathBuf::from("sentinel-ui")
+                .join("target")
+                .join("debug")
+                .join(bin_name),
+        ] {
+            let candidate = root.join(rel);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+async fn serve_dashboard_ui(
+    port: u16,
+    demo_mode: bool,
+    native_rune: bool,
+    no_browser: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = SocketAddr::from(([127, 0, 0, 1], port));
     let std_listener = std::net::TcpListener::bind(bind_addr)?;
     std_listener.set_nonblocking(true)?;
@@ -2424,35 +2501,65 @@ async fn serve_dashboard_ui(port: u16, demo_mode: bool) -> Result<(), Box<dyn st
     }
 
     info!("===========================================================");
-    info!("   OmniConnect Sentinel - Localhost Web GUI Dashboard      ");
+    info!("   OmniConnect Sentinel - Localhost Defense Station Server ");
     info!("===========================================================");
     println!("\n🖥️ [SENTINEL DASHBOARD SERVER ACTIVE (AXUM)]");
     println!("   Bound Address:  http://127.0.0.1:{actual_port}/");
+    println!("   Bootstrap Code: {bootstrap_token}");
     println!("   One-Time URL:   {launch_url}");
     println!(
         "   Auth Model:     Single-Use Bootstrap (#bootstrap=...) -> HttpOnly Cookie + CSRF Header"
     );
     println!("   Staging Root:   {}", ui_staging_root.display());
 
-    #[cfg(target_os = "windows")]
-    {
-        // Launch default browser via rundll32 FileProtocolHandler without invoking cmd.exe (`BUG-CLI-02`, `Row 179`)
-        let _ = std::process::Command::new("rundll32.exe")
-            .args(["url.dll,FileProtocolHandler", &launch_url])
-            .spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(&launch_url).spawn();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(&launch_url)
-            .spawn();
+    if native_rune {
+        if let Some(rune_bin) = resolve_native_rune_ui_binary() {
+            println!(
+                "   UI Surface:     Native RUNE Framework GPU App ({})",
+                rune_bin.display()
+            );
+            let mut cmd = std::process::Command::new(&rune_bin);
+            cmd.args([
+                "--port",
+                &actual_port.to_string(),
+                "--bootstrap",
+                &bootstrap_token,
+            ]);
+            if demo_mode {
+                cmd.arg("--demo");
+            }
+            if let Err(err) = cmd.spawn() {
+                tracing::warn!(
+                    "Failed spawning native Rune UI ({}): {err}",
+                    rune_bin.display()
+                );
+            }
+        } else {
+            println!("   UI Surface:     Native RUNE binary not built yet.");
+            println!("   Build Hint:     cargo build --manifest-path sentinel-ui/Cargo.toml");
+            println!("   Fallback URL:   {launch_url}");
+        }
+    } else if !no_browser {
+        #[cfg(target_os = "windows")]
+        {
+            // Launch default browser via rundll32 FileProtocolHandler without invoking cmd.exe (`BUG-CLI-02`, `Row 179`)
+            let _ = std::process::Command::new("rundll32.exe")
+                .args(["url.dll,FileProtocolHandler", &launch_url])
+                .spawn();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&launch_url).spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("xdg-open")
+                .arg(&launch_url)
+                .spawn();
+        }
     }
 
-    let dashboard_dir = std::env::current_dir()?.join("dashboard");
+    let dashboard_dir = resolve_dashboard_dir();
     let state = Arc::new(DashboardAppState::new(
         actual_port,
         demo_mode,

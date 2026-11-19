@@ -6,6 +6,9 @@ members = [
     "crates/sentinel-core",
     "crates/sentinel-cli",
 ]
+exclude = [
+    "sentinel-ui",
+]
 resolver = "2"
 
 [workspace.package]

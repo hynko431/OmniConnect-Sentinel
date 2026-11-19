@@ -243,9 +243,9 @@
     if (kpiThreats) kpiThreats.textContent = '0';
     if (kpiThreatDelta) kpiThreatDelta.textContent = 'Agent Unreachable';
     if (valDeviceName) valDeviceName.textContent = 'DISCONNECTED — NO LIVE DATA';
-    if (valVoltage) valVoltage.textContent = '0.00 V';
-    if (valCurrent) valCurrent.textContent = '0.00 A';
-    if (valPower) valPower.textContent = '0.00 W';
+    if (valVoltage) valVoltage.textContent = 'Offline';
+    if (valCurrent) valCurrent.textContent = 'Offline';
+    if (valPower) valPower.textContent = 'No HW Sensor';
 
     renderCdrStreamItems(cdrStreamBox, [
       {
@@ -303,25 +303,25 @@
         : '⚠ AutoMount Enabled';
     }
 
-    // Connected USB volumes from backend DriveWatcher
+    // Connected USB volumes from backend DriveWatcher (honest bus telemetry — zero fabricated electrical sensors)
     const volumes = (data && Array.isArray(data.connected_volumes)) ? data.connected_volumes : [];
     if (volumes.length > 0) {
       const firstVol = volumes[0];
       if (valDeviceName) {
         valDeviceName.textContent = `${firstVol.volume_name || 'USB Volume'} (${firstVol.mount_point || 'Offline GUID'})`;
       }
-      if (valVoltage) valVoltage.textContent = '5.00 V';
-      if (valCurrent) valCurrent.textContent = safeChargingToggle && safeChargingToggle.checked ? '0.50 A' : '0.90 A';
-      if (valPower) valPower.textContent = safeChargingToggle && safeChargingToggle.checked ? '2.50 W' : '4.50 W';
+      if (valVoltage) valVoltage.textContent = 'BusTypeUsb (0x07)';
+      if (valCurrent) valCurrent.textContent = safeChargingToggle && safeChargingToggle.checked ? 'HELD OFFLINE' : 'RING 3 CDR';
+      if (valPower) valPower.textContent = 'No HW Sensor';
     } else {
       if (valDeviceName) {
         valDeviceName.textContent = isDemo
           ? 'DEMO FIXTURE VOLUME (WATERMARKED)'
           : '0 Removable Volumes Mounted (Fail-Closed)';
       }
-      if (valVoltage) valVoltage.textContent = '0.00 V';
-      if (valCurrent) valCurrent.textContent = '0.00 A';
-      if (valPower) valPower.textContent = '0.00 W';
+      if (valVoltage) valVoltage.textContent = 'No USB Storage';
+      if (valCurrent) valCurrent.textContent = 'Idle';
+      if (valPower) valPower.textContent = 'No HW Sensor';
     }
 
     if (data && data.last_shred_receipt) {
@@ -454,12 +454,12 @@
   function updateSafeChargingState(isDecoupled) {
     if (!kpiPinStatusText || !kpiPinSubtext || !safeChargeBadge) return;
     if (isDecoupled) {
-      kpiPinStatusText.textContent = 'DECOUPLED';
+      kpiPinStatusText.textContent = 'HELD OFFLINE';
       kpiPinStatusText.className = 'kpi-value kpi-value-pin kpi-pin-decoupled';
-      kpiPinSubtext.textContent = 'Safe Charge: Active (No Data)';
+      kpiPinSubtext.textContent = 'I1 Pre-Mount Hold Preview';
       kpiPinSubtext.className = 'kpi-delta safe';
 
-      safeChargeBadge.textContent = 'ACTIVE: DATA ISOLATED';
+      safeChargeBadge.textContent = 'PREVIEW: DATA PATH HELD OFFLINE';
       safeChargeBadge.className = 'kpi-delta safe';
 
       if (switchArmMinus) {
@@ -477,12 +477,12 @@
       if (lineDataMinusRight) lineDataMinusRight.setAttribute('stroke', '#cbd5e1');
       if (lineDataPlusRight) lineDataPlusRight.setAttribute('stroke', '#cbd5e1');
     } else {
-      kpiPinStatusText.textContent = 'COUPLED';
+      kpiPinStatusText.textContent = 'RING 3 CDR';
       kpiPinStatusText.className = 'kpi-value kpi-value-pin kpi-pin-coupled';
-      kpiPinSubtext.textContent = 'UMDF Ring 3 Filter Active';
+      kpiPinSubtext.textContent = 'ShadowCache + ProjFS/FUSE';
       kpiPinSubtext.className = 'kpi-delta info';
 
-      safeChargeBadge.textContent = 'OFF: DATA LINES ACTIVE';
+      safeChargeBadge.textContent = 'PREVIEW: RING 3 CDR PIPELINE ACTIVE';
       safeChargeBadge.className = 'kpi-delta info';
 
       if (switchArmMinus) {
@@ -518,7 +518,7 @@
       const cell = document.createElement('div');
       cell.className = 'sector-cell';
       cell.id = `sector-${i}`;
-      cell.setAttribute('title', `LBA Sector ${i * 4096} - Ready`);
+      cell.setAttribute('title', `Logical Block ${i + 1} / 64 — Ready`);
       sectorGrid64.appendChild(cell);
     }
   }
@@ -740,12 +740,22 @@
       if (kioskStep3) kioskStep3.classList.remove('active');
 
       const report = await executeLiveBackendScan();
+      const kioskStep3Body = document.getElementById('kioskStep3Body');
       if (kioskStep2) kioskStep2.classList.remove('active');
-      if (report && report.complete) {
+      const threatCount = report && Array.isArray(report.threats) ? report.threats.length : 0;
+      if (report && report.complete === true && threatCount === 0) {
         if (kioskStep3) kioskStep3.classList.add('active');
+        if (kioskStep3Body) {
+          kioskStep3Body.textContent = `Scan verified clean (${report.files_scanned || 0} staged files inspected, 0 threats). Run sentinel kiosk CLI for signed transfer receipts.`;
+        }
         if (btnKioskEject) btnKioskEject.disabled = false;
       } else {
         if (kioskStep1) kioskStep1.classList.add('active');
+        if (kioskStep3Body) {
+          kioskStep3Body.textContent = threatCount > 0
+            ? `BLOCKED FAIL-CLOSED: ${threatCount} threat(s) detected — transfer halted.`
+            : 'BLOCKED FAIL-CLOSED: Scan incomplete or agent unreachable — media remains held offline.';
+        }
       }
       btnKioskSimulate.disabled = false;
     });
