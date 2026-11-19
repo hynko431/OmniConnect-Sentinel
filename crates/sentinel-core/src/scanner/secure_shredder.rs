@@ -11,10 +11,21 @@ use sentinel_sys::{
     ensure_not_symlink_or_reparse_point, flush_hardware_buffers, is_reparse_point_or_symlink,
     issue_file_level_trim, normalize_file_attributes, open_no_buffering_write_through,
     open_write_through, query_media_type, query_sector_alignment, query_sector_alignment_for_path,
-    to_verbatim_path, AlignedSectorBuffer,
+    to_verbatim_path, AlignedSectorBuffer, MediaType,
 };
 
 use crate::enterprise::ledger::{AuditLedger, AuditSubsystem, SharedAuditLedger};
+
+/// NIST SP 800-88 Rev. 2 sanitization outcome classification (`Sub-Phase 2.2`, `CSE-14`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Nist80088Rev2Category {
+    /// Logical overwrite + TRIM (`NIST SP 800-88 Rev. 2` Clear; never claims physical flash Purge on wear-leveled media).
+    #[default]
+    Clear,
+    /// Cryptographic Erase (`NIST SP 800-88 Rev. 2` Purge), reserved strictly for artifacts encrypted from inception
+    /// under a strong CSPRNG DEK (`ShadowCache` / `.quar`) whose DEK has been cryptographically destroyed.
+    CryptographicErasePurge,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShredMethod {
@@ -27,6 +38,37 @@ impl ShredMethod {
 
     pub const fn default_clear() -> Self {
         Self::ClearMultiPass { passes: 3 }
+    }
+}
+
+fn default_nist_standard_rev2() -> String {
+    "NIST SP 800-88 Rev. 2".to_string()
+}
+
+/// Computes the authoritative `NIST SP 800-88 Rev. 2` sanitization classification and human-auditable
+/// media-honesty label (`Sub-Phase 2.2`, `CSE-14`).
+pub fn classify_nist_sp800_88_rev2(
+    method: ShredMethod,
+    media: MediaType,
+) -> (Nist80088Rev2Category, bool, String) {
+    match method {
+        ShredMethod::ClearMultiPass { .. } => match media {
+            MediaType::UsbFlash | MediaType::SsdOrFlash => (
+                Nist80088Rev2Category::Clear,
+                false,
+                "NIST SP 800-88 Rev. 2 — Clear (NIST 800-88 Clear (logical) Overwrite + TRIM; Flash Wear-Leveling Caveat: Purge is not guaranteed on flash/SSD wear-leveling media without hardware Secure Erase or inception-encrypted DEK Cryptographic Erase)".to_string(),
+            ),
+            MediaType::Hdd | MediaType::UnknownOrVirtual => (
+                Nist80088Rev2Category::Clear,
+                false,
+                "NIST SP 800-88 Rev. 2 — Clear (NIST 800-88 Clear (logical) Multi-Pass Overwrite + Flush — Note: NIST 800-88 Purge is not guaranteed on flash/SSD wear-leveling media without hardware Secure Erase or crypto-erase)".to_string(),
+            ),
+        },
+        ShredMethod::CryptoErase => (
+            Nist80088Rev2Category::CryptographicErasePurge,
+            true,
+            "NIST SP 800-88 Rev. 2 — Cryptographic Erase (Purge) (Inception-Encrypted Payload DEK Destroyed + Ciphertext Overwritten)".to_string(),
+        ),
     }
 }
 
@@ -44,17 +86,31 @@ pub struct ShredReceipt {
     pub rename_cycles_completed: u8,
     pub media_type: String,
     pub sanitization_level: String,
+    #[serde(default = "default_nist_standard_rev2")]
+    pub nist_standard: String,
+    #[serde(default)]
+    pub rev2_category: Nist80088Rev2Category,
+    #[serde(default)]
+    pub inception_encrypted_dek_destroyed: bool,
     pub verification_passed: bool,
     pub verify_read_ok: bool,
 }
 
-/// Cryptographic & Multi-Pass File Sanitizer (`BUG-CORE-06`, Phase 1.2)
+/// Cryptographic & Multi-Pass File Sanitizer (`BUG-CORE-06`, `Sub-Phase 2.2`, `CSE-14`)
 ///
-/// Implements NIST SP 800-88 Rev. 1 Clear (logical multi-pass overwrite with
+/// Implements **NIST SP 800-88 Rev. 2** `Clear` (logical multi-pass overwrite with
 /// sector-aligned `FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`,
-/// `FSCTL_FILE_LEVEL_TRIM`, and `FlushFileBuffers`) and Cryptographic Erase,
-/// with verbatim `\\?\` path support for reserved DOS device names (`CON.txt`,
-/// `NUL.doc`, etc.) and strict refusal to follow symlinks or NTFS reparse points.
+/// `FSCTL_FILE_LEVEL_TRIM`, and `FlushFileBuffers`) and `Cryptographic Erase (Purge)`
+/// (reserved strictly for destroying DEKs of inception-encrypted payloads such as
+/// `ShadowCache` and `.quar`), with verbatim `\\?\` path support for reserved DOS device
+/// names (`CON.txt`, `NUL.doc`, etc.) and strict refusal to follow symlinks or NTFS reparse points.
+/// Destination ledger sink for `SecureShredder` sanitization receipts (`Sub-Phase 2.2`).
+pub enum ShredLedgerSink<'a> {
+    Shared(&'a SharedAuditLedger),
+    Path(&'a Path),
+    DefaultUnified,
+}
+
 pub struct SecureShredder;
 
 impl SecureShredder {
@@ -62,6 +118,28 @@ impl SecureShredder {
         path: &Path,
         method: ShredMethod,
         shared_ledger: Option<&SharedAuditLedger>,
+    ) -> Result<ShredReceipt, String> {
+        Self::shred_file_with_media_hint(path, method, None, shared_ledger)
+    }
+
+    pub fn shred_file_with_media_hint(
+        path: &Path,
+        method: ShredMethod,
+        media_override: Option<MediaType>,
+        shared_ledger: Option<&SharedAuditLedger>,
+    ) -> Result<ShredReceipt, String> {
+        let sink = match shared_ledger {
+            Some(sl) => ShredLedgerSink::Shared(sl),
+            None => ShredLedgerSink::DefaultUnified,
+        };
+        Self::shred_file_to_sink(path, method, media_override, sink)
+    }
+
+    pub fn shred_file_to_sink(
+        path: &Path,
+        method: ShredMethod,
+        media_override: Option<MediaType>,
+        sink: ShredLedgerSink<'_>,
     ) -> Result<ShredReceipt, String> {
         // Refuse symlinks and NTFS reparse points before touching attributes or opening handles (`Critical #1`, Row 67)
         ensure_not_symlink_or_reparse_point(path).map_err(|e| {
@@ -103,7 +181,7 @@ impl SecureShredder {
         let metadata = fs::symlink_metadata(&target_path)
             .map_err(|e| format!("Failed reading file metadata: {e}"))?;
         let file_size = metadata.len();
-        let detected_media = query_media_type(&target_path);
+        let detected_media = media_override.unwrap_or_else(|| query_media_type(&target_path));
         let sector_alignment = query_sector_alignment_for_path(&target_path, None).max(512);
 
         let effective_passes = match method {
@@ -326,14 +404,8 @@ impl SecureShredder {
             )
         })?;
 
-        let sanitization_level = match method {
-            ShredMethod::ClearMultiPass { .. } => {
-                "NIST 800-88 Clear (logical) — Note: NIST 800-88 Purge is not guaranteed on flash/SSD wear-leveling media without hardware Secure Erase or crypto-erase".to_string()
-            }
-            ShredMethod::CryptoErase => {
-                "NIST 800-88 Cryptographic Erase (NIST 800-88 Clear (logical) + Key Destruction — Note: physical flash Purge depends on controller wear-leveling)".to_string()
-            }
-        };
+        let (rev2_category, inception_encrypted_dek_destroyed, sanitization_level) =
+            classify_nist_sp800_88_rev2(method, detected_media);
 
         let media_type_label = format!("{:?} — {}", detected_media, detected_media.label());
 
@@ -360,24 +432,33 @@ impl SecureShredder {
             rename_cycles_completed: actual_scramble_cycles,
             media_type: media_type_label,
             sanitization_level,
+            nist_standard: default_nist_standard_rev2(),
+            rev2_category,
+            inception_encrypted_dek_destroyed,
             verification_passed,
             verify_read_ok: verification_passed,
         };
 
-        if let Some(sl) = shared_ledger {
-            Self::record_shred_receipt_to_shared_ledger(sl, "SHRED_RECEIPT", &receipt)?;
-        } else {
-            Self::record_shred_receipt_to_ledger(
-                &default_shred_ledger_path(),
-                "SHRED_RECEIPT",
-                &receipt,
-            )?;
+        match sink {
+            ShredLedgerSink::Shared(sl) => {
+                Self::record_shred_receipt_to_shared_ledger(sl, "SHRED_RECEIPT", &receipt)?;
+            }
+            ShredLedgerSink::Path(lp) => {
+                Self::record_shred_receipt_to_ledger(lp, "SHRED_RECEIPT", &receipt)?;
+            }
+            ShredLedgerSink::DefaultUnified => {
+                Self::record_shred_receipt_to_ledger(
+                    &default_shred_ledger_path(),
+                    "SHRED_RECEIPT",
+                    &receipt,
+                )?;
+            }
         }
         Ok(receipt)
     }
 
     pub fn shred_file(path: &Path, method: ShredMethod) -> Result<ShredReceipt, String> {
-        Self::shred_file_with_shared_ledger(path, method, None)
+        Self::shred_file_to_sink(path, method, None, ShredLedgerSink::DefaultUnified)
     }
 
     pub fn shred_file_with_ledger(
@@ -385,9 +466,27 @@ impl SecureShredder {
         method: ShredMethod,
         ledger_path: &Path,
     ) -> Result<ShredReceipt, String> {
-        let receipt = Self::shred_file(path, method)?;
-        Self::record_shred_receipt_to_ledger(ledger_path, "SHRED_RECEIPT", &receipt)?;
-        Ok(receipt)
+        Self::shred_file_to_sink(path, method, None, ShredLedgerSink::Path(ledger_path))
+    }
+
+    /// Produces a privacy-redacted JSON payload for `AuditLedger` where raw user/device
+    /// `original_path` PII is replaced by an HMAC-SHA256 `path_token` keyed by the ledger's
+    /// OS-sealed privacy key (`CEA-DEFECT-06`, GDPR/DPDP compliance).
+    pub fn redacted_receipt_json(
+        ledger: &AuditLedger,
+        receipt: &ShredReceipt,
+    ) -> Result<serde_json::Value, String> {
+        let path_token = ledger.tokenize_path(Path::new(&receipt.original_path))?;
+        let mut payload = serde_json::to_value(receipt)
+            .map_err(|e| format!("Failed serializing ShredReceipt for AuditLedger: {e}"))?;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("original_path");
+            obj.insert(
+                "path_token".to_string(),
+                serde_json::Value::String(path_token),
+            );
+        }
+        Ok(payload)
     }
 
     pub fn record_shred_receipt_to_shared_ledger(
@@ -398,8 +497,7 @@ impl SecureShredder {
         let mut guard = shared_ledger
             .lock()
             .map_err(|e| format!("SharedAuditLedger lock poisoned: {e}"))?;
-        let payload = serde_json::to_value(receipt)
-            .map_err(|e| format!("Failed serializing ShredReceipt for AuditLedger: {e}"))?;
+        let payload = Self::redacted_receipt_json(&guard, receipt)?;
         guard.append_subsystem_event(AuditSubsystem::SecureShredder, event_type, payload)?;
         Ok(())
     }
@@ -411,9 +509,8 @@ impl SecureShredder {
     ) -> Result<(), String> {
         static SHRED_LEDGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = SHRED_LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut ledger = AuditLedger::open(ledger_path);
-        let payload = serde_json::to_value(receipt)
-            .map_err(|e| format!("Failed serializing ShredReceipt for AuditLedger: {e}"))?;
+        let mut ledger = AuditLedger::open_result(ledger_path)?;
+        let payload = Self::redacted_receipt_json(&ledger, receipt)?;
         ledger.append_subsystem_event(AuditSubsystem::SecureShredder, event_type, payload)?;
         Ok(())
     }
@@ -435,6 +532,26 @@ impl SecureShredder {
         host_path: &Path,
         stream_name: &str,
         shared_ledger: Option<&SharedAuditLedger>,
+    ) -> Result<ShredReceipt, String> {
+        let sink = match shared_ledger {
+            Some(sl) => ShredLedgerSink::Shared(sl),
+            None => ShredLedgerSink::DefaultUnified,
+        };
+        Self::shred_ntfs_stream_to_sink(host_path, stream_name, sink)
+    }
+
+    pub fn shred_ntfs_stream_with_ledger(
+        host_path: &Path,
+        stream_name: &str,
+        ledger_path: &Path,
+    ) -> Result<ShredReceipt, String> {
+        Self::shred_ntfs_stream_to_sink(host_path, stream_name, ShredLedgerSink::Path(ledger_path))
+    }
+
+    pub fn shred_ntfs_stream_to_sink(
+        host_path: &Path,
+        stream_name: &str,
+        sink: ShredLedgerSink<'_>,
     ) -> Result<ShredReceipt, String> {
         ensure_not_symlink_or_reparse_point(host_path).map_err(|e| {
             format!(
@@ -569,19 +686,28 @@ impl SecureShredder {
             actual_scramble_cycles: 0,
             rename_cycles_completed: 0,
             media_type: media_type_label,
-            sanitization_level: "NIST 800-88 Clear (logical ADS) — Note: Purge is not guaranteed on flash/SSD wear-leveling media".to_string(),
+            sanitization_level: "NIST SP 800-88 Rev. 2 — Clear (NIST 800-88 Clear (logical ADS)) — Note: Purge is not guaranteed on flash/SSD wear-leveling media".to_string(),
+            nist_standard: default_nist_standard_rev2(),
+            rev2_category: Nist80088Rev2Category::Clear,
+            inception_encrypted_dek_destroyed: false,
             verification_passed,
             verify_read_ok: verification_passed,
         };
 
-        if let Some(sl) = shared_ledger {
-            Self::record_shred_receipt_to_shared_ledger(sl, "SHRED_ADS_RECEIPT", &receipt)?;
-        } else {
-            Self::record_shred_receipt_to_ledger(
-                &default_shred_ledger_path(),
-                "SHRED_ADS_RECEIPT",
-                &receipt,
-            )?;
+        match sink {
+            ShredLedgerSink::Shared(sl) => {
+                Self::record_shred_receipt_to_shared_ledger(sl, "SHRED_ADS_RECEIPT", &receipt)?;
+            }
+            ShredLedgerSink::Path(lp) => {
+                Self::record_shred_receipt_to_ledger(lp, "SHRED_ADS_RECEIPT", &receipt)?;
+            }
+            ShredLedgerSink::DefaultUnified => {
+                Self::record_shred_receipt_to_ledger(
+                    &default_shred_ledger_path(),
+                    "SHRED_ADS_RECEIPT",
+                    &receipt,
+                )?;
+            }
         }
         Ok(receipt)
     }

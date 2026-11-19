@@ -2,9 +2,9 @@
 #![allow(unused_imports)]
 
 use sentinel_core::enterprise::intune::{
-    backup_enterprise_root_keypair, default_enterprise_root_public_keys,
-    primary_enterprise_root_keypair, IntuneMdmPolicy, IntunePolicyManager, SignedPolicyBundle,
+    default_enterprise_root_public_keys, IntuneMdmPolicy, IntunePolicyManager, SignedPolicyBundle,
 };
+use sentinel_sys::generate_raw_ecdsa_p256_keypair;
 use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
@@ -14,8 +14,10 @@ fn probe_cli_policy_verify_genuine_and_adversarial_tamper() {
     let dir = tempdir().expect("tempdir");
     let vault_dir = dir.path().join(".sentinel_vault");
     let bundle_path = dir.path().join("policy_bundle.json");
+    let root_key_path = dir.path().join("test_enterprise_root.pub");
 
-    let (pub1, priv1) = primary_enterprise_root_keypair();
+    let (pub1, priv1) = generate_raw_ecdsa_p256_keypair().expect("test root keygen");
+    fs::write(&root_key_path, &pub1).expect("write test root pubkey");
 
     // 1. Generate valid enterprise signed bundle
     let pol = IntuneMdmPolicy {
@@ -42,12 +44,14 @@ fn probe_cli_policy_verify_genuine_and_adversarial_tamper() {
         return;
     }
 
-    // Run CLI on genuine bundle
+    // Run CLI on genuine bundle with injected test root key
     let output = Command::new(&exe_path)
         .args([
             "policy-verify",
             "--bundle",
             bundle_path.to_str().unwrap(),
+            "--root-key",
+            root_key_path.to_str().unwrap(),
             "--vault-dir",
             vault_dir.to_str().unwrap(),
         ])
@@ -58,6 +62,39 @@ fn probe_cli_policy_verify_genuine_and_adversarial_tamper() {
         output.status.success(),
         "CLI policy-verify must succeed on legitimate bundle! stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    // 1b. Legacy hardcoded seed derivation bundle MUST FAIL default CLI policy-verify (without --root-key)
+    use sha2::{Digest, Sha256};
+    let legacy_seed: [u8; 32] =
+        Sha256::digest(b"OMNICONNECT-ENTERPRISE-ROOT-POLICY-CA-PRIMARY-V2").into();
+    let (legacy_pub, legacy_priv) =
+        sentinel_sys::generate_ecdsa_p256_keypair_from_seed(&legacy_seed).unwrap();
+    let legacy_pol = IntuneMdmPolicy {
+        version: 99,
+        enforce_usb_zero_trust: false,
+        ..Default::default()
+    };
+    let legacy_bundle = SignedPolicyBundle::sign(legacy_pol, &legacy_priv, &legacy_pub).unwrap();
+    let legacy_bundle_path = dir.path().join("legacy_seed_bundle.json");
+    fs::write(
+        &legacy_bundle_path,
+        serde_json::to_string_pretty(&legacy_bundle).unwrap(),
+    )
+    .unwrap();
+    let output_legacy = Command::new(&exe_path)
+        .args([
+            "policy-verify",
+            "--bundle",
+            legacy_bundle_path.to_str().unwrap(),
+            "--vault-dir",
+            dir.path().join(".legacy_vault").to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed executing sentinel.exe for legacy seed check");
+    assert!(
+        !output_legacy.status.success(),
+        "CLI policy-verify MUST REJECT bundle signed by removed legacy hardcoded seed"
     );
 
     // 2. Tamper signature in file
@@ -76,6 +113,8 @@ fn probe_cli_policy_verify_genuine_and_adversarial_tamper() {
             "policy-verify",
             "--bundle",
             bundle_path.to_str().unwrap(),
+            "--root-key",
+            root_key_path.to_str().unwrap(),
             "--vault-dir",
             vault_dir.to_str().unwrap(),
         ])
@@ -106,6 +145,8 @@ fn probe_cli_policy_verify_genuine_and_adversarial_tamper() {
             "policy-verify",
             "--bundle",
             bundle_path.to_str().unwrap(),
+            "--root-key",
+            root_key_path.to_str().unwrap(),
             "--vault-dir",
             vault_dir.to_str().unwrap(),
         ])
@@ -144,12 +185,13 @@ fn probe_both_primary_and_backup_dr_roots_accepted() {
     let vault_dir = dir.path().join(".sentinel_vault");
     let ledger_path = vault_dir.join("audit.jsonl");
 
-    let (pub1, priv1) = primary_enterprise_root_keypair();
-    let (pub2, priv2) = backup_enterprise_root_keypair();
+    let (pub1, priv1) = generate_raw_ecdsa_p256_keypair().expect("primary test root");
+    let (pub2, priv2) = generate_raw_ecdsa_p256_keypair().expect("backup test root");
 
     let mut mgr = IntunePolicyManager::new()
         .with_vault_dir(vault_dir)
-        .with_ledger_path(ledger_path);
+        .with_ledger_path(ledger_path)
+        .with_pinned_root_public_keys(vec![pub1.clone(), pub2.clone()]);
 
     // Apply via Primary
     let mut pol1 = mgr.policy().clone();
@@ -201,13 +243,14 @@ fn probe_defect_sealed_floor_corruption_fails_closed_and_blocks_rollback() {
     let vault_dir = dir.path().join(".sentinel_vault");
     let ledger_path = vault_dir.join("audit.jsonl");
 
-    let (pub1, priv1) = primary_enterprise_root_keypair();
+    let (pub1, priv1) = generate_raw_ecdsa_p256_keypair().expect("primary test root");
 
     // 1. Setup policy at version 10
     {
         let mut mgr = IntunePolicyManager::new()
             .with_vault_dir(vault_dir.clone())
-            .with_ledger_path(ledger_path.clone());
+            .with_ledger_path(ledger_path.clone())
+            .with_pinned_root_public_keys(vec![pub1.clone()]);
 
         let mut v10 = mgr.policy().clone();
         v10.version = 10;
@@ -225,7 +268,8 @@ fn probe_defect_sealed_floor_corruption_fails_closed_and_blocks_rollback() {
     // 3. Sentinel restarts and attacker tries to replay v5
     let mut mgr2 = IntunePolicyManager::new()
         .with_vault_dir(vault_dir.clone())
-        .with_ledger_path(ledger_path.clone());
+        .with_ledger_path(ledger_path.clone())
+        .with_pinned_root_public_keys(vec![pub1.clone()]);
 
     let mut v5 = mgr2.policy().clone();
     v5.version = 5;
@@ -273,11 +317,12 @@ fn probe_adversarial_replay_same_version_blocked() {
     let vault_dir = dir.path().join(".sentinel_vault");
     let ledger_path = vault_dir.join("audit.jsonl");
 
-    let (pub1, priv1) = primary_enterprise_root_keypair();
+    let (pub1, priv1) = generate_raw_ecdsa_p256_keypair().expect("primary test root");
 
     let mut mgr = IntunePolicyManager::new()
         .with_vault_dir(vault_dir)
-        .with_ledger_path(ledger_path);
+        .with_ledger_path(ledger_path)
+        .with_pinned_root_public_keys(vec![pub1.clone()]);
 
     let mut v5 = mgr.policy().clone();
     v5.version = 5;
@@ -298,12 +343,13 @@ fn probe_adversarial_envelope_key_substitution_cross_root_rejected() {
     let vault_dir = dir.path().join(".sentinel_vault");
     let ledger_path = vault_dir.join("audit.jsonl");
 
-    let (pub1, priv1) = primary_enterprise_root_keypair();
-    let (pub2, _priv2) = backup_enterprise_root_keypair();
+    let (pub1, priv1) = generate_raw_ecdsa_p256_keypair().expect("primary test root");
+    let (pub2, _priv2) = generate_raw_ecdsa_p256_keypair().expect("backup test root");
 
     let mut mgr = IntunePolicyManager::new()
         .with_vault_dir(vault_dir)
-        .with_ledger_path(ledger_path);
+        .with_ledger_path(ledger_path)
+        .with_pinned_root_public_keys(vec![pub1.clone(), pub2.clone()]);
 
     let initial_version = mgr.policy().version;
     let mut pol = mgr.policy().clone();
@@ -331,8 +377,10 @@ fn probe_adversarial_cli_vault_dir_strict_isolation() {
     let dir = tempdir().expect("tempdir");
     let custom_vault_dir = dir.path().join("isolated_audit_vault");
     let bundle_path = dir.path().join("policy_bundle.json");
+    let root_key_path = dir.path().join("test_root.pub");
 
-    let (pub1, priv1) = primary_enterprise_root_keypair();
+    let (pub1, priv1) = generate_raw_ecdsa_p256_keypair().expect("primary test root");
+    fs::write(&root_key_path, &pub1).expect("write test root key");
 
     let pol = IntuneMdmPolicy {
         version: 8,
@@ -351,7 +399,9 @@ fn probe_adversarial_cli_vault_dir_strict_isolation() {
 
     if !exe_path.exists() {
         // Run verification via IntunePolicyManager directly with custom vault_dir
-        let mut mgr = IntunePolicyManager::new().with_vault_dir(custom_vault_dir.clone());
+        let mut mgr = IntunePolicyManager::new()
+            .with_vault_dir(custom_vault_dir.clone())
+            .with_pinned_root_public_keys(vec![pub1]);
         let res = mgr.apply_signed_bundle(&bundle);
         assert!(res.is_ok());
 
@@ -373,6 +423,8 @@ fn probe_adversarial_cli_vault_dir_strict_isolation() {
             "policy-verify",
             "--bundle",
             bundle_path.to_str().unwrap(),
+            "--root-key",
+            root_key_path.to_str().unwrap(),
             "--vault-dir",
             custom_vault_dir.to_str().unwrap(),
         ])

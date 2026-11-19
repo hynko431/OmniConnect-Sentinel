@@ -151,6 +151,25 @@ extern "system" {
     ) -> i32;
     fn GetFileInformationByHandle(hFile: isize, lpFileInformation: *mut core::ffi::c_void) -> i32;
     fn GetFileType(hFile: isize) -> u32;
+    fn FindFirstFileW(lpFileName: *const u16, lpFindFileData: *mut core::ffi::c_void) -> isize;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct Win32FindDataW {
+    dw_file_attributes: u32,
+    ft_creation_time_low: u32,
+    ft_creation_time_high: u32,
+    ft_last_access_time_low: u32,
+    ft_last_access_time_high: u32,
+    ft_last_write_time_low: u32,
+    ft_last_write_time_high: u32,
+    n_file_size_high: u32,
+    n_file_size_low: u32,
+    dw_reserved0: u32,
+    dw_reserved1: u32,
+    c_file_name: [u16; 260],
+    c_alternate_file_name: [u16; 14],
 }
 
 #[cfg(windows)]
@@ -276,23 +295,67 @@ pub fn normalize_file_attributes(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Verifies that a target path (or host path for an NTFS `:stream`) is NOT a symlink or reparse point.
+/// Verifies that `path` AND every existing ancestor component (plus host path for an NTFS `:stream`)
+/// is NOT a symlink or NTFS reparse point / junction.
 pub fn ensure_not_symlink_or_reparse_point(path: &Path) -> io::Result<()> {
     let s = path.to_string_lossy();
-    // If path is an NTFS Alternate Data Stream `C:\dir\file.txt:stream`, check the host file too
     let without_verbatim = s.strip_prefix(r"\\?\").unwrap_or(&s);
-    if without_verbatim.len() > 3 {
+    let base_target: PathBuf = if without_verbatim.len() > 3 {
         if let Some(colon_rel) = without_verbatim[2..].find(':') {
             let host_str = &without_verbatim[..2 + colon_rel];
-            let host_verbatim = to_verbatim_path(Path::new(host_str));
-            if let Ok(host_meta) = fs::symlink_metadata(&host_verbatim) {
-                if is_reparse_point_or_symlink(&host_meta) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "Refusing operation: host path '{host_str}' is a symlink or reparse point"
-                        ),
-                    ));
+            PathBuf::from(host_str)
+        } else {
+            PathBuf::from(without_verbatim)
+        }
+    } else {
+        PathBuf::from(without_verbatim)
+    };
+
+    let abs_target = if base_target.is_absolute() {
+        base_target
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&base_target))
+            .unwrap_or(base_target)
+    };
+
+    // Walk every prefix component without collapsing `..` first so intermediate NTFS junctions
+    // or symlinks (`junc/existing_sub/file.txt` or `junc/../foo`) are caught before OS traversal.
+    let mut cur = PathBuf::new();
+    for comp in abs_target.components() {
+        match comp {
+            Component::Prefix(p) => cur.push(p.as_os_str()),
+            Component::RootDir => cur.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                cur.push("..");
+            }
+            Component::Normal(c) => {
+                cur.push(c);
+                let cur_verbatim = to_verbatim_path(&cur);
+                if let Ok(meta) = fs::symlink_metadata(&cur_verbatim) {
+                    if is_reparse_point_or_symlink(&meta) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "Refusing operation: path component '{}' (in '{}') is a symlink or reparse point",
+                                cur.display(),
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+                if let Ok(meta) = fs::symlink_metadata(&cur) {
+                    if is_reparse_point_or_symlink(&meta) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "Refusing operation: path component '{}' (in '{}') is a symlink or reparse point",
+                                cur.display(),
+                                path.display()
+                            ),
+                        ));
+                    }
                 }
             }
         }
@@ -873,6 +936,18 @@ pub fn sync_directory(dir: &Path) -> io::Result<()> {
 /// to a directory or file so unprivileged standard users cannot read/tamper with vault keys,
 /// shadow caches, or audit ledgers (`Master Plan v2 §1.1, §3.2, §4.2`).
 pub fn apply_system_admin_dacl(path: &Path) -> io::Result<()> {
+    ensure_not_symlink_or_reparse_point(path)?;
+    let verbatim = to_verbatim_path(path);
+    let meta = fs::symlink_metadata(&verbatim).or_else(|_| fs::symlink_metadata(path))?;
+    if is_reparse_point_or_symlink(&meta) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Refusing DACL application on symlink or reparse point '{}'",
+                path.display()
+            ),
+        ));
+    }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -881,9 +956,13 @@ pub fn apply_system_admin_dacl(path: &Path) -> io::Result<()> {
         const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
         const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
 
-        // Grant full control to SYSTEM (SY), Administrators (BA), and Creator/Owner (CO/OW) so
+        // Grant full control to SYSTEM (SY), Administrators (BA), and Owner Rights (OW) so
         // both elevated SYSTEM services and current process owners can access while blocking other users.
-        let sddl = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GA;;;OW)";
+        let sddl = if meta.is_dir() {
+            "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GA;;;OW)"
+        } else {
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)"
+        };
         let wide_sddl: Vec<u16> = std::ffi::OsStr::new(sddl)
             .encode_wide()
             .chain(Some(0))
@@ -922,7 +1001,6 @@ pub fn apply_system_admin_dacl(path: &Path) -> io::Result<()> {
             return Err(err);
         }
 
-        let verbatim = to_verbatim_path(path);
         let wide_path: Vec<u16> = verbatim.as_os_str().encode_wide().chain(Some(0)).collect();
         let status = unsafe {
             SetNamedSecurityInfoW(
@@ -946,7 +1024,6 @@ pub fn apply_system_admin_dacl(path: &Path) -> io::Result<()> {
     #[cfg(not(windows))]
     {
         use std::os::unix::fs::PermissionsExt;
-        let meta = fs::symlink_metadata(path)?;
         let mut perms = meta.permissions();
         if meta.is_dir() {
             perms.set_mode(0o700);
@@ -961,6 +1038,11 @@ pub fn apply_system_admin_dacl(path: &Path) -> io::Result<()> {
 /// on Windows, or `0o600` on Unix, at handle creation time, completely eliminating post-creation DACL race windows.
 pub fn create_restricted_file_handle_atomic(path: &Path) -> io::Result<File> {
     ensure_not_symlink_or_reparse_point(path)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            ensure_not_symlink_or_reparse_point(parent)?;
+        }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -972,8 +1054,12 @@ pub fn create_restricted_file_handle_atomic(path: &Path) -> io::Result<File> {
         const FILE_SHARE_READ: u32 = 0x0000_0001;
         const FILE_SHARE_WRITE: u32 = 0x0000_0002;
         const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-        const CREATE_ALWAYS: u32 = 2;
+        const CREATE_NEW: u32 = 1;
+        const OPEN_EXISTING: u32 = 3;
         const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
         const INVALID_HANDLE_VALUE: isize = -1;
 
         // Grant full control to SYSTEM (SY), Administrators (BA), and Owner (OW) so
@@ -1015,14 +1101,15 @@ pub fn create_restricted_file_handle_atomic(path: &Path) -> io::Result<File> {
         let verbatim = to_verbatim_path(path);
         let wide_path: Vec<u16> = verbatim.as_os_str().encode_wide().chain(Some(0)).collect();
 
-        let h_file = unsafe {
+        // Attempt atomic `CREATE_NEW` first (never follows live or dangling symlinks/junctions).
+        let h_new = unsafe {
             CreateFileW(
                 wide_path.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 &sa as *const _ as *const core::ffi::c_void,
-                CREATE_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL,
+                CREATE_NEW,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL,
                 0,
             )
         };
@@ -1031,28 +1118,140 @@ pub fn create_restricted_file_handle_atomic(path: &Path) -> io::Result<File> {
             let _ = LocalFree(sd_ptr);
         }
 
-        if h_file == INVALID_HANDLE_VALUE || h_file == 0 {
+        if h_new != INVALID_HANDLE_VALUE && h_new != 0 {
+            return Ok(unsafe { File::from_raw_handle(h_new as *mut core::ffi::c_void) });
+        }
+
+        let create_err = io::Error::last_os_error();
+        if create_err.raw_os_error() != Some(80) && create_err.raw_os_error() != Some(183) {
+            return Err(create_err);
+        }
+
+        // File entry already exists: open strictly with `FILE_FLAG_OPEN_REPARSE_POINT` (no traversal),
+        // verify on the kernel handle that it is a single-link regular file, remediate its DACL, then truncate.
+        ensure_not_symlink_or_reparse_point(path)?;
+        let h_existing = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                core::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL,
+                0,
+            )
+        };
+        if h_existing == INVALID_HANDLE_VALUE || h_existing == 0 {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(unsafe { File::from_raw_handle(h_file as *mut core::ffi::c_void) })
+        let mut info: ByHandleFileInformation = unsafe { core::mem::zeroed() };
+        let ok_info = unsafe {
+            GetFileInformationByHandle(h_existing, &mut info as *mut _ as *mut core::ffi::c_void)
+        };
+        if ok_info == 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                let _ = CloseHandle(h_existing);
+            }
+            return Err(err);
+        }
+        if (info.dw_file_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))
+            != 0
+        {
+            unsafe {
+                let _ = CloseHandle(h_existing);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing restricted file open: '{}' is a reparse point or directory",
+                    path.display()
+                ),
+            ));
+        }
+        if info.n_number_of_links > 1 {
+            unsafe {
+                let _ = CloseHandle(h_existing);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing restricted file open: hardlink squatting detected on '{}' (links={})",
+                    path.display(),
+                    info.n_number_of_links
+                ),
+            ));
+        }
+
+        let file = unsafe { File::from_raw_handle(h_existing as *mut core::ffi::c_void) };
+        apply_system_admin_dacl(path)?;
+        file.set_len(0)?;
+        Ok(file)
     }
     #[cfg(not(windows))]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(true);
+        options.read(true).write(true).create(true);
         options.mode(0o600);
         options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        options.open(path)
+        let file = options.open(path)?;
+        let fd = file.as_raw_fd();
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Restricted target '{}' is not a regular file",
+                    path.display()
+                ),
+            ));
+        }
+        if st.st_nlink > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing restricted file open: hardlink squatting detected on '{}'",
+                    path.display()
+                ),
+            ));
+        }
+        if unsafe { libc::fchmod(fd, 0o600) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        file.set_len(0)?;
+        Ok(file)
     }
 }
 
 /// Creates a file atomically with restricted permissions and writes `content` to it.
 pub fn create_restricted_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
+    ensure_not_symlink_or_reparse_point(path)?;
     if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            create_restricted_dir_atomic(parent)?;
+        if !parent.as_os_str().is_empty() {
+            ensure_not_symlink_or_reparse_point(parent)?;
+            let parent_verbatim = to_verbatim_path(parent);
+            match fs::symlink_metadata(&parent_verbatim).or_else(|_| fs::symlink_metadata(parent)) {
+                Ok(pm) => {
+                    if is_reparse_point_or_symlink(&pm) || !pm.is_dir() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "Parent path '{}' is a reparse point or non-directory",
+                                parent.display()
+                            ),
+                        ));
+                    }
+                }
+                Err(_) => {
+                    create_restricted_dir_atomic(parent)?;
+                }
+            }
         }
     }
     let mut file = create_restricted_file_handle_atomic(path)?;
@@ -1064,12 +1263,59 @@ pub fn create_restricted_file_atomic(path: &Path, content: &[u8]) -> io::Result<
 /// Creates a directory atomically with strict SYSTEM + Administrators DACL (`D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)`)
 /// on Windows, or `0o700` on Unix, at creation time.
 pub fn create_restricted_dir_atomic(path: &Path) -> io::Result<()> {
-    if path.exists() {
+    ensure_not_symlink_or_reparse_point(path)?;
+    let verbatim = to_verbatim_path(path);
+    if let Ok(meta) = fs::symlink_metadata(&verbatim).or_else(|_| fs::symlink_metadata(path)) {
+        if is_reparse_point_or_symlink(&meta) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing operation: '{}' is a symlink or reparse point",
+                    path.display()
+                ),
+            ));
+        }
+        if !meta.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "Target restricted directory '{}' already exists as a non-directory",
+                    path.display()
+                ),
+            ));
+        }
+        apply_system_admin_dacl(path)?;
         return Ok(());
     }
     if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            create_restricted_dir_atomic(parent)?;
+        if !parent.as_os_str().is_empty() {
+            ensure_not_symlink_or_reparse_point(parent)?;
+            let parent_verbatim = to_verbatim_path(parent);
+            match fs::symlink_metadata(&parent_verbatim).or_else(|_| fs::symlink_metadata(parent)) {
+                Ok(pm) => {
+                    if is_reparse_point_or_symlink(&pm) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "Refusing operation: parent '{}' is a symlink or reparse point",
+                                parent.display()
+                            ),
+                        ));
+                    }
+                    if !pm.is_dir() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!(
+                                "Parent path '{}' already exists as a non-directory",
+                                parent.display()
+                            ),
+                        ));
+                    }
+                }
+                Err(_) => {
+                    create_restricted_dir_atomic(parent)?;
+                }
+            }
         }
     }
     #[cfg(windows)]
@@ -1111,7 +1357,6 @@ pub fn create_restricted_dir_atomic(path: &Path) -> io::Result<()> {
             b_inherit_handle: 0,
         };
 
-        let verbatim = to_verbatim_path(path);
         let wide_path: Vec<u16> = verbatim.as_os_str().encode_wide().chain(Some(0)).collect();
 
         let res = unsafe {
@@ -1128,7 +1373,20 @@ pub fn create_restricted_dir_atomic(path: &Path) -> io::Result<()> {
         if res == 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(183) {
-                // ERROR_ALREADY_EXISTS
+                // ERROR_ALREADY_EXISTS — re-validate non-reparse directory AND enforce restricted DACL
+                ensure_not_symlink_or_reparse_point(path)?;
+                let meta =
+                    fs::symlink_metadata(&verbatim).or_else(|_| fs::symlink_metadata(path))?;
+                if is_reparse_point_or_symlink(&meta) || !meta.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Concurrent creation check failed: '{}' is a symlink/reparse point or non-directory",
+                            path.display()
+                        ),
+                    ));
+                }
+                apply_system_admin_dacl(path)?;
                 return Ok(());
             }
             return Err(err);
@@ -1140,7 +1398,25 @@ pub fn create_restricted_dir_atomic(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
-        builder.create(path)
+        match builder.create(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                ensure_not_symlink_or_reparse_point(path)?;
+                let meta = fs::symlink_metadata(path)?;
+                if is_reparse_point_or_symlink(&meta) || !meta.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Concurrent creation check failed: '{}' is a symlink or non-directory",
+                            path.display()
+                        ),
+                    ));
+                }
+                apply_system_admin_dacl(path)?;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -1257,6 +1533,9 @@ pub fn enumerate_ntfs_ads(path: &Path) -> Vec<(String, u64)> {
     }
 }
 
+/// Windows Projected File System (`ProjFS`) NTFS reparse tag (`0x9000_001C`).
+pub const IO_REPARSE_TAG_PROJFS: u32 = 0x9000_001C;
+
 /// Checks if a `Metadata` object represents a symlink or a Windows NTFS reparse point / junction (`FILE_ATTRIBUTE_REPARSE_POINT`).
 pub fn is_reparse_point_or_symlink(meta: &Metadata) -> bool {
     if meta.file_type().is_symlink() {
@@ -1271,6 +1550,40 @@ pub fn is_reparse_point_or_symlink(meta: &Metadata) -> bool {
         }
     }
     false
+}
+
+/// Returns `true` strictly when `path` is a Windows NTFS reparse point tagged with
+/// `IO_REPARSE_TAG_PROJFS` (`0x9000_001C`) rather than a symlink or NTFS junction.
+pub fn is_projfs_reparse_point(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        const INVALID_HANDLE_VALUE: isize = -1;
+
+        let verbatim = to_verbatim_path(path);
+        let wide: Vec<u16> = verbatim.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut find_data: Win32FindDataW = unsafe { core::mem::zeroed() };
+        let h = unsafe {
+            FindFirstFileW(
+                wide.as_ptr(),
+                (&mut find_data as *mut Win32FindDataW).cast::<core::ffi::c_void>(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE || h == 0 {
+            return false;
+        }
+        unsafe {
+            let _ = FindClose(h);
+        }
+        (find_data.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            && find_data.dw_reserved0 == IO_REPARSE_TAG_PROJFS
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 /// Attaches Mark-of-the-Web (`Zone.Identifier` stream with `ZoneId=3` on Windows;
@@ -1320,11 +1633,33 @@ pub fn write_mark_of_the_web(path: &Path, zone_id: u8) -> io::Result<()> {
     }
 }
 
+/// Metadata for an entry projected through Windows Projected File System (`ProjFS`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjFsProjectedEntry {
+    pub relative_path: PathBuf,
+    pub is_directory: bool,
+    pub file_size: u64,
+    pub content_sha256: [u8; 32],
+}
+
+/// Backend data source invoked by Windows `ProjectedFSLib.dll` callbacks (`Row 148`).
+pub trait ProjFsVirtualizerBackend: Send + Sync + 'static {
+    fn list_entries(&self) -> Vec<ProjFsProjectedEntry>;
+    fn read_verified_range(
+        &self,
+        relative_path: &Path,
+        byte_offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, String>;
+}
+
 /// Handle to an active Windows Projected File System (`ProjectedFSLib.dll`) virtualization instance (`Row 148`).
 pub struct ProjFsInstanceHandle {
     namespace_ctx: isize,
     #[cfg(windows)]
     lib_handle: isize,
+    #[cfg(windows)]
+    state: Option<Box<ProjFsInstanceState>>,
 }
 
 unsafe impl Send for ProjFsInstanceHandle {}
@@ -1340,25 +1675,23 @@ impl Drop for ProjFsInstanceHandle {
     fn drop(&mut self) {
         #[cfg(windows)]
         {
-            if self.namespace_ctx != 0 && self.lib_handle != 0 {
-                #[link(name = "kernel32")]
-                extern "system" {
-                    fn GetProcAddress(h_module: isize, lp_proc_name: *const u8) -> isize;
-                    fn FreeLibrary(h_lib_module: isize) -> i32;
-                }
-                type PrjStopVirtualizingFn = unsafe extern "system" fn(isize);
-                unsafe {
-                    let proc_addr = GetProcAddress(
-                        self.lib_handle,
-                        c"PrjStopVirtualizing".as_ptr().cast::<u8>(),
-                    );
-                    if proc_addr != 0 {
-                        let stop_fn: PrjStopVirtualizingFn = core::mem::transmute(proc_addr);
-                        stop_fn(self.namespace_ctx);
+            if self.namespace_ctx != 0 {
+                if let Some(ref state) = self.state {
+                    unsafe {
+                        (state.stop_fn)(self.namespace_ctx);
                     }
-                    let _ = FreeLibrary(self.lib_handle);
                 }
                 self.namespace_ctx = 0;
+            }
+            drop(self.state.take());
+            if self.lib_handle != 0 {
+                #[link(name = "kernel32")]
+                extern "system" {
+                    fn FreeLibrary(h_lib_module: isize) -> i32;
+                }
+                unsafe {
+                    let _ = FreeLibrary(self.lib_handle);
+                }
                 self.lib_handle = 0;
             }
         }
@@ -1367,12 +1700,43 @@ impl Drop for ProjFsInstanceHandle {
 
 #[cfg(windows)]
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PrjGuid {
     data1: u32,
     data2: u16,
     data3: u16,
     data4: [u8; 8],
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct PrjFileBasicInfo {
+    is_directory: u8,
+    _pad0: [u8; 7],
+    file_size: i64,
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    file_attributes: u32,
+    _pad1: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct PrjPlaceholderInfo {
+    file_basic_info: PrjFileBasicInfo,
+    ea_buffer_size: u32,
+    offset_to_first_ea: u32,
+    security_buffer_size: u32,
+    offset_to_security_descriptor: u32,
+    streams_info_buffer_size: u32,
+    offset_to_first_stream_info: u32,
+    provider_id: [u8; 128],
+    content_id: [u8; 128],
+    variable_data: [u8; 1],
 }
 
 #[cfg(windows)]
@@ -1408,36 +1772,396 @@ struct PrjCallbacks {
 }
 
 #[cfg(windows)]
+type PrjMarkDirectoryAsPlaceholderFn = unsafe extern "system" fn(
+    *const u16,
+    *const u16,
+    *const core::ffi::c_void,
+    *const PrjGuid,
+) -> i32;
+#[cfg(windows)]
+type PrjStartVirtualizingFn = unsafe extern "system" fn(
+    *const u16,
+    *const PrjCallbacks,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut isize,
+) -> i32;
+#[cfg(windows)]
+type PrjStopVirtualizingFn = unsafe extern "system" fn(isize);
+#[cfg(windows)]
+type PrjFillDirEntryBufferFn =
+    unsafe extern "system" fn(*const u16, *const PrjFileBasicInfo, isize) -> i32;
+#[cfg(windows)]
+type PrjWritePlaceholderInfoFn =
+    unsafe extern "system" fn(isize, *const u16, *const PrjPlaceholderInfo, u32) -> i32;
+#[cfg(windows)]
+type PrjAllocateAlignedBufferFn = unsafe extern "system" fn(isize, usize) -> *mut u8;
+#[cfg(windows)]
+type PrjFreeAlignedBufferFn = unsafe extern "system" fn(*mut u8);
+#[cfg(windows)]
+type PrjWriteFileDataFn =
+    unsafe extern "system" fn(isize, *const PrjGuid, *const u8, u64, u32) -> i32;
+#[cfg(windows)]
+type PrjFileNameCompareFn = unsafe extern "system" fn(*const u16, *const u16) -> i32;
+#[cfg(windows)]
+type PrjFileNameMatchFn = unsafe extern "system" fn(*const u16, *const u16) -> u8;
+
+#[cfg(windows)]
+struct DirEnumSession {
+    cursor: usize,
+    search_expr: Option<String>,
+}
+
+#[cfg(windows)]
+struct ProjFsInstanceState {
+    callbacks: PrjCallbacks,
+    backend: Box<dyn ProjFsVirtualizerBackend>,
+    dir_enums: std::sync::Mutex<std::collections::HashMap<PrjGuid, DirEnumSession>>,
+    fill_dir_fn: PrjFillDirEntryBufferFn,
+    write_placeholder_fn: PrjWritePlaceholderInfoFn,
+    alloc_buf_fn: PrjAllocateAlignedBufferFn,
+    free_buf_fn: PrjFreeAlignedBufferFn,
+    write_data_fn: PrjWriteFileDataFn,
+    compare_fn: PrjFileNameCompareFn,
+    match_fn: PrjFileNameMatchFn,
+    stop_fn: PrjStopVirtualizingFn,
+}
+
+#[cfg(windows)]
+const PRJ_S_OK: i32 = 0;
+#[cfg(windows)]
+const PRJ_E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+#[cfg(windows)]
+const PRJ_E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
+#[cfg(windows)]
+const PRJ_E_FAIL: i32 = 0x8000_4005u32 as i32;
+#[cfg(windows)]
+const PRJ_HRESULT_ERROR_FILE_NOT_FOUND: i32 = 0x8007_0002u32 as i32;
+#[cfg(windows)]
+const PRJ_HRESULT_ERROR_ACCESS_DENIED: i32 = 0x8007_0005u32 as i32;
+#[cfg(windows)]
+const PRJ_HRESULT_ERROR_INSUFFICIENT_BUFFER: i32 = 0x8007_007Au32 as i32;
+#[cfg(windows)]
+const PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN: u32 = 0x1;
+
+#[cfg(windows)]
+unsafe fn wide_ptr_to_string(ptr: *const u16) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while len < 65_536 {
+        if unsafe { *ptr.add(len) } == 0 {
+            break;
+        }
+        len += 1;
+    }
+    let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+    Some(String::from_utf16_lossy(slice))
+}
+
+#[cfg(windows)]
+fn normalize_projfs_rel_components(raw: &str) -> Option<Vec<String>> {
+    if raw.contains('\0') || raw.contains(':') {
+        return None;
+    }
+    let trimmed = raw.trim_matches(|c| c == '\\' || c == '/');
+    if trimmed.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut parts = Vec::new();
+    for seg in trimmed.split(['\\', '/']) {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return None;
+        }
+        parts.push(seg.to_string());
+    }
+    Some(parts)
+}
+
+#[cfg(windows)]
+fn build_prj_basic_info(entry: &ProjFsProjectedEntry) -> PrjFileBasicInfo {
+    let file_size = if entry.is_directory {
+        0
+    } else {
+        i64::try_from(entry.file_size).unwrap_or(i64::MAX)
+    };
+    PrjFileBasicInfo {
+        is_directory: if entry.is_directory { 1 } else { 0 },
+        _pad0: [0u8; 7],
+        file_size,
+        creation_time: 0,
+        last_access_time: 0,
+        last_write_time: 0,
+        change_time: 0,
+        file_attributes: if entry.is_directory { 0x10 } else { 0x01 },
+        _pad1: 0,
+    }
+}
+
+#[cfg(windows)]
+unsafe fn recover_instance_state<'a>(cb: &PrjCallbackData) -> Result<&'a ProjFsInstanceState, i32> {
+    if cb.instance_context.is_null() {
+        return Err(PRJ_E_INVALIDARG);
+    }
+    Ok(unsafe { &*(cb.instance_context.cast::<ProjFsInstanceState>()) })
+}
+
+#[cfg(windows)]
 unsafe extern "system" fn prj_start_dir_enum_cb(
-    _callback_data: *const PrjCallbackData,
-    _enumeration_id: *const PrjGuid,
+    callback_data: *const PrjCallbackData,
+    enumeration_id: *const PrjGuid,
 ) -> i32 {
-    0 // S_OK
+    if callback_data.is_null() || enumeration_id.is_null() {
+        return PRJ_E_INVALIDARG;
+    }
+    let cb = unsafe { &*callback_data };
+    let state = match unsafe { recover_instance_state(cb) } {
+        Ok(s) => s,
+        Err(hr) => return hr,
+    };
+    let mut enums = match state.dir_enums.lock() {
+        Ok(g) => g,
+        Err(_) => return PRJ_E_FAIL,
+    };
+    enums.insert(
+        unsafe { *enumeration_id },
+        DirEnumSession {
+            cursor: 0,
+            search_expr: None,
+        },
+    );
+    PRJ_S_OK
 }
 
 #[cfg(windows)]
 unsafe extern "system" fn prj_end_dir_enum_cb(
-    _callback_data: *const PrjCallbackData,
-    _enumeration_id: *const PrjGuid,
+    callback_data: *const PrjCallbackData,
+    enumeration_id: *const PrjGuid,
 ) -> i32 {
-    0 // S_OK
+    if callback_data.is_null() || enumeration_id.is_null() {
+        return PRJ_E_INVALIDARG;
+    }
+    let cb = unsafe { &*callback_data };
+    let state = match unsafe { recover_instance_state(cb) } {
+        Ok(s) => s,
+        Err(hr) => return hr,
+    };
+    let mut enums = match state.dir_enums.lock() {
+        Ok(g) => g,
+        Err(_) => return PRJ_E_FAIL,
+    };
+    enums.remove(unsafe { &*enumeration_id });
+    PRJ_S_OK
 }
 
 #[cfg(windows)]
 unsafe extern "system" fn prj_get_dir_enum_cb(
-    _callback_data: *const PrjCallbackData,
-    _enumeration_id: *const PrjGuid,
-    _search_expression: *const u16,
-    _dir_entry_buffer_handle: isize,
+    callback_data: *const PrjCallbackData,
+    enumeration_id: *const PrjGuid,
+    search_expression: *const u16,
+    dir_entry_buffer_handle: isize,
 ) -> i32 {
-    0 // S_OK
+    if callback_data.is_null() || enumeration_id.is_null() || dir_entry_buffer_handle == 0 {
+        return PRJ_E_INVALIDARG;
+    }
+    let cb = unsafe { &*callback_data };
+    let state = match unsafe { recover_instance_state(cb) } {
+        Ok(s) => s,
+        Err(hr) => return hr,
+    };
+
+    let raw_dir = match unsafe { wide_ptr_to_string(cb.file_path_name) } {
+        Some(s) => s,
+        None => return PRJ_E_INVALIDARG,
+    };
+    let parent_comps = match normalize_projfs_rel_components(&raw_dir) {
+        Some(c) => c,
+        None => return PRJ_HRESULT_ERROR_FILE_NOT_FOUND,
+    };
+
+    let restart_scan = (cb.flags & PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN) != 0;
+    let incoming_expr = unsafe { wide_ptr_to_string(search_expression) }.filter(|s| !s.is_empty());
+
+    let (start_cursor, active_expr) = {
+        let mut enums = match state.dir_enums.lock() {
+            Ok(g) => g,
+            Err(_) => return PRJ_E_FAIL,
+        };
+        let Some(session) = enums.get_mut(unsafe { &*enumeration_id }) else {
+            return PRJ_E_INVALIDARG;
+        };
+        if restart_scan {
+            session.cursor = 0;
+            session.search_expr = incoming_expr;
+        } else if session.search_expr.is_none() && incoming_expr.is_some() {
+            session.search_expr = incoming_expr;
+        }
+        (session.cursor, session.search_expr.clone())
+    };
+
+    struct ChildItem {
+        child_name: String,
+        entry: ProjFsProjectedEntry,
+    }
+
+    let entries = state.backend.list_entries();
+    let mut children_map: std::collections::HashMap<String, ChildItem> =
+        std::collections::HashMap::new();
+
+    for entry in entries {
+        let entry_str = entry.relative_path.to_string_lossy();
+        let Some(entry_comps) = normalize_projfs_rel_components(&entry_str) else {
+            continue;
+        };
+        if entry_comps.len() != parent_comps.len() + 1 {
+            continue;
+        }
+        let parent_matches = entry_comps[..parent_comps.len()]
+            .iter()
+            .zip(parent_comps.iter())
+            .all(|(a, b)| {
+                let a_wide: Vec<u16> = a.encode_utf16().chain(Some(0)).collect();
+                let b_wide: Vec<u16> = b.encode_utf16().chain(Some(0)).collect();
+                unsafe { (state.compare_fn)(a_wide.as_ptr(), b_wide.as_ptr()) == 0 }
+            });
+        if !parent_matches {
+            continue;
+        }
+        let child_name = entry_comps[parent_comps.len()].clone();
+        let key = child_name.to_lowercase();
+        children_map
+            .entry(key)
+            .and_modify(|existing| {
+                if !existing.entry.is_directory && entry.is_directory {
+                    existing.child_name = child_name.clone();
+                    existing.entry = entry.clone();
+                }
+            })
+            .or_insert(ChildItem { child_name, entry });
+    }
+
+    let mut children: Vec<ChildItem> = children_map.into_values().collect();
+    if let Some(ref expr) = active_expr {
+        if !expr.is_empty() && expr != "*" {
+            let expr_wide: Vec<u16> = expr.encode_utf16().chain(Some(0)).collect();
+            children.retain(|child| {
+                let child_wide: Vec<u16> = child.child_name.encode_utf16().chain(Some(0)).collect();
+                unsafe { (state.match_fn)(child_wide.as_ptr(), expr_wide.as_ptr()) != 0 }
+            });
+        }
+    }
+
+    children.sort_by(|a, b| {
+        let a_wide: Vec<u16> = a.child_name.encode_utf16().chain(Some(0)).collect();
+        let b_wide: Vec<u16> = b.child_name.encode_utf16().chain(Some(0)).collect();
+        let cmp = unsafe { (state.compare_fn)(a_wide.as_ptr(), b_wide.as_ptr()) };
+        cmp.cmp(&0)
+    });
+
+    let mut cursor = start_cursor;
+    let mut return_hr = PRJ_S_OK;
+
+    for (entries_added, child) in children.iter().skip(start_cursor).enumerate() {
+        let child_wide: Vec<u16> = child.child_name.encode_utf16().chain(Some(0)).collect();
+        let basic_info = build_prj_basic_info(&child.entry);
+        let hr = unsafe {
+            (state.fill_dir_fn)(child_wide.as_ptr(), &basic_info, dir_entry_buffer_handle)
+        };
+        if hr == PRJ_HRESULT_ERROR_INSUFFICIENT_BUFFER {
+            if entries_added == 0 {
+                return_hr = PRJ_HRESULT_ERROR_INSUFFICIENT_BUFFER;
+            }
+            break;
+        }
+        if hr < 0 {
+            return_hr = hr;
+            break;
+        }
+        cursor += 1;
+    }
+
+    if let Ok(mut enums) = state.dir_enums.lock() {
+        if let Some(session) = enums.get_mut(unsafe { &*enumeration_id }) {
+            session.cursor = cursor;
+        }
+    }
+
+    return_hr
 }
 
 #[cfg(windows)]
 unsafe extern "system" fn prj_get_placeholder_info_cb(
-    _callback_data: *const PrjCallbackData,
+    callback_data: *const PrjCallbackData,
 ) -> i32 {
-    0 // S_OK
+    if callback_data.is_null() {
+        return PRJ_E_INVALIDARG;
+    }
+    let cb = unsafe { &*callback_data };
+    let state = match unsafe { recover_instance_state(cb) } {
+        Ok(s) => s,
+        Err(hr) => return hr,
+    };
+    let raw_path = match unsafe { wide_ptr_to_string(cb.file_path_name) } {
+        Some(s) => s,
+        None => return PRJ_E_INVALIDARG,
+    };
+    let Some(req_comps) = normalize_projfs_rel_components(&raw_path) else {
+        return PRJ_HRESULT_ERROR_FILE_NOT_FOUND;
+    };
+    if req_comps.is_empty() {
+        return PRJ_HRESULT_ERROR_FILE_NOT_FOUND;
+    }
+
+    let entries = state.backend.list_entries();
+    let matched = entries.into_iter().find_map(|entry| {
+        let entry_str = entry.relative_path.to_string_lossy();
+        let entry_comps = normalize_projfs_rel_components(&entry_str)?;
+        if entry_comps.len() == req_comps.len()
+            && entry_comps.iter().zip(req_comps.iter()).all(|(a, b)| {
+                let a_wide: Vec<u16> = a.encode_utf16().chain(Some(0)).collect();
+                let b_wide: Vec<u16> = b.encode_utf16().chain(Some(0)).collect();
+                unsafe { (state.compare_fn)(a_wide.as_ptr(), b_wide.as_ptr()) == 0 }
+            })
+        {
+            Some((entry, entry_comps))
+        } else {
+            None
+        }
+    });
+
+    let Some((entry, entry_comps)) = matched else {
+        return PRJ_HRESULT_ERROR_FILE_NOT_FOUND;
+    };
+
+    let mut provider_id = [0u8; 128];
+    provider_id[..16].copy_from_slice(b"OMNISENTINEL_V2\0");
+    let mut content_id = [0u8; 128];
+    content_id[..32].copy_from_slice(&entry.content_sha256);
+
+    let placeholder_info = PrjPlaceholderInfo {
+        file_basic_info: build_prj_basic_info(&entry),
+        ea_buffer_size: 0,
+        offset_to_first_ea: 0,
+        security_buffer_size: 0,
+        offset_to_security_descriptor: 0,
+        streams_info_buffer_size: 0,
+        offset_to_first_stream_info: 0,
+        provider_id,
+        content_id,
+        variable_data: [0u8; 1],
+    };
+
+    let canonical_rel = entry_comps.join("\\");
+    let dest_wide: Vec<u16> = canonical_rel.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        (state.write_placeholder_fn)(
+            cb.namespace_virtualization_context,
+            dest_wide.as_ptr(),
+            &placeholder_info,
+            core::mem::size_of::<PrjPlaceholderInfo>() as u32,
+        )
+    }
 }
 
 #[cfg(windows)]
@@ -1447,23 +2171,58 @@ unsafe extern "system" fn prj_get_file_data_cb(
     length: u32,
 ) -> i32 {
     if callback_data.is_null() {
-        return -2147024809; // E_INVALIDARG
+        return PRJ_E_INVALIDARG;
     }
     let cb = unsafe { &*callback_data };
-    let mut guid_bytes = [0u8; 16];
-    guid_bytes[0..4].copy_from_slice(&cb.data_stream_id.data1.to_le_bytes());
-    guid_bytes[4..6].copy_from_slice(&cb.data_stream_id.data2.to_le_bytes());
-    guid_bytes[6..8].copy_from_slice(&cb.data_stream_id.data3.to_le_bytes());
-    guid_bytes[8..16].copy_from_slice(&cb.data_stream_id.data4);
-    let zero_buf = vec![0u8; length as usize];
-    match prj_write_file_data(
-        cb.namespace_virtualization_context,
-        &guid_bytes,
-        &zero_buf,
-        byte_offset,
-    ) {
-        Ok(()) => 0,
-        Err(_) => -2147467259, // E_FAIL
+    let state = match unsafe { recover_instance_state(cb) } {
+        Ok(s) => s,
+        Err(hr) => return hr,
+    };
+    let raw_path = match unsafe { wide_ptr_to_string(cb.file_path_name) } {
+        Some(s) => s,
+        None => return PRJ_E_INVALIDARG,
+    };
+    if length == 0 {
+        return PRJ_S_OK;
+    }
+
+    let Some(req_comps) = normalize_projfs_rel_components(&raw_path) else {
+        return PRJ_HRESULT_ERROR_ACCESS_DENIED;
+    };
+    if req_comps.is_empty() {
+        return PRJ_HRESULT_ERROR_ACCESS_DENIED;
+    }
+    let rel_path: PathBuf = req_comps.iter().collect();
+
+    let verified = match state
+        .backend
+        .read_verified_range(&rel_path, byte_offset, length as usize)
+    {
+        Ok(bytes) => bytes,
+        Err(_) => return PRJ_HRESULT_ERROR_ACCESS_DENIED,
+    };
+
+    let write_len = verified.len().min(length as usize);
+    if write_len == 0 {
+        return PRJ_HRESULT_ERROR_ACCESS_DENIED;
+    }
+    let aligned_ptr =
+        unsafe { (state.alloc_buf_fn)(cb.namespace_virtualization_context, write_len) };
+    if aligned_ptr.is_null() {
+        return PRJ_E_OUTOFMEMORY;
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(verified.as_ptr(), aligned_ptr, write_len);
+        let res = (state.write_data_fn)(
+            cb.namespace_virtualization_context,
+            &cb.data_stream_id,
+            aligned_ptr,
+            byte_offset,
+            write_len as u32,
+        );
+        (state.free_buf_fn)(aligned_ptr);
+        res
     }
 }
 
@@ -1487,22 +2246,25 @@ pub fn is_projfs_available() -> bool {
         if h_lib == 0 {
             return false;
         }
-        let has_start =
-            unsafe { GetProcAddress(h_lib, c"PrjStartVirtualizing".as_ptr().cast::<u8>()) != 0 };
-        let has_stop =
-            unsafe { GetProcAddress(h_lib, c"PrjStopVirtualizing".as_ptr().cast::<u8>()) != 0 };
-        let has_write =
-            unsafe { GetProcAddress(h_lib, c"PrjWriteFileData".as_ptr().cast::<u8>()) != 0 };
-        let has_mark = unsafe {
-            GetProcAddress(
-                h_lib,
-                c"PrjMarkDirectoryAsPlaceholder".as_ptr().cast::<u8>(),
-            ) != 0
-        };
+        let required_exports = [
+            c"PrjMarkDirectoryAsPlaceholder",
+            c"PrjStartVirtualizing",
+            c"PrjStopVirtualizing",
+            c"PrjFillDirEntryBuffer",
+            c"PrjWritePlaceholderInfo",
+            c"PrjAllocateAlignedBuffer",
+            c"PrjFreeAlignedBuffer",
+            c"PrjWriteFileData",
+            c"PrjFileNameCompare",
+            c"PrjFileNameMatch",
+        ];
+        let all_present = required_exports
+            .iter()
+            .all(|sym| unsafe { GetProcAddress(h_lib, sym.as_ptr().cast::<u8>()) != 0 });
         unsafe {
             let _ = FreeLibrary(h_lib);
         }
-        has_start && has_stop && has_write && has_mark
+        all_present
     }
     #[cfg(not(windows))]
     {
@@ -1511,8 +2273,11 @@ pub fn is_projfs_available() -> bool {
 }
 
 /// Marks `root_path` as a ProjFS virtualization root (`PrjMarkDirectoryAsPlaceholder`) and
-/// starts a ProjFS virtualization instance (`PrjStartVirtualizing`) (`Row 148`).
-pub fn prj_start_virtualizing_root(root_path: &Path) -> io::Result<ProjFsInstanceHandle> {
+/// starts a ProjFS virtualization instance (`PrjStartVirtualizing`) backed by `backend` (`Row 148`).
+pub fn prj_start_virtualizing_root(
+    root_path: &Path,
+    backend: Box<dyn ProjFsVirtualizerBackend>,
+) -> io::Result<ProjFsInstanceHandle> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -1522,19 +2287,6 @@ pub fn prj_start_virtualizing_root(root_path: &Path) -> io::Result<ProjFsInstanc
             fn GetProcAddress(h_module: isize, lp_proc_name: *const u8) -> isize;
             fn FreeLibrary(h_lib_module: isize) -> i32;
         }
-        type PrjMarkDirectoryAsPlaceholderFn = unsafe extern "system" fn(
-            *const u16,
-            *const u16,
-            *const core::ffi::c_void,
-            *const PrjGuid,
-        ) -> i32;
-        type PrjStartVirtualizingFn = unsafe extern "system" fn(
-            *const u16,
-            *const PrjCallbacks,
-            *const core::ffi::c_void,
-            *const core::ffi::c_void,
-            *mut isize,
-        ) -> i32;
 
         fs::create_dir_all(root_path)?;
         let dll_wide: Vec<u16> = std::ffi::OsStr::new("ProjectedFSLib.dll")
@@ -1549,33 +2301,136 @@ pub fn prj_start_virtualizing_root(root_path: &Path) -> io::Result<ProjFsInstanc
             ));
         }
 
-        let mark_addr = unsafe {
-            GetProcAddress(
-                h_lib,
-                c"PrjMarkDirectoryAsPlaceholder".as_ptr().cast::<u8>(),
-            )
-        };
-        let start_addr =
-            unsafe { GetProcAddress(h_lib, c"PrjStartVirtualizing".as_ptr().cast::<u8>()) };
-        if mark_addr == 0 || start_addr == 0 {
-            unsafe {
-                let _ = FreeLibrary(h_lib);
+        let resolve_proc = |sym: &core::ffi::CStr| -> Result<isize, io::Error> {
+            let addr = unsafe { GetProcAddress(h_lib, sym.as_ptr().cast::<u8>()) };
+            if addr == 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "ProjectedFSLib.dll missing {} entry point",
+                        sym.to_string_lossy()
+                    ),
+                ))
+            } else {
+                Ok(addr)
             }
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "ProjectedFSLib.dll missing PrjStartVirtualizing entry point",
-            ));
-        }
+        };
+
+        let mark_addr = match resolve_proc(c"PrjMarkDirectoryAsPlaceholder") {
+            Ok(a) => a,
+            Err(e) => {
+                unsafe {
+                    let _ = FreeLibrary(h_lib);
+                }
+                return Err(e);
+            }
+        };
+        let start_addr = match resolve_proc(c"PrjStartVirtualizing") {
+            Ok(a) => a,
+            Err(e) => {
+                unsafe {
+                    let _ = FreeLibrary(h_lib);
+                }
+                return Err(e);
+            }
+        };
+        let stop_addr = match resolve_proc(c"PrjStopVirtualizing") {
+            Ok(a) => a,
+            Err(e) => {
+                unsafe {
+                    let _ = FreeLibrary(h_lib);
+                }
+                return Err(e);
+            }
+        };
+        let fill_dir_addr = match resolve_proc(c"PrjFillDirEntryBuffer") {
+            Ok(a) => a,
+            Err(e) => {
+                unsafe {
+                    let _ = FreeLibrary(h_lib);
+                }
+                return Err(e);
+            }
+        };
+        let write_ph_addr = match resolve_proc(c"PrjWritePlaceholderInfo") {
+            Ok(a) => a,
+            Err(e) => {
+                unsafe {
+                    let _ = FreeLibrary(h_lib);
+                }
+                return Err(e);
+            }
+        };
+        let alloc_addr = match resolve_proc(c"PrjAllocateAlignedBuffer") {
+            Ok(a) => a,
+            Err(e) => {
+                unsafe {
+                    let _ = FreeLibrary(h_lib);
+                }
+                return Err(e);
+            }
+        };
+        let free_addr = match resolve_proc(c"PrjFreeAlignedBuffer") {
+            Ok(a) => a,
+            Err(e) => {
+                unsafe {
+                    let _ = FreeLibrary(h_lib);
+                }
+                return Err(e);
+            }
+        };
+        let write_data_addr = match resolve_proc(c"PrjWriteFileData") {
+            Ok(a) => a,
+            Err(e) => {
+                unsafe {
+                    let _ = FreeLibrary(h_lib);
+                }
+                return Err(e);
+            }
+        };
+        let cmp_addr = match resolve_proc(c"PrjFileNameCompare") {
+            Ok(a) => a,
+            Err(e) => {
+                unsafe {
+                    let _ = FreeLibrary(h_lib);
+                }
+                return Err(e);
+            }
+        };
+        let match_addr = match resolve_proc(c"PrjFileNameMatch") {
+            Ok(a) => a,
+            Err(e) => {
+                unsafe {
+                    let _ = FreeLibrary(h_lib);
+                }
+                return Err(e);
+            }
+        };
 
         let mark_fn: PrjMarkDirectoryAsPlaceholderFn = unsafe { core::mem::transmute(mark_addr) };
         let start_fn: PrjStartVirtualizingFn = unsafe { core::mem::transmute(start_addr) };
+        let stop_fn: PrjStopVirtualizingFn = unsafe { core::mem::transmute(stop_addr) };
+        let fill_dir_fn: PrjFillDirEntryBufferFn = unsafe { core::mem::transmute(fill_dir_addr) };
+        let write_placeholder_fn: PrjWritePlaceholderInfoFn =
+            unsafe { core::mem::transmute(write_ph_addr) };
+        let alloc_buf_fn: PrjAllocateAlignedBufferFn = unsafe { core::mem::transmute(alloc_addr) };
+        let free_buf_fn: PrjFreeAlignedBufferFn = unsafe { core::mem::transmute(free_addr) };
+        let write_data_fn: PrjWriteFileDataFn = unsafe { core::mem::transmute(write_data_addr) };
+        let compare_fn: PrjFileNameCompareFn = unsafe { core::mem::transmute(cmp_addr) };
+        let match_fn: PrjFileNameMatchFn = unsafe { core::mem::transmute(match_addr) };
 
         let root_wide: Vec<u16> = root_path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut guid_bytes = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut guid_bytes);
+        guid_bytes[6] = (guid_bytes[6] & 0x0F) | 0x40;
+        guid_bytes[8] = (guid_bytes[8] & 0x3F) | 0x80;
+        let mut d4 = [0u8; 8];
+        d4.copy_from_slice(&guid_bytes[8..16]);
         let instance_guid = PrjGuid {
-            data1: 0x534E_544C,
-            data2: 0x5052,
-            data3: 0x4A46,
-            data4: *b"SENTINEL",
+            data1: u32::from_le_bytes([guid_bytes[0], guid_bytes[1], guid_bytes[2], guid_bytes[3]]),
+            data2: u16::from_le_bytes([guid_bytes[4], guid_bytes[5]]),
+            data3: u16::from_le_bytes([guid_bytes[6], guid_bytes[7]]),
+            data4: d4,
         };
         let hr_mark = unsafe {
             mark_fn(
@@ -1598,27 +2453,43 @@ pub fn prj_start_virtualizing_root(root_path: &Path) -> io::Result<ProjFsInstanc
             ));
         }
 
-        let callbacks = Box::new(PrjCallbacks {
-            start_directory_enumeration_cb: prj_start_dir_enum_cb,
-            end_directory_enumeration_cb: prj_end_dir_enum_cb,
-            get_directory_enumeration_cb: prj_get_dir_enum_cb,
-            get_placeholder_info_cb: prj_get_placeholder_info_cb,
-            get_file_data_cb: prj_get_file_data_cb,
-            query_file_name_cb: 0,
-            notification_cb: 0,
-            cancel_command_cb: 0,
+        let state = Box::new(ProjFsInstanceState {
+            callbacks: PrjCallbacks {
+                start_directory_enumeration_cb: prj_start_dir_enum_cb,
+                end_directory_enumeration_cb: prj_end_dir_enum_cb,
+                get_directory_enumeration_cb: prj_get_dir_enum_cb,
+                get_placeholder_info_cb: prj_get_placeholder_info_cb,
+                get_file_data_cb: prj_get_file_data_cb,
+                query_file_name_cb: 0,
+                notification_cb: 0,
+                cancel_command_cb: 0,
+            },
+            backend,
+            dir_enums: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fill_dir_fn,
+            write_placeholder_fn,
+            alloc_buf_fn,
+            free_buf_fn,
+            write_data_fn,
+            compare_fn,
+            match_fn,
+            stop_fn,
         });
+
+        let state_ptr: *const ProjFsInstanceState = &*state;
+        let callbacks_ptr: *const PrjCallbacks = &state.callbacks;
         let mut namespace_ctx: isize = 0;
         let hr_start = unsafe {
             start_fn(
                 root_wide.as_ptr(),
-                &*callbacks,
-                core::ptr::null(),
+                callbacks_ptr,
+                state_ptr.cast::<core::ffi::c_void>(),
                 core::ptr::null(),
                 &mut namespace_ctx,
             )
         };
         if hr_start < 0 || namespace_ctx == 0 {
+            drop(state);
             unsafe {
                 let _ = FreeLibrary(h_lib);
             }
@@ -1634,11 +2505,12 @@ pub fn prj_start_virtualizing_root(root_path: &Path) -> io::Result<ProjFsInstanc
         Ok(ProjFsInstanceHandle {
             namespace_ctx,
             lib_handle: h_lib,
+            state: Some(state),
         })
     }
     #[cfg(not(windows))]
     {
-        let _ = root_path;
+        let _ = (root_path, backend);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "ProjFS is only supported on Windows hosts",
@@ -1765,5 +2637,551 @@ pub fn prj_write_file_data(
             io::ErrorKind::Unsupported,
             "PrjWriteFileData is only supported on Windows",
         ))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod projfs_callback_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    #[derive(Debug, Clone)]
+    struct RecordedDirEntry {
+        name: String,
+        is_directory: u8,
+        file_size: i64,
+        file_attributes: u32,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedPlaceholder {
+        dest_rel_path: String,
+        is_directory: u8,
+        file_size: i64,
+        file_attributes: u32,
+        provider_id: [u8; 128],
+        content_id: [u8; 128],
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedFileData {
+        stream_id: PrjGuid,
+        byte_offset: u64,
+        bytes: Vec<u8>,
+    }
+
+    #[derive(Default)]
+    struct MockProjFsRecorder {
+        fill_capacity: usize,
+        filled_entries: Vec<RecordedDirEntry>,
+        placeholders: Vec<RecordedPlaceholder>,
+        allocations: HashMap<usize, Vec<u8>>,
+        alloc_count: usize,
+        freed_count: usize,
+        written_data: Vec<RecordedFileData>,
+        stop_calls: usize,
+    }
+
+    thread_local! {
+        static MOCK_RECORDER: RefCell<MockProjFsRecorder> = RefCell::new(MockProjFsRecorder::default());
+    }
+
+    fn reset_mock_recorder(fill_capacity: usize) {
+        MOCK_RECORDER.with(|cell| {
+            let mut rec = cell.borrow_mut();
+            *rec = MockProjFsRecorder {
+                fill_capacity,
+                ..MockProjFsRecorder::default()
+            };
+        });
+    }
+
+    unsafe extern "system" fn mock_compare_fn(a: *const u16, b: *const u16) -> i32 {
+        let sa = unsafe { wide_ptr_to_string(a) }
+            .unwrap_or_default()
+            .to_lowercase();
+        let sb = unsafe { wide_ptr_to_string(b) }
+            .unwrap_or_default()
+            .to_lowercase();
+        match sa.cmp(&sb) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
+
+    fn wildcard_match(pattern: &[char], text: &[char]) -> bool {
+        if pattern.is_empty() {
+            return text.is_empty();
+        }
+        if pattern[0] == '*' {
+            return wildcard_match(&pattern[1..], text)
+                || (!text.is_empty() && wildcard_match(pattern, &text[1..]));
+        }
+        if !text.is_empty() && (pattern[0] == '?' || pattern[0] == text[0]) {
+            return wildcard_match(&pattern[1..], &text[1..]);
+        }
+        false
+    }
+
+    unsafe extern "system" fn mock_match_fn(name: *const u16, expr: *const u16) -> u8 {
+        let n_chars: Vec<char> = unsafe { wide_ptr_to_string(name) }
+            .unwrap_or_default()
+            .to_lowercase()
+            .chars()
+            .collect();
+        let e_chars: Vec<char> = unsafe { wide_ptr_to_string(expr) }
+            .unwrap_or_default()
+            .to_lowercase()
+            .chars()
+            .collect();
+        if wildcard_match(&e_chars, &n_chars) {
+            1
+        } else {
+            0
+        }
+    }
+
+    unsafe extern "system" fn mock_fill_dir_fn(
+        file_name: *const u16,
+        basic_info: *const PrjFileBasicInfo,
+        _dir_entry_buffer_handle: isize,
+    ) -> i32 {
+        let Some(name) = (unsafe { wide_ptr_to_string(file_name) }) else {
+            return PRJ_E_INVALIDARG;
+        };
+        if basic_info.is_null() {
+            return PRJ_E_INVALIDARG;
+        }
+        let info = unsafe { *basic_info };
+        MOCK_RECORDER.with(|cell| {
+            let mut rec = cell.borrow_mut();
+            if rec.fill_capacity == 0 {
+                return PRJ_HRESULT_ERROR_INSUFFICIENT_BUFFER;
+            }
+            rec.fill_capacity -= 1;
+            rec.filled_entries.push(RecordedDirEntry {
+                name,
+                is_directory: info.is_directory,
+                file_size: info.file_size,
+                file_attributes: info.file_attributes,
+            });
+            PRJ_S_OK
+        })
+    }
+
+    unsafe extern "system" fn mock_write_placeholder_fn(
+        _ns_ctx: isize,
+        dest_file_name: *const u16,
+        placeholder_info: *const PrjPlaceholderInfo,
+        size: u32,
+    ) -> i32 {
+        if dest_file_name.is_null()
+            || placeholder_info.is_null()
+            || (size as usize) < core::mem::size_of::<PrjPlaceholderInfo>()
+        {
+            return PRJ_E_INVALIDARG;
+        }
+        let dest_rel_path = unsafe { wide_ptr_to_string(dest_file_name) }.unwrap_or_default();
+        let info = unsafe { *placeholder_info };
+        MOCK_RECORDER.with(|cell| {
+            cell.borrow_mut().placeholders.push(RecordedPlaceholder {
+                dest_rel_path,
+                is_directory: info.file_basic_info.is_directory,
+                file_size: info.file_basic_info.file_size,
+                file_attributes: info.file_basic_info.file_attributes,
+                provider_id: info.provider_id,
+                content_id: info.content_id,
+            });
+        });
+        PRJ_S_OK
+    }
+
+    unsafe extern "system" fn mock_alloc_buf_fn(_ns_ctx: isize, size: usize) -> *mut u8 {
+        let mut buf = vec![0u8; size.max(1)];
+        let ptr = buf.as_mut_ptr();
+        MOCK_RECORDER.with(|cell| {
+            let mut rec = cell.borrow_mut();
+            rec.alloc_count += 1;
+            rec.allocations.insert(ptr as usize, buf);
+        });
+        ptr
+    }
+
+    unsafe extern "system" fn mock_free_buf_fn(ptr: *mut u8) {
+        MOCK_RECORDER.with(|cell| {
+            let mut rec = cell.borrow_mut();
+            if rec.allocations.remove(&(ptr as usize)).is_some() {
+                rec.freed_count += 1;
+            }
+        });
+    }
+
+    unsafe extern "system" fn mock_write_data_fn(
+        _ns_ctx: isize,
+        stream_id: *const PrjGuid,
+        buf: *const u8,
+        byte_offset: u64,
+        length: u32,
+    ) -> i32 {
+        if stream_id.is_null() || buf.is_null() {
+            return PRJ_E_INVALIDARG;
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(buf, length as usize) }.to_vec();
+        let sid = unsafe { *stream_id };
+        MOCK_RECORDER.with(|cell| {
+            cell.borrow_mut().written_data.push(RecordedFileData {
+                stream_id: sid,
+                byte_offset,
+                bytes,
+            });
+        });
+        PRJ_S_OK
+    }
+
+    unsafe extern "system" fn mock_stop_fn(_ns_ctx: isize) {
+        MOCK_RECORDER.with(|cell| {
+            cell.borrow_mut().stop_calls += 1;
+        });
+    }
+
+    struct MockProjFsBackend {
+        entries: Vec<ProjFsProjectedEntry>,
+        payloads: HashMap<String, Vec<u8>>,
+    }
+
+    impl ProjFsVirtualizerBackend for MockProjFsBackend {
+        fn list_entries(&self) -> Vec<ProjFsProjectedEntry> {
+            self.entries.clone()
+        }
+
+        fn read_verified_range(
+            &self,
+            relative_path: &Path,
+            byte_offset: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, String> {
+            let key = relative_path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_lowercase();
+            let payload = self
+                .payloads
+                .get(&key)
+                .ok_or_else(|| format!("missing or tampered entry: {key}"))?;
+            let start =
+                usize::try_from(byte_offset).map_err(|_| "byte_offset overflow".to_string())?;
+            if start > payload.len() {
+                return Err("byte_offset out of range".to_string());
+            }
+            let end = start.saturating_add(length).min(payload.len());
+            Ok(payload[start..end].to_vec())
+        }
+    }
+
+    fn make_test_state() -> Box<ProjFsInstanceState> {
+        let mut payloads = HashMap::new();
+        let alpha_bytes = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_vec();
+        let zebra_bytes = b"ZEBRA_VERIFIED_CONTENT".to_vec();
+        let root_bytes = b"ROOT_BIN_BYTES".to_vec();
+        payloads.insert("docs/alpha.txt".to_string(), alpha_bytes.clone());
+        payloads.insert("docs/zebra.txt".to_string(), zebra_bytes.clone());
+        payloads.insert("root.bin".to_string(), root_bytes.clone());
+        // Note: "docs/tampered.txt" is listed in entries but omitted from payloads to simulate AEAD/SHA256 verification failure.
+
+        let entries = vec![
+            ProjFsProjectedEntry {
+                relative_path: PathBuf::from("root.bin"),
+                is_directory: false,
+                file_size: root_bytes.len() as u64,
+                content_sha256: [0x11u8; 32],
+            },
+            ProjFsProjectedEntry {
+                relative_path: PathBuf::from("docs"),
+                is_directory: true,
+                file_size: 0,
+                content_sha256: [0u8; 32],
+            },
+            ProjFsProjectedEntry {
+                relative_path: PathBuf::from("docs/zebra.txt"),
+                is_directory: false,
+                file_size: zebra_bytes.len() as u64,
+                content_sha256: [0x22u8; 32],
+            },
+            ProjFsProjectedEntry {
+                relative_path: PathBuf::from("docs/sub"),
+                is_directory: true,
+                file_size: 0,
+                content_sha256: [0u8; 32],
+            },
+            ProjFsProjectedEntry {
+                relative_path: PathBuf::from("docs/alpha.txt"),
+                is_directory: false,
+                file_size: alpha_bytes.len() as u64,
+                content_sha256: [0x33u8; 32],
+            },
+            ProjFsProjectedEntry {
+                relative_path: PathBuf::from("docs/tampered.txt"),
+                is_directory: false,
+                file_size: 64,
+                content_sha256: [0x44u8; 32],
+            },
+        ];
+
+        Box::new(ProjFsInstanceState {
+            callbacks: PrjCallbacks {
+                start_directory_enumeration_cb: prj_start_dir_enum_cb,
+                end_directory_enumeration_cb: prj_end_dir_enum_cb,
+                get_directory_enumeration_cb: prj_get_dir_enum_cb,
+                get_placeholder_info_cb: prj_get_placeholder_info_cb,
+                get_file_data_cb: prj_get_file_data_cb,
+                query_file_name_cb: 0,
+                notification_cb: 0,
+                cancel_command_cb: 0,
+            },
+            backend: Box::new(MockProjFsBackend { entries, payloads }),
+            dir_enums: std::sync::Mutex::new(HashMap::new()),
+            fill_dir_fn: mock_fill_dir_fn,
+            write_placeholder_fn: mock_write_placeholder_fn,
+            alloc_buf_fn: mock_alloc_buf_fn,
+            free_buf_fn: mock_free_buf_fn,
+            write_data_fn: mock_write_data_fn,
+            compare_fn: mock_compare_fn,
+            match_fn: mock_match_fn,
+            stop_fn: mock_stop_fn,
+        })
+    }
+
+    fn make_cb_data(
+        state: &ProjFsInstanceState,
+        flags: u32,
+        rel_path_wide: &[u16],
+        stream_id: PrjGuid,
+    ) -> PrjCallbackData {
+        PrjCallbackData {
+            size: core::mem::size_of::<PrjCallbackData>() as u32,
+            flags,
+            namespace_virtualization_context: 0x1234,
+            command_id: 7,
+            file_id: PrjGuid {
+                data1: 1,
+                data2: 2,
+                data3: 3,
+                data4: [4; 8],
+            },
+            data_stream_id: stream_id,
+            file_path_name: rel_path_wide.as_ptr(),
+            version_info: core::ptr::null(),
+            triggering_process_id: 42,
+            triggering_process_image_file_name: core::ptr::null(),
+            instance_context: (state as *const ProjFsInstanceState as *mut ProjFsInstanceState)
+                .cast::<core::ffi::c_void>(),
+        }
+    }
+
+    #[test]
+    fn projfs_abi_sizes_and_full_callback_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(core::mem::size_of::<PrjGuid>(), 16);
+        assert_eq!(core::mem::size_of::<PrjFileBasicInfo>(), 56);
+        assert_eq!(core::mem::size_of::<PrjPlaceholderInfo>(), 344);
+
+        let state = make_test_state();
+        let dummy_stream = PrjGuid {
+            data1: 0xAABB_CCDD,
+            data2: 0x1122,
+            data3: 0x3344,
+            data4: [0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC],
+        };
+        let enum_id = PrjGuid {
+            data1: 0x0000_0001,
+            data2: 0x0002,
+            data3: 0x0003,
+            data4: [0x0A; 8],
+        };
+
+        // 1. Root enumeration (`""`) returns sorted immediate children (`docs`, `root.bin`)
+        reset_mock_recorder(16);
+        let root_wide: Vec<u16> = "".encode_utf16().chain(Some(0)).collect();
+        let cb_root = make_cb_data(&state, 0, &root_wide, dummy_stream);
+        assert_eq!(
+            unsafe { prj_start_dir_enum_cb(&cb_root, &enum_id) },
+            PRJ_S_OK
+        );
+        assert_eq!(
+            unsafe { prj_get_dir_enum_cb(&cb_root, &enum_id, core::ptr::null(), 1) },
+            PRJ_S_OK
+        );
+        MOCK_RECORDER.with(|cell| -> Result<(), Box<dyn std::error::Error>> {
+            let rec = cell.borrow();
+            assert_eq!(rec.filled_entries.len(), 2);
+            assert_eq!(rec.filled_entries[0].name, "docs");
+            assert_eq!(rec.filled_entries[0].is_directory, 1);
+            assert_eq!(rec.filled_entries[0].file_attributes, 0x10);
+            assert_eq!(rec.filled_entries[1].name, "root.bin");
+            assert_eq!(rec.filled_entries[1].is_directory, 0);
+            assert_eq!(rec.filled_entries[1].file_attributes, 0x01);
+            assert_eq!(rec.filled_entries[1].file_size, 14);
+            Ok(())
+        })?;
+        assert_eq!(unsafe { prj_end_dir_enum_cb(&cb_root, &enum_id) }, PRJ_S_OK);
+
+        // 2. Subdir enumeration (`"DOCS"` case-insensitive) with wildcard `"*.txt"`,
+        //    0-slot `ERROR_INSUFFICIENT_BUFFER`, 1-slot resume, and `RESTART_SCAN`.
+        let docs_wide: Vec<u16> = "DOCS".encode_utf16().chain(Some(0)).collect();
+        let expr_txt: Vec<u16> = "*.txt".encode_utf16().chain(Some(0)).collect();
+        let cb_docs = make_cb_data(&state, 0, &docs_wide, dummy_stream);
+        assert_eq!(
+            unsafe { prj_start_dir_enum_cb(&cb_docs, &enum_id) },
+            PRJ_S_OK
+        );
+
+        // 0-capacity buffer on first entry -> ERROR_INSUFFICIENT_BUFFER without advancing cursor
+        reset_mock_recorder(0);
+        assert_eq!(
+            unsafe { prj_get_dir_enum_cb(&cb_docs, &enum_id, expr_txt.as_ptr(), 1) },
+            PRJ_HRESULT_ERROR_INSUFFICIENT_BUFFER
+        );
+
+        // 1-capacity buffer -> adds first entry (`alpha.txt`) and hits insufficient buffer -> returns S_OK
+        reset_mock_recorder(1);
+        assert_eq!(
+            unsafe { prj_get_dir_enum_cb(&cb_docs, &enum_id, core::ptr::null(), 1) },
+            PRJ_S_OK
+        );
+        MOCK_RECORDER.with(|cell| {
+            let rec = cell.borrow();
+            assert_eq!(rec.filled_entries.len(), 1);
+            assert_eq!(rec.filled_entries[0].name, "alpha.txt");
+        });
+
+        // Resume with larger buffer -> gets remaining `tampered.txt` and `zebra.txt` in sorted order
+        reset_mock_recorder(10);
+        assert_eq!(
+            unsafe { prj_get_dir_enum_cb(&cb_docs, &enum_id, core::ptr::null(), 1) },
+            PRJ_S_OK
+        );
+        MOCK_RECORDER.with(|cell| {
+            let rec = cell.borrow();
+            assert_eq!(rec.filled_entries.len(), 2);
+            assert_eq!(rec.filled_entries[0].name, "tampered.txt");
+            assert_eq!(rec.filled_entries[1].name, "zebra.txt");
+        });
+
+        // RESTART_SCAN with `*` resets cursor to 0 and includes `sub` directory too
+        reset_mock_recorder(10);
+        let star_wide: Vec<u16> = "*".encode_utf16().chain(Some(0)).collect();
+        let cb_docs_restart = make_cb_data(
+            &state,
+            PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
+            &docs_wide,
+            dummy_stream,
+        );
+        assert_eq!(
+            unsafe { prj_get_dir_enum_cb(&cb_docs_restart, &enum_id, star_wide.as_ptr(), 1) },
+            PRJ_S_OK
+        );
+        MOCK_RECORDER.with(|cell| {
+            let names: Vec<String> = cell
+                .borrow()
+                .filled_entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect();
+            assert_eq!(names, vec!["alpha.txt", "sub", "tampered.txt", "zebra.txt"]);
+        });
+        assert_eq!(unsafe { prj_end_dir_enum_cb(&cb_docs, &enum_id) }, PRJ_S_OK);
+        // Ended enumeration ID must fail closed
+        assert_eq!(
+            unsafe { prj_get_dir_enum_cb(&cb_docs, &enum_id, core::ptr::null(), 1) },
+            PRJ_E_INVALIDARG
+        );
+
+        // 3. `prj_get_placeholder_info_cb`: existing file + missing file
+        reset_mock_recorder(10);
+        let alpha_req_wide: Vec<u16> = "DOCS/alpha.txt".encode_utf16().chain(Some(0)).collect();
+        let cb_alpha = make_cb_data(&state, 0, &alpha_req_wide, dummy_stream);
+        assert_eq!(unsafe { prj_get_placeholder_info_cb(&cb_alpha) }, PRJ_S_OK);
+        MOCK_RECORDER.with(|cell| -> Result<(), Box<dyn std::error::Error>> {
+            let rec = cell.borrow();
+            assert_eq!(rec.placeholders.len(), 1);
+            let ph = &rec.placeholders[0];
+            assert_eq!(ph.dest_rel_path, r"docs\alpha.txt");
+            assert_eq!(ph.is_directory, 0);
+            assert_eq!(ph.file_size, 36);
+            assert_eq!(ph.file_attributes, 0x01);
+            assert_eq!(&ph.provider_id[..16], b"OMNISENTINEL_V2\0");
+            assert_eq!(ph.content_id[..32], [0x33u8; 32]);
+            Ok(())
+        })?;
+
+        let missing_wide: Vec<u16> = r"docs\missing.exe".encode_utf16().chain(Some(0)).collect();
+        let cb_missing = make_cb_data(&state, 0, &missing_wide, dummy_stream);
+        assert_eq!(
+            unsafe { prj_get_placeholder_info_cb(&cb_missing) },
+            PRJ_HRESULT_ERROR_FILE_NOT_FOUND
+        );
+
+        // 4. `prj_get_file_data_cb`: exact non-zero slice at non-zero byte_offset with cb.data_stream_id,
+        //    length=0 fast path, and ERROR_ACCESS_DENIED on missing/tampered file
+        reset_mock_recorder(10);
+        let cb_alpha_data = make_cb_data(&state, 0, &alpha_req_wide, dummy_stream);
+        assert_eq!(
+            unsafe { prj_get_file_data_cb(&cb_alpha_data, 10, 8) },
+            PRJ_S_OK
+        );
+        assert_eq!(
+            unsafe { prj_get_file_data_cb(&cb_alpha_data, 0, 0) },
+            PRJ_S_OK
+        );
+        MOCK_RECORDER.with(|cell| -> Result<(), Box<dyn std::error::Error>> {
+            let rec = cell.borrow();
+            assert_eq!(rec.written_data.len(), 1);
+            assert_eq!(rec.written_data[0].stream_id, dummy_stream);
+            assert_eq!(rec.written_data[0].byte_offset, 10);
+            assert_eq!(rec.written_data[0].bytes, b"ABCDEFGH");
+            assert_eq!(rec.alloc_count, 1);
+            assert_eq!(rec.freed_count, 1);
+            assert!(rec.allocations.is_empty());
+            Ok(())
+        })?;
+
+        let tampered_wide: Vec<u16> = r"docs\tampered.txt".encode_utf16().chain(Some(0)).collect();
+        let cb_tampered = make_cb_data(&state, 0, &tampered_wide, dummy_stream);
+        assert_eq!(
+            unsafe { prj_get_file_data_cb(&cb_tampered, 0, 16) },
+            PRJ_HRESULT_ERROR_ACCESS_DENIED
+        );
+        assert_eq!(
+            unsafe { prj_get_file_data_cb(&cb_missing, 0, 16) },
+            PRJ_HRESULT_ERROR_ACCESS_DENIED
+        );
+
+        // Request at exact EOF offset (36) with non-zero length (8) must fail closed without invoking PrjWriteFileData(length=0)
+        reset_mock_recorder(10);
+        assert_eq!(
+            unsafe { prj_get_file_data_cb(&cb_alpha_data, 36, 8) },
+            PRJ_HRESULT_ERROR_ACCESS_DENIED
+        );
+        MOCK_RECORDER.with(|cell| {
+            let rec = cell.borrow();
+            assert_eq!(rec.alloc_count, 0);
+            assert!(rec.written_data.is_empty());
+        });
+
+        // Verify Win32FindDataW ABI size and is_projfs_reparse_point false-positive rejection on standard paths
+        assert_eq!(core::mem::size_of::<Win32FindDataW>(), 592);
+        let tmp_dir = std::env::temp_dir().join(format!("projfs_tag_probe_{}", std::process::id()));
+        fs::create_dir_all(&tmp_dir)?;
+        let regular_file = tmp_dir.join("regular.txt");
+        fs::write(&regular_file, b"ok")?;
+        assert!(!is_projfs_reparse_point(&tmp_dir));
+        assert!(!is_projfs_reparse_point(&regular_file));
+        assert!(!is_projfs_reparse_point(
+            &tmp_dir.join("does_not_exist.txt")
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        Ok(())
     }
 }

@@ -12,7 +12,7 @@
 //!    - Cryptographic entropy check: no repeat tokens across 100 generations
 //! 3. Zero-leakage verification:
 //!    - Verifies neither state file nor serialized JSON ever contains plaintext tokens
-//! 4. Zero `thread_rng` check across all production crates.
+//! 4. Exclusive kernel `OsRng` CSPRNG enforcement across all production crates.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;

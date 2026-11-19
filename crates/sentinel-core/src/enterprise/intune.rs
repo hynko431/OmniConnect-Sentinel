@@ -10,12 +10,13 @@ use sentinel_sys::{
     read_registry_string, sign_ecdsa_p256_with_private_blob, verify_ecdsa_p256_digest,
 };
 
-use crate::enterprise::ledger::AuditLedger;
+use crate::enterprise::ledger::{AuditLedger, AuditSubsystem, SharedAuditLedger};
 use crate::error::{DegradationEvent, SentinelError};
 
 const SENTINEL_POLICY_REG_SUBKEY: &str = r"SOFTWARE\Policies\OmniConnect\Sentinel";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct IntuneMdmPolicy {
     pub policy_id: String,
     pub version: u32,
@@ -61,32 +62,38 @@ impl IntuneMdmPolicy {
     }
 }
 
-/// Deterministically generates the two pinned enterprise root public keys (Primary & DR Backup).
+/// Offline HSM/PKI-provisioned Primary Enterprise Root Policy CA ECDSA P-256 public key
+/// (`BCRYPT_ECCPUBLIC_BLOB` `ECS1`, 72 bytes). Corresponding private key is air-gapped;
+/// NO private key material or derivation seed exists in this binary (`CEA-DEFECT-01`).
+const PRIMARY_ENTERPRISE_ROOT_CA_PUBKEY_ECS1: [u8; 72] = [
+    0x45, 0x43, 0x53, 0x31, 0x20, 0x00, 0x00, 0x00, 0x56, 0x95, 0x82, 0x84, 0x9C, 0x7E, 0x95, 0x59,
+    0x40, 0x5D, 0x9B, 0x69, 0xBA, 0xB3, 0xD3, 0xE2, 0x0D, 0xD9, 0xC6, 0x00, 0xAA, 0xDF, 0xA0, 0x7B,
+    0x24, 0xC2, 0xAD, 0xF9, 0x73, 0xB8, 0xDA, 0x41, 0x59, 0x3A, 0xAB, 0xD1, 0x0D, 0xC5, 0xA1, 0x16,
+    0x35, 0x4A, 0x71, 0xB9, 0x75, 0x45, 0xD7, 0x9C, 0x49, 0xD4, 0x1A, 0xFE, 0x6C, 0xD9, 0xA1, 0x95,
+    0xCF, 0x96, 0x44, 0x62, 0x2E, 0xB9, 0xFD, 0x89,
+];
+
+/// Offline HSM/PKI-provisioned DR Backup Enterprise Root Policy CA ECDSA P-256 public key
+/// (`BCRYPT_ECCPUBLIC_BLOB` `ECS1`, 72 bytes). Corresponding private key is held offline in DR HSM;
+/// NO private key material or derivation seed exists in this binary (`CEA-DEFECT-01`).
+const BACKUP_DR_ENTERPRISE_ROOT_CA_PUBKEY_ECS1: [u8; 72] = [
+    0x45, 0x43, 0x53, 0x31, 0x20, 0x00, 0x00, 0x00, 0x5E, 0x31, 0xA4, 0xEF, 0x58, 0x25, 0x58, 0xFC,
+    0x3A, 0xC2, 0x6E, 0x41, 0x04, 0x52, 0xB5, 0x7D, 0xEB, 0xE2, 0x0A, 0xA0, 0x39, 0x02, 0xE6, 0x7C,
+    0x78, 0xF6, 0x45, 0xC8, 0x4D, 0x7B, 0x23, 0x40, 0x3F, 0x18, 0x1A, 0x20, 0xD9, 0xC4, 0xD6, 0x7A,
+    0x23, 0xEB, 0x1D, 0x97, 0x50, 0xBD, 0xEA, 0x5A, 0xAB, 0x60, 0xFC, 0xC4, 0x57, 0x62, 0x0E, 0x26,
+    0x44, 0x00, 0x6F, 0x06, 0xD9, 0x75, 0xF4, 0x13,
+];
+
+/// Returns the two pinned offline-provisioned enterprise root public keys (Primary & DR Backup).
+///
+/// Only ECDSA P-256 `ECS1` public keys are embedded in production binaries; signing keys remain
+/// exclusively offline / in enterprise HSMs. Use `.with_pinned_root_public_keys(...)` in tests or
+/// custom PKI deployments.
 pub fn default_enterprise_root_public_keys() -> Vec<Vec<u8>> {
-    let seed1: [u8; 32] =
-        Sha256::digest(b"OMNICONNECT-ENTERPRISE-ROOT-POLICY-CA-PRIMARY-V2").into();
-    let seed2: [u8; 32] =
-        Sha256::digest(b"OMNICONNECT-ENTERPRISE-ROOT-POLICY-CA-BACKUP-DR-V2").into();
-    let pub1 = sentinel_sys::generate_ecdsa_p256_keypair_from_seed(&seed1)
-        .map(|(pk, _)| pk)
-        .unwrap_or_default();
-    let pub2 = sentinel_sys::generate_ecdsa_p256_keypair_from_seed(&seed2)
-        .map(|(pk, _)| pk)
-        .unwrap_or_default();
-    vec![pub1, pub2]
-}
-
-/// Generates the Primary enterprise root signing keypair.
-pub fn primary_enterprise_root_keypair() -> (Vec<u8>, Vec<u8>) {
-    let seed: [u8; 32] = Sha256::digest(b"OMNICONNECT-ENTERPRISE-ROOT-POLICY-CA-PRIMARY-V2").into();
-    sentinel_sys::generate_ecdsa_p256_keypair_from_seed(&seed).unwrap_or_default()
-}
-
-/// Generates the Backup DR enterprise root signing keypair.
-pub fn backup_enterprise_root_keypair() -> (Vec<u8>, Vec<u8>) {
-    let seed: [u8; 32] =
-        Sha256::digest(b"OMNICONNECT-ENTERPRISE-ROOT-POLICY-CA-BACKUP-DR-V2").into();
-    sentinel_sys::generate_ecdsa_p256_keypair_from_seed(&seed).unwrap_or_default()
+    vec![
+        PRIMARY_ENTERPRISE_ROOT_CA_PUBKEY_ECS1.to_vec(),
+        BACKUP_DR_ENTERPRISE_ROOT_CA_PUBKEY_ECS1.to_vec(),
+    ]
 }
 
 /// Cryptographically Signed Policy Bundle (`Rows 186, 198`, Master Plan v2 §4.4 & §5.1)
@@ -94,6 +101,7 @@ pub fn backup_enterprise_root_keypair() -> (Vec<u8>, Vec<u8>) {
 /// Signs the canonical policy fields with an asymmetric ECDSA P-256 keypair and enforces
 /// monotonic versioning (`new_version > current_version`) to block policy downgrade attacks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SignedPolicyBundle {
     pub policy: IntuneMdmPolicy,
     pub signature_hex: String,
@@ -162,6 +170,7 @@ pub struct IntunePolicyManager {
     vault_dir: PathBuf,
     pinned_root_public_keys: Vec<Vec<u8>>,
     last_degradation_event: Option<DegradationEvent>,
+    shared_ledger: Option<SharedAuditLedger>,
 }
 
 impl Default for IntunePolicyManager {
@@ -178,6 +187,7 @@ impl IntunePolicyManager {
             vault_dir: PathBuf::from(".sentinel_vault"),
             pinned_root_public_keys: default_enterprise_root_public_keys(),
             last_degradation_event: None,
+            shared_ledger: None,
         }
     }
 
@@ -188,7 +198,13 @@ impl IntunePolicyManager {
             vault_dir: PathBuf::from(".sentinel_vault"),
             pinned_root_public_keys: default_enterprise_root_public_keys(),
             last_degradation_event: None,
+            shared_ledger: None,
         }
+    }
+
+    pub fn with_shared_ledger(mut self, shared_ledger: SharedAuditLedger) -> Self {
+        self.shared_ledger = Some(shared_ledger);
+        self
     }
 
     pub fn with_ledger_path(mut self, ledger_path: PathBuf) -> Self {
@@ -544,6 +560,13 @@ impl IntunePolicyManager {
         event_type: &str,
         details: serde_json::Value,
     ) -> Result<(), String> {
+        if let Some(shared) = &self.shared_ledger {
+            if let Ok(mut guard) = shared.lock() {
+                return guard
+                    .append_subsystem_event(AuditSubsystem::Intune, event_type, details)
+                    .map(|_| ());
+            }
+        }
         let mut ledger = AuditLedger::open(&self.ledger_path);
         ledger.append_event(event_type, details).map(|_| ())
     }
@@ -652,36 +675,94 @@ impl IntunePolicyManager {
 }
 
 fn default_policy_ledger_path() -> PathBuf {
+    const POLICY_LEDGER_NAME: &str = "policy_audit_ledger_v2.jsonl";
     #[cfg(windows)]
     {
-        let pd = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
-        let dir = PathBuf::from(pd).join("OmniConnect").join("Sentinel");
-        if sentinel_sys::create_restricted_dir_atomic(&dir).is_ok() {
-            return dir.join("policy_audit_ledger_v2.jsonl");
+        if let Ok(pd) = std::env::var("ProgramData") {
+            let dir = PathBuf::from(pd).join("OmniConnect").join("Sentinel");
+            if crate::enterprise::ledger::is_restricted_ledger_dir_writable(
+                &dir,
+                POLICY_LEDGER_NAME,
+            ) {
+                return dir.join(POLICY_LEDGER_NAME);
+            }
+        }
+        if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+            let dir = PathBuf::from(lad).join("OmniConnect").join("Sentinel");
+            if crate::enterprise::ledger::is_restricted_ledger_dir_writable(
+                &dir,
+                POLICY_LEDGER_NAME,
+            ) {
+                return dir.join(POLICY_LEDGER_NAME);
+            }
         }
     }
     #[cfg(not(windows))]
     {
         let dir = PathBuf::from("/var/lib/omniconnect/sentinel");
-        if sentinel_sys::create_restricted_dir_atomic(&dir).is_ok() {
-            return dir.join("policy_audit_ledger_v2.jsonl");
+        if crate::enterprise::ledger::is_restricted_ledger_dir_writable(&dir, POLICY_LEDGER_NAME) {
+            return dir.join(POLICY_LEDGER_NAME);
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let dir = PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("omniconnect")
+                .join("sentinel");
+            if crate::enterprise::ledger::is_restricted_ledger_dir_writable(
+                &dir,
+                POLICY_LEDGER_NAME,
+            ) {
+                return dir.join(POLICY_LEDGER_NAME);
+            }
         }
     }
     #[cfg(test)]
     {
         std::env::temp_dir()
             .join("omniconnect_sentinel_policy")
-            .join("policy_audit_ledger_v2.jsonl")
+            .join(POLICY_LEDGER_NAME)
     }
     #[cfg(not(test))]
     {
-        #[cfg(windows)]
-        {
-            PathBuf::from(r"C:\ProgramData\OmniConnect\Sentinel\policy_audit_ledger_v2.jsonl")
+        crate::enterprise::ledger::default_unified_ledger_path()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_roots_are_valid_distinct_p256_ecs1_public_keys_without_seeds(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let roots = default_enterprise_root_public_keys();
+        assert_eq!(roots.len(), 2);
+        assert_ne!(roots[0], roots[1]);
+
+        for root in &roots {
+            assert_eq!(root.len(), 72);
+            assert_eq!(&root[0..8], b"ECS1\x20\x00\x00\x00");
+            let mut sec1 = Vec::with_capacity(65);
+            sec1.push(0x04);
+            sec1.extend_from_slice(&root[8..72]);
+            sentinel_sys::validate_p256_uncompressed_point(&sec1)?;
         }
-        #[cfg(not(windows))]
-        {
-            PathBuf::from("/var/lib/omniconnect/sentinel/policy_audit_ledger_v2.jsonl")
-        }
+        Ok(())
+    }
+
+    #[test]
+    fn policy_and_bundle_deny_unknown_json_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let default_json = serde_json::to_value(IntuneMdmPolicy::default())?;
+        let mut smuggled = default_json;
+        smuggled["extra_bypass_flag"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<IntuneMdmPolicy>(smuggled).is_err());
+
+        let (pub_k, priv_k) = sentinel_sys::generate_raw_ecdsa_p256_keypair()?;
+        let bundle = SignedPolicyBundle::sign(IntuneMdmPolicy::default(), &priv_k, &pub_k)?;
+        let mut bundle_val = serde_json::to_value(bundle)?;
+        bundle_val["smuggled_field"] = serde_json::json!("evil");
+        assert!(serde_json::from_value::<SignedPolicyBundle>(bundle_val).is_err());
+        Ok(())
     }
 }

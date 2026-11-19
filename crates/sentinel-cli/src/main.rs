@@ -27,8 +27,11 @@ use sentinel_cdr::policy::SanitizationPolicy;
 use sentinel_cdr::worker::{WorkerLauncher, WorkerRequest};
 use sentinel_core::enterprise::falcon::{CrowdStrikeFalconBridge, FalconTelemetryEvent};
 use sentinel_core::enterprise::intune::{IntunePolicyManager, SignedPolicyBundle};
-use sentinel_core::enterprise::kiosk::AirGappedKioskManager;
-use sentinel_core::enterprise::ledger::AuditLedger;
+use sentinel_core::enterprise::kiosk::{verify_kiosk_passport, AirGappedKioskManager};
+use sentinel_core::enterprise::ledger::{
+    default_unified_ledger_path, get_or_init_global_shared_ledger, tokenize_path_for_ledger,
+    AuditLedger, AuditSubsystem,
+};
 use sentinel_core::error::SentinelMetrics;
 use sentinel_core::interceptor::drive_watcher::DriveWatcher;
 use sentinel_core::interceptor::PendingDeviceConfirmationManager;
@@ -83,8 +86,8 @@ enum Commands {
         #[arg(short, long, default_value = "win11-whvp-microvm")]
         vm: String,
 
-        /// OpenSandbox endpoint
-        #[arg(short, long, default_value = "http://localhost:8080")]
+        /// OpenSandbox endpoint (`https://...` with mTLS or `offline://opensandbox.local`)
+        #[arg(short, long, default_value = "offline://opensandbox.local")]
         endpoint: String,
     },
     /// Scan an external drive or folder recursively for viruses, worms, and suspicious payloads
@@ -101,7 +104,7 @@ enum Commands {
         #[arg(short, long, default_value_t = false)]
         interactive: bool,
     },
-    /// Permanently shred a malicious file or carrier (NIST 800-88 Clear (logical))
+    /// Permanently shred a malicious file or carrier (NIST SP 800-88 Rev. 2 Clear)
     Shred {
         /// Target file path to permanently obliterate
         #[arg(short, long)]
@@ -137,17 +140,39 @@ enum Commands {
         #[arg(short, long)]
         export: Option<PathBuf>,
     },
-    /// Emit sample CrowdStrike Falcon FDR / CEF Syslog telemetry
+    /// Emit sample CrowdStrike Falcon FDR / CEF Syslog telemetry (RFC 5425 TLS 1.3 port 6514)
     Telemetry {
         /// Event type (e.g. DeviceArrival, ExploitBlocked, FileSanitized)
         #[arg(short, long, default_value = "DeviceArrival")]
         event: String,
+
+        /// RFC 5425 TLS 1.3 syslog endpoint (`host:6514` or `offline://...`; defaults to SENTINEL_SIEM_ENDPOINT or `offline://siem.omniconnect.local:6514`; port 514 prohibited)
+        #[arg(long)]
+        endpoint: Option<String>,
     },
-    /// Run an Air-Gapped Kiosk session with posture verification & NIST 800-88 Clear shredding
+    /// Run an Air-Gapped Kiosk session with posture verification, NIST SP 800-88 Rev. 2 shredding & signed CDR Passport
     Kiosk {
         /// Media serial number or identifier
         #[arg(short, long, default_value = "USB-MEDIA-SCADA-01")]
         media: String,
+
+        /// Optional sanitized export directory in which to emit signed .sentinel-passport.json
+        #[arg(long)]
+        export_dir: Option<PathBuf>,
+    },
+    /// Verify a detached ECDSA-P256 signed CDR Kiosk Passport (.sentinel-passport.json) and all sanitized files
+    VerifyPassport {
+        /// Optional positional path to sanitized export directory or .sentinel-passport.json
+        #[arg(value_name = "TARGET")]
+        target: Option<PathBuf>,
+
+        /// Path to sanitized export directory or .sentinel-passport.json manifest
+        #[arg(short = 'm', long = "manifest", alias = "path")]
+        manifest: Option<PathBuf>,
+
+        /// Optional pinned kiosk ECDSA P-256 public key file (hex, raw ECS1/SEC1, or PEM SPKI)
+        #[arg(long = "pub-key", alias = "public-key")]
+        pub_key: Option<PathBuf>,
     },
     /// Manage the AES-256-GCM Quarantine Vault (list, restore, migrate legacy entries)
     Vault {
@@ -182,6 +207,17 @@ enum Commands {
         /// Vault directory path
         #[arg(long, default_value = ".sentinel_vault")]
         vault_dir: PathBuf,
+    },
+    /// Verify offline SOC RSA-3072+ OAEP escrow recovery package (top-level alias for `vault verify-escrow`)
+    #[command(name = "vault-verify-escrow")]
+    VaultVerifyEscrow {
+        /// Vault directory path
+        #[arg(long, default_value = ".sentinel_vault")]
+        vault_dir: PathBuf,
+
+        /// Path to the offline SOC RSA private key
+        #[arg(long)]
+        soc_priv_key: PathBuf,
     },
 }
 
@@ -227,7 +263,7 @@ enum VaultAction {
         #[arg(long, default_value = ".sentinel_vault")]
         vault_dir: PathBuf,
     },
-    /// Verify offline SOC RSA-2048 OAEP escrow recovery package (vault_kek.escrow)
+    /// Verify offline SOC RSA-3072+ OAEP escrow recovery package (vault_kek.escrow)
     VerifyEscrow {
         /// Vault directory path
         #[arg(long, default_value = ".sentinel_vault")]
@@ -237,15 +273,35 @@ enum VaultAction {
         #[arg(long)]
         soc_priv_key: PathBuf,
     },
+    /// Provision Hybrid Post-Quantum OCESCROW3 (RSA-3072 + FIPS 203 ML-KEM-768) recovery envelope
+    ProvisionHybridEscrowV3 {
+        /// Vault directory path
+        #[arg(long, default_value = ".sentinel_vault")]
+        vault_dir: PathBuf,
+
+        /// Path to HybridSocPublicKeyBundle JSON file
+        #[arg(long)]
+        hybrid_pub_key: PathBuf,
+    },
+    /// Verify offline SOC Hybrid Post-Quantum OCESCROW3 (RSA-3072 + ML-KEM-768) recovery envelope
+    VerifyHybridEscrowV3 {
+        /// Vault directory path
+        #[arg(long, default_value = ".sentinel_vault")]
+        vault_dir: PathBuf,
+
+        /// Path to HybridSocPrivateKeyBundle JSON file
+        #[arg(long)]
+        hybrid_priv_key: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
 enum LedgerAction {
     /// Verify the cryptographic SHA-256 hash chain and ECDSA-P256 signed chain head of the audit ledger
     Verify {
-        /// Path to audit ledger JSONL file
-        #[arg(short, long, default_value = ".sentinel_vault/audit.jsonl")]
-        path: PathBuf,
+        /// Path to audit ledger JSONL file (defaults to unified system audit ledger)
+        #[arg(short, long)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -344,7 +400,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let launcher = WorkerLauncher::new();
             let inspection = launcher.inspect_isolated(&bytes, file_name)?;
-            let yara = Tier0YaraScanner::new();
+            let yara =
+                Tier0YaraScanner::new().with_shared_ledger(get_or_init_global_shared_ledger(None));
             let yara_res = yara.scan_bytes(&bytes, &path.to_string_lossy());
             let threats = UniversalScanner::scan_file_checked(&path)?;
 
@@ -443,7 +500,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             hasher.update(&bytes);
             let sha256_hex = hex::encode(hasher.finalize());
 
-            let client = Tier3SandboxConnector::new(endpoint, "LOCAL-KEY");
+            let trimmed_sand_ep = endpoint.trim();
+            let lower_sand_ep = trimmed_sand_ep.to_ascii_lowercase();
+            if !(lower_sand_ep.starts_with("https://") || lower_sand_ep.starts_with("offline://")) {
+                return Err(format!(
+                    "Rejected insecure sandbox endpoint '{trimmed_sand_ep}': https:// (mTLS) or offline:// is required"
+                )
+                .into());
+            }
+            let shared_ledger = get_or_init_global_shared_ledger(None);
+            let client = Tier3SandboxConnector::new(trimmed_sand_ep, "LOCAL-KEY")
+                .with_shared_ledger(shared_ledger);
             let req = SandboxDetonationRequest {
                 file_name: file_name.clone(),
                 sha256_hex: sha256_hex.clone(),
@@ -549,7 +616,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if interactive && !scan_report.threats.is_empty() {
                 println!("\n🚨 [INTERACTIVE REMEDIATION ENGAGED]");
                 // Instantiate QuarantineVault ONCE outside the remediation loop (`BUG-CORE-02`, Invariant I4)
-                let vault = QuarantineVault::open(PathBuf::from(".sentinel_vault"))?;
+                let shared_ledger = get_or_init_global_shared_ledger(None);
+                let vault = QuarantineVault::open(PathBuf::from(".sentinel_vault"))?
+                    .with_shared_ledger(shared_ledger);
                 println!(
                     "Prompting for remediation on {} discovered threat(s)...",
                     scan_report.threats.len()
@@ -572,15 +641,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("      OMNICONNECT SENTINEL: ANTI-FORENSIC SECURE SHREDDER  ");
             println!("===========================================================");
             println!("Target Path: {path:?}");
-            println!("Standard:    NIST 800-88 Clear (logical)");
+            println!("Standard:    NIST SP 800-88 Rev. 2 Clear (Logical Overwrite + TRIM)");
             println!(
                 "Overwrites:  {passes} Passes (0x00, 0xFF, CSPRNG + Read-Back Verification)\n"
             );
 
             let parent_dir = path.parent().map(|p| p.to_path_buf());
-            match SecureShredder::shred_file(&path, ShredMethod::ClearMultiPass { passes }) {
+            let shared_ledger = get_or_init_global_shared_ledger(None);
+            match SecureShredder::shred_file_with_shared_ledger(
+                &path,
+                ShredMethod::ClearMultiPass { passes },
+                Some(&shared_ledger),
+            ) {
                 Ok(receipt) => {
                     println!("⚡ [SHREDDING COMPLETE]");
+                    println!("   NIST Standard:        {}", receipt.nist_standard);
+                    println!("   Rev. 2 Category:      {:?}", receipt.rev2_category);
                     println!("   Sanitization Level:   {}", receipt.sanitization_level);
                     println!("   Media Type:           {}", receipt.media_type);
                     println!("   Original File Size:   {} bytes", receipt.file_size_bytes);
@@ -623,7 +699,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("Press Ctrl+C to terminate sentinel sentry.\n");
 
-            let vault = std::sync::Arc::new(QuarantineVault::new(PathBuf::from(".sentinel_vault")));
+            let shared_ledger = get_or_init_global_shared_ledger(None);
+            let vault = std::sync::Arc::new(
+                QuarantineVault::open(PathBuf::from(".sentinel_vault"))?
+                    .with_shared_ledger(shared_ledger),
+            );
             let mut watcher = DriveWatcher::new();
             watcher
                 .watch_loop(move |drive_root| {
@@ -657,7 +737,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             serve_dashboard_ui(port, demo).await?;
         }
         Commands::Intune { export } => {
-            let mut mgr = IntunePolicyManager::new();
+            let shared_ledger = get_or_init_global_shared_ledger(None);
+            let mut mgr = IntunePolicyManager::new().with_shared_ledger(shared_ledger);
             let policy = mgr.load_active_policy();
             println!("\n===========================================================");
             println!("       MICROSOFT INTUNE CUSTOM CSP POLICY PROFILE          ");
@@ -744,8 +825,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Telemetry { event } => {
-            let bridge = CrowdStrikeFalconBridge::new("127.0.0.1:514");
+        Commands::Telemetry { event, endpoint } => {
+            let resolved_ep =
+                endpoint.unwrap_or_else(sentinel_core::config::default_siem_syslog_endpoint);
+            let trimmed_ep = resolved_ep.trim();
+            if let Err(err) = CrowdStrikeFalconBridge::validate_syslog_endpoint(trimmed_ep) {
+                return Err(
+                    format!("Rejected insecure SIEM endpoint '{trimmed_ep}': {err}").into(),
+                );
+            }
+            let shared_ledger = get_or_init_global_shared_ledger(None);
+            let bridge = CrowdStrikeFalconBridge::new(trimmed_ep).with_shared_ledger(shared_ledger);
             let ev = FalconTelemetryEvent {
                 severity: 9,
                 signature_id: format!("SENTINEL-{}", event.to_uppercase()),
@@ -764,9 +854,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("     CROWDSTRIKE FALCON / SIEM CEF TELEMETRY STREAM        ");
             println!("===========================================================");
             println!("CEF v0 Payload:\n{}\n", bridge.format_cef_payload(&ev));
-            let _ = bridge.emit_alert(&ev);
+            bridge.emit_alert(&ev)?;
         }
-        Commands::Kiosk { media } => {
+        Commands::Kiosk { media, export_dir } => {
+            if !sentinel_core::enterprise::kiosk::is_valid_media_id(&media) {
+                return Err(format!(
+                    "Invalid media_id '{media}': must match ^[A-Za-z0-9_-]{{1,64}}$"
+                )
+                .into());
+            }
             let scratch = {
                 #[cfg(test)]
                 {
@@ -774,18 +870,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 #[cfg(not(test))]
                 {
-                    #[cfg(windows)]
-                    let p = PathBuf::from(r"C:\ProgramData\OmniConnect\KioskScratch");
-                    #[cfg(not(windows))]
-                    let p = PathBuf::from("/var/lib/omniconnect/kiosk_scratch");
-                    let _ = sentinel_sys::create_restricted_dir_atomic(&p);
-                    p
+                    resolve_restricted_runtime_dir("KioskScratch", ".sentinel_kiosk_scratch")
                 }
             };
+            let shared_ledger = get_or_init_global_shared_ledger(None);
             let mut kiosk = AirGappedKioskManager::from_terminal_id(
                 "KIOSK-TERMINAL-SCADA-01".to_string(),
                 scratch.clone(),
-            );
+            )
+            .with_shared_ledger(shared_ledger.clone());
 
             println!("\n===========================================================");
             println!("       AIR-GAPPED INDUSTRIAL KIOSK SESSION (IEC 62443)     ");
@@ -813,15 +906,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Ephemeral Session Workspace:    {session_dir:?}");
             println!("Status:                         Executing Offline YARA & Deep CDR disarm...");
 
+            if let Some(exp_dir) = export_dir {
+                let mut intune = IntunePolicyManager::new().with_shared_ledger(shared_ledger);
+                let pol = intune.load_active_policy();
+                let passport = kiosk.generate_passport_for_directory(
+                    &exp_dir,
+                    &media,
+                    &pol.policy_id,
+                    pol.version as u64,
+                    "DEEP_CDR_SANITIZED",
+                )?;
+                println!(
+                    "Signed CDR Passport Emitted:    {} ({} sanitized files)",
+                    passport.passport_id,
+                    passport.sanitized_files.len()
+                );
+            }
+
             let wiped_files = kiosk.end_session_and_shred()?;
             println!(
-                "NIST 800-88 Clear + Key Wipe:   COMPLETED ({wiped_files} session files shredded)"
+                "NIST SP 800-88 Rev. 2 Wipe:     COMPLETED ({wiped_files} session files shredded)"
             );
             println!("IEC 62443 Compliance State:     SL-3 ENFORCED\n");
         }
+        Commands::VerifyPassport {
+            target,
+            manifest,
+            pub_key,
+        } => {
+            let resolved_target = manifest.or(target).ok_or_else(|| {
+                "Must specify sanitized export directory or --manifest <path> for verify-passport"
+                    .to_string()
+            })?;
+            let trusted_pub = match pub_key {
+                Some(pk_path) => Some(fs::read(&pk_path).map_err(|e| {
+                    format!(
+                        "Failed reading trusted public key '{}': {e}",
+                        pk_path.display()
+                    )
+                })?),
+                None => None,
+            };
+            match verify_kiosk_passport(&resolved_target, trusted_pub.as_deref()) {
+                Ok(passport) => {
+                    println!("\n===========================================================");
+                    println!("       OMNICONNECT SENTINEL: CDR PASSPORT VERIFIED         ");
+                    println!("===========================================================");
+                    println!("Passport ID:       {}", passport.passport_id);
+                    println!("Kiosk Terminal:    {}", passport.kiosk_id);
+                    println!("Media ID:          {}", passport.media_id);
+                    println!(
+                        "Policy Binding:    {} (seq={})",
+                        passport.policy_id, passport.policy_sequence
+                    );
+                    println!(
+                        "NTP Clock Sync:    {} ({})",
+                        passport.ntp_sync.ntp_synchronized, passport.ntp_sync.clock_source
+                    );
+                    println!(
+                        "Verified Files:    {} file(s) intact (ECDSA-P256-SHA256 valid)",
+                        passport.sanitized_files.len()
+                    );
+                    println!(
+                        "✅ CDR Passport signature and all sanitized file SHA-256 hashes verified!"
+                    );
+                }
+                Err(err) => {
+                    eprintln!("❌ [CDR PASSPORT VERIFICATION FAILED]: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::VaultVerifyEscrow {
+            vault_dir,
+            soc_priv_key,
+        } => {
+            execute_verify_escrow(&vault_dir, &soc_priv_key)?;
+        }
         Commands::Vault { action } => match action {
             VaultAction::List { vault_dir } => {
-                let vault = QuarantineVault::open(vault_dir)?;
+                let shared_ledger = get_or_init_global_shared_ledger(None);
+                let vault = QuarantineVault::open(vault_dir)?.with_shared_ledger(shared_ledger);
                 let entries = vault.list()?;
                 println!("\n===========================================================");
                 println!("         OMNICONNECT SENTINEL: QUARANTINE VAULT            ");
@@ -848,13 +1013,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output,
                 vault_dir,
             } => {
-                let vault = QuarantineVault::open(vault_dir)?;
+                let shared_ledger = get_or_init_global_shared_ledger(None);
+                let vault = QuarantineVault::open(vault_dir)?.with_shared_ledger(shared_ledger);
                 let restored = vault.restore_file(&id, &output)?;
                 println!("✅ Restored quarantine entry '{id}' to {restored:?}");
             }
             VaultAction::Migrate { vault_dir, action } => {
                 use sentinel_core::scanner::quarantine::LegacyMigrationAction;
-                let vault = QuarantineVault::open(vault_dir)?;
+                let shared_ledger = get_or_init_global_shared_ledger(None);
+                let vault = QuarantineVault::open(vault_dir)?.with_shared_ledger(shared_ledger);
                 let migrate_action = if action.eq_ignore_ascii_case("delete") {
                     LegacyMigrationAction::Delete
                 } else {
@@ -868,7 +1035,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             VaultAction::Purge { id, vault_dir } => {
-                let vault = QuarantineVault::open(vault_dir)?;
+                let shared_ledger = get_or_init_global_shared_ledger(None);
+                let vault = QuarantineVault::open(vault_dir)?.with_shared_ledger(shared_ledger);
                 vault.purge(&id)?;
                 println!(
                     "✅ Crypto-erased wrapped DEK and shredded quarantine entry '{id}' from vault."
@@ -878,40 +1046,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 vault_dir,
                 soc_priv_key,
             } => {
-                let escrow_path = vault_dir.join("vault_kek.escrow");
+                execute_verify_escrow(&vault_dir, &soc_priv_key)?;
+            }
+            VaultAction::ProvisionHybridEscrowV3 {
+                vault_dir,
+                hybrid_pub_key,
+            } => {
+                let shared_ledger = get_or_init_global_shared_ledger(None);
+                let vault = QuarantineVault::open(vault_dir)?.with_shared_ledger(shared_ledger);
+                let raw_pub = fs::read(&hybrid_pub_key)?;
+                let pub_bundle: sentinel_sys::HybridSocPublicKeyBundle =
+                    serde_json::from_slice(&raw_pub)
+                        .map_err(|e| format!("Invalid HybridSocPublicKeyBundle JSON: {e}"))?;
+                let escrow_v3 = vault.provision_hybrid_soc_escrow_v3(&pub_bundle)?;
+                println!("✅ Provisioned Hybrid Post-Quantum OCESCROW3 envelope!");
+                println!("   KEK ID:             {}", escrow_v3.kek_id);
+                println!("   Algorithm:          {}", escrow_v3.algorithm);
+                println!("   RSA Fingerprint:    {}", escrow_v3.soc_rsa_fingerprint);
+                println!(
+                    "   ML-KEM Fingerprint: {}",
+                    escrow_v3.soc_mlkem768_fingerprint
+                );
+            }
+            VaultAction::VerifyHybridEscrowV3 {
+                vault_dir,
+                hybrid_priv_key,
+            } => {
+                let escrow_path = vault_dir
+                    .join(sentinel_core::scanner::quarantine::HYBRID_ESCROW_V3_JSON_FILENAME);
                 if !escrow_path.exists() {
-                    return Err(format!("Escrow file not found: {}", escrow_path.display()).into());
+                    return Err(
+                        format!("OCESCROW3 file not found: {}", escrow_path.display()).into(),
+                    );
                 }
                 let raw_escrow = fs::read(&escrow_path)?;
-                let escrow: sentinel_sys::SocEscrowBlob = serde_json::from_slice(&raw_escrow)
-                    .map_err(|e| format!("Failed parsing escrow JSON: {e}"))?;
-                let priv_bytes = fs::read(&soc_priv_key)?;
-                let mut kek = sentinel_sys::decrypt_kek_from_soc_escrow(&escrow, &priv_bytes)
-                    .map_err(|e| format!("Escrow decryption failed: {e}"))?;
+                let mut escrow_v3: sentinel_sys::HybridSocEscrowBlobV3 =
+                    serde_json::from_slice(&raw_escrow)
+                        .map_err(|e| format!("Failed parsing OCESCROW3 JSON: {e}"))?;
+
+                let wire_path = vault_dir
+                    .join(sentinel_core::scanner::quarantine::HYBRID_ESCROW_V3_WIRE_FILENAME);
+                if !wire_path.exists() {
+                    return Err(format!(
+                        "OCESCROW3 binary wire file not found: {}",
+                        wire_path.display()
+                    )
+                    .into());
+                }
+                let disk_wire = fs::read(&wire_path)?;
+                if disk_wire != escrow_v3.ocescrow3_wire_bytes {
+                    return Err(
+                        "OCESCROW3 verification failed: binary wire file diverges from JSON metadata (tampering detected)"
+                            .into(),
+                    );
+                }
+                escrow_v3.ocescrow3_wire_bytes = disk_wire;
+
+                let mut raw_priv = fs::read(&hybrid_priv_key)?;
+                let priv_bundle_res =
+                    serde_json::from_slice::<sentinel_sys::HybridSocPrivateKeyBundle>(&raw_priv);
+                sentinel_sys::zeroize_slice(&mut raw_priv);
+                let priv_bundle = priv_bundle_res
+                    .map_err(|e| format!("Failed parsing HybridSocPrivateKeyBundle: {e}"))?;
+                let mut kek =
+                    sentinel_sys::decrypt_kek_from_soc_escrow_hybrid_v3(&escrow_v3, &priv_bundle)
+                        .map_err(|e| format!("OCESCROW3 decapsulation failed: {e}"))?;
                 let mut hasher = Sha256::new();
                 hasher.update(b"SENTINEL-KEK-ID-V2:");
                 hasher.update(kek.as_slice());
                 let computed_id = &hex::encode(hasher.finalize())[..16];
                 sentinel_sys::zeroize_slice(&mut kek);
-                if computed_id != escrow.kek_id {
+                if computed_id != escrow_v3.kek_id {
                     return Err(format!(
-                        "Escrow verification failed: computed KEK ID '{}' does not match escrow KEK ID '{}'",
-                        computed_id, escrow.kek_id
+                        "OCESCROW3 verification failed: computed KEK ID '{computed_id}' != '{}'",
+                        escrow_v3.kek_id
                     )
                     .into());
                 }
-                println!("✅ Offline SOC RSA escrow verified successfully!");
-                println!("   KEK ID:      {}", escrow.kek_id);
-                println!("   Algorithm:   {}", escrow.algorithm);
-                println!("   Fingerprint: {}", escrow.soc_key_fingerprint);
+                println!("✅ Offline SOC Hybrid Post-Quantum OCESCROW3 verified successfully!");
+                println!("   KEK ID:             {}", escrow_v3.kek_id);
+                println!("   Algorithm:          {}", escrow_v3.algorithm);
+                println!("   RSA Fingerprint:    {}", escrow_v3.soc_rsa_fingerprint);
+                println!(
+                    "   ML-KEM Fingerprint: {}",
+                    escrow_v3.soc_mlkem768_fingerprint
+                );
             }
         },
         Commands::Ledger { action } => match action {
             LedgerAction::Verify { path } => {
-                let ledger = AuditLedger::open_result(path.clone())?;
+                let resolved_path = path.unwrap_or_else(default_unified_ledger_path);
+                let ledger = AuditLedger::open_result(resolved_path.clone())?;
                 let verified_count = ledger.verify_chain()?;
                 println!(
-                    "✅ Audit ledger {path:?} verified intact ({verified_count} hash-chained records + ECDSA-P256 signed chain head)."
+                    "✅ Audit ledger {resolved_path:?} verified intact ({verified_count} hash-chained records + ECDSA-P256 signed chain head)."
                 );
             }
         },
@@ -932,17 +1160,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PendingDeviceConfirmationManager::default_state_file(),
             );
             mgr.confirm_device_with_challenge(&device_id, &resolved_token)?;
-            let mut ledger = AuditLedger::open(PathBuf::from(".sentinel_vault/audit.jsonl"));
-            let _ = ledger.append_event(
-                "DEVICE_CONFIRMED_BY_USER",
-                format!("Device {device_id} authorized via physical user-presence challenge"),
-            );
+            let shared_ledger = get_or_init_global_shared_ledger(None);
+            if let Ok(mut ledger) = shared_ledger.lock() {
+                let _ = ledger.append_subsystem_event(
+                    AuditSubsystem::System,
+                    "DEVICE_CONFIRMED_BY_USER",
+                    serde_json::json!({
+                        "message": format!("Device {device_id} authorized via physical user-presence challenge")
+                    }),
+                );
+            }
             println!(
                 "✅ Physical user-presence challenge verified. Re-enabled USB device node: {device_id}"
             );
         }
     }
 
+    Ok(())
+}
+
+fn execute_verify_escrow(
+    vault_dir: &Path,
+    soc_priv_key: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let escrow_path = vault_dir.join("vault_kek.escrow");
+    if !escrow_path.exists() {
+        return Err(format!("Escrow file not found: {}", escrow_path.display()).into());
+    }
+    let raw_escrow = fs::read(&escrow_path)?;
+    let escrow: sentinel_sys::SocEscrowBlob = serde_json::from_slice(&raw_escrow)
+        .map_err(|e| format!("Failed parsing escrow JSON: {e}"))?;
+    let mut priv_bytes = fs::read(soc_priv_key)?;
+    let kek_res = sentinel_sys::decrypt_kek_from_soc_escrow(&escrow, &priv_bytes);
+    sentinel_sys::zeroize_slice(&mut priv_bytes);
+    let mut kek = kek_res.map_err(|e| format!("Escrow decryption failed: {e}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"SENTINEL-KEK-ID-V2:");
+    hasher.update(kek.as_slice());
+    let computed_id = &hex::encode(hasher.finalize())[..16];
+    sentinel_sys::zeroize_slice(&mut kek);
+    if computed_id != escrow.kek_id {
+        return Err(format!(
+            "Escrow verification failed: computed KEK ID '{}' does not match escrow KEK ID '{}'",
+            computed_id, escrow.kek_id
+        )
+        .into());
+    }
+    println!("✅ Offline SOC RSA escrow verified successfully!");
+    println!("   KEK ID:      {}", escrow.kek_id);
+    println!("   Algorithm:   {}", escrow.algorithm);
+    println!("   Fingerprint: {}", escrow.soc_key_fingerprint);
     Ok(())
 }
 
@@ -985,14 +1252,14 @@ fn prompt_remediation(threat: &UniversalThreat, vault: &QuarantineVault) -> Resu
             println!(
                 "⚡ Surgically shredding NTFS Alternate Data Stream '{stream_name}' while preserving host file..."
             );
-            let receipt = SecureShredder::shred_ntfs_stream(&threat.file_path, stream_name)?;
+            let receipt = vault.shred_ads_to_vault_ledger(&threat.file_path, stream_name)?;
             println!(
                 "✅ [ADS STREAM ERADICATED]: {} ({} bytes overwritten, {}). Host file preserved!",
                 receipt.original_path, receipt.file_size_bytes, receipt.sanitization_level
             );
         } else {
             println!("⚡ Executing NIST 800-88 Clear (logical) multi-pass shredding...");
-            let receipt = SecureShredder::shred_file(
+            let receipt = vault.shred_file_to_vault_ledger(
                 &threat.file_path,
                 ShredMethod::ClearMultiPass { passes: 3 },
             )?;
@@ -1260,12 +1527,16 @@ fn check_host_and_origin(headers: &HeaderMap, port: u16) -> Result<(), Box<Respo
 }
 
 pub fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
-    for pair in cookie_header.split(';') {
-        let mut parts = pair.trim().splitn(2, '=');
-        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-            if k.trim() == name {
-                return Some(v.trim().to_string());
+    for header_val in headers.get_all(header::COOKIE) {
+        let Ok(cookie_header) = header_val.to_str() else {
+            continue;
+        };
+        for pair in cookie_header.split(';') {
+            let mut parts = pair.trim().splitn(2, '=');
+            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                if k.trim() == name {
+                    return Some(v.trim().to_string());
+                }
             }
         }
     }
@@ -1276,15 +1547,7 @@ pub fn check_session_auth(
     headers: &HeaderMap,
     expected_session_id: &str,
 ) -> Result<(), Box<Response>> {
-    // 1. Check Authorization: Bearer <session_id>
-    let auth_str = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    if verify_bearer_token_constant_time(auth_str, expected_session_id) {
-        return Ok(());
-    }
-
-    // 2. Check sentinel_sid cookie
+    // Session authentication relies strictly on HttpOnly; SameSite=Strict sentinel_sid cookie (`CEA-DEFECT-05`)
     if let Some(cookie_sid) = extract_cookie_value(headers, "sentinel_sid") {
         let provided = cookie_sid.trim().as_bytes();
         let expected = expected_session_id.as_bytes();
@@ -1378,8 +1641,7 @@ async fn handle_session_exchange(
     );
     let body_json = serde_json::json!({
         "status": "AUTHENTICATED",
-        "csrf_token": state.csrf_token,
-        "session_token": state.session_id
+        "csrf_token": state.csrf_token
     });
 
     let mut resp = with_security_headers(
@@ -1397,11 +1659,26 @@ pub fn resolve_contained_ui_target(
     user_path: &Path,
     staging_root: &Path,
 ) -> Result<PathBuf, (StatusCode, &'static str)> {
-    // 1. Inspect raw path string immediately for sensitive vault keywords before any filesystem access
-    let raw_lower = user_path.to_string_lossy().to_lowercase();
+    use std::path::Component;
+
+    // 1. Inspect raw path string immediately for sensitive vault keywords or NUL bytes before any filesystem access
+    let raw_str = user_path.to_string_lossy();
+    if raw_str.contains('\0') {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Null bytes in target path are prohibited",
+        ));
+    }
+    let raw_lower = raw_str.to_lowercase();
     if raw_lower.contains(".sentinel_vault")
         || raw_lower.contains("audit.jsonl")
         || raw_lower.contains("vault_kek")
+        || raw_lower.contains("ledger_key.sealed")
+        || raw_lower.contains("privacy_hmac.sealed")
+        || raw_lower.contains("head.sig")
+        || raw_lower.contains("spool_key.sealed")
+        || raw_lower.contains("siem_spool")
+        || raw_lower.contains("sentinel_unified_audit")
     {
         return Err((
             StatusCode::FORBIDDEN,
@@ -1409,14 +1686,51 @@ pub fn resolve_contained_ui_target(
         ));
     }
 
-    // 2. Reject path traversal ('..')
+    // 2. Reject path traversal ('..') unconditionally BEFORE any disk access
     for comp in user_path.components() {
-        if matches!(comp, std::path::Component::ParentDir) {
+        if matches!(comp, Component::ParentDir) {
             return Err((
                 StatusCode::FORBIDDEN,
                 "Path traversal ('..') is strictly prohibited",
             ));
         }
+    }
+
+    // 3. Reject Windows rooted (`\...`, `/...`), drive-relative (`C:...`), and ALL NTFS ADS colons
+    // (on both relative AND absolute inputs, after optional leading `X:` drive prefix on Windows)
+    // BEFORE joining or probing `.exists()` (`CEA-DEFECT-05` zero oracle)
+    if !user_path.is_absolute()
+        && (raw_str.starts_with('/')
+            || raw_str.starts_with('\\')
+            || raw_str.contains(':')
+            || user_path
+                .components()
+                .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir)))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Target path is outside the designated UI staging root",
+        ));
+    }
+    let colon_check_tail = if cfg!(windows) && user_path.is_absolute() {
+        let after_verbatim = raw_str.strip_prefix(r"\\?\").unwrap_or(&raw_str);
+        let mut chars = after_verbatim.chars();
+        if matches!(
+            (chars.next(), chars.next()),
+            (Some(c), Some(':')) if c.is_ascii_alphabetic()
+        ) {
+            chars.as_str()
+        } else {
+            after_verbatim
+        }
+    } else {
+        raw_str.as_ref()
+    };
+    if colon_check_tail.contains(':') {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Alternate data streams and drive-relative colons are strictly prohibited",
+        ));
     }
 
     let canonical_root = match staging_root.canonicalize() {
@@ -1429,9 +1743,8 @@ pub fn resolve_contained_ui_target(
         }
     };
 
-    // 3. Absolute path containment check: verify boundary BEFORE probing exists()
-    // to eliminate arbitrary host disk file existence/enumeration oracles
-    if user_path.is_absolute() {
+    // 4. Absolute path containment check: verify boundary BEFORE probing exists()
+    let candidate = if user_path.is_absolute() {
         let is_within_staging =
             user_path.starts_with(staging_root) || user_path.starts_with(&canonical_root);
         if !is_within_staging {
@@ -1440,13 +1753,44 @@ pub fn resolve_contained_ui_target(
                 "Target path is outside the designated UI staging root",
             ));
         }
-    }
-
-    let candidate = if user_path.is_absolute() {
         user_path.to_path_buf()
     } else {
         staging_root.join(user_path)
     };
+
+    // 5. Walk every prefix component inside staging_root BEFORE candidate.exists() so symlinks/
+    // junctions targeting external existing vs non-existing host paths never create an oracle
+    let rel_inside_root = candidate
+        .strip_prefix(staging_root)
+        .or_else(|_| candidate.strip_prefix(&canonical_root))
+        .map_err(|_| {
+            (
+                StatusCode::FORBIDDEN,
+                "Target path is outside the designated UI staging root",
+            )
+        })?;
+    let mut walk = canonical_root.clone();
+    for comp in rel_inside_root.components() {
+        match comp {
+            Component::Normal(seg) => {
+                walk.push(seg);
+                if fs::symlink_metadata(&walk).is_ok()
+                    && sentinel_sys::ensure_not_symlink_or_reparse_point(&walk).is_err()
+                {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        "Reparse points and symbolic links are prohibited",
+                    ));
+                }
+            }
+            _ => {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Target path is outside the designated UI staging root",
+                ));
+            }
+        }
+    }
 
     if !candidate.exists() {
         return Err((
@@ -1483,6 +1827,12 @@ pub fn resolve_contained_ui_target(
     if s_lossy.contains(".sentinel_vault")
         || s_lossy.contains("audit.jsonl")
         || s_lossy.contains("vault_kek")
+        || s_lossy.contains("ledger_key.sealed")
+        || s_lossy.contains("privacy_hmac.sealed")
+        || s_lossy.contains("head.sig")
+        || s_lossy.contains("spool_key.sealed")
+        || s_lossy.contains("siem_spool")
+        || s_lossy.contains("sentinel_unified_audit")
     {
         return Err((
             StatusCode::FORBIDDEN,
@@ -1544,12 +1894,16 @@ async fn handle_api_status(
     }
 
     let posture = verify_system_posture();
-    let mut pol_mgr = IntunePolicyManager::new();
+    let shared_ledger = get_or_init_global_shared_ledger(None);
+    let mut pol_mgr = IntunePolicyManager::new().with_shared_ledger(shared_ledger.clone());
     let policy = pol_mgr.load_active_policy();
-    let vault = QuarantineVault::new(PathBuf::from(".sentinel_vault"));
+    let vault = QuarantineVault::new(PathBuf::from(".sentinel_vault"))
+        .with_shared_ledger(shared_ledger.clone());
     let entries = vault.list_entries().unwrap_or_default();
-    let ledger = AuditLedger::open(PathBuf::from(".sentinel_vault/audit.jsonl"));
-    let chain_ok = ledger.verify_chain().is_ok();
+    let chain_ok = shared_ledger
+        .lock()
+        .map(|g| g.verify_chain().is_ok())
+        .unwrap_or(false);
     let connected_drives: Vec<serde_json::Value> = DriveWatcher::enumerate_mounted_drives()
         .into_iter()
         .map(|p| {
@@ -1756,10 +2110,17 @@ async fn handle_api_scan(
         );
     }
 
+    let shared_ledger = get_or_init_global_shared_ledger(None);
+    let path_token = tokenize_path_for_ledger(
+        Some(&shared_ledger),
+        &default_unified_ledger_path(),
+        &target_path,
+    )
+    .unwrap_or_else(|_| "TOKEN_UNAVAILABLE".to_string());
     state.push_event(serde_json::json!({
         "event": "SCAN_COMPLETE",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "path": target_path.to_string_lossy(),
+        "path_token": path_token,
         "files_scanned": report.files_scanned,
         "threats_found": report.threats.len(),
         "complete": report.complete,
@@ -1847,10 +2208,16 @@ async fn handle_api_shred(
         }
     };
 
+    let shared_ledger = get_or_init_global_shared_ledger(None);
+    let shared_for_task = shared_ledger.clone();
     let target_clone = target_path.clone();
     let shred_result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        SecureShredder::shred_file(&target_clone, ShredMethod::ClearMultiPass { passes: 3 })
+        SecureShredder::shred_file_with_shared_ledger(
+            &target_clone,
+            ShredMethod::ClearMultiPass { passes: 3 },
+            Some(&shared_for_task),
+        )
     })
     .await;
 
@@ -1883,15 +2250,16 @@ async fn handle_api_shred(
     if let Ok(mut guard) = state.last_shred_receipt.lock() {
         *guard = Some(receipt.clone());
     }
-    let mut ledger = AuditLedger::open(PathBuf::from(".sentinel_vault/audit.jsonl"));
-    let _ = ledger.append_event(
-        "SHRED_RECEIPT",
-        serde_json::to_string(&receipt).unwrap_or_default(),
-    );
+    let path_token = tokenize_path_for_ledger(
+        Some(&shared_ledger),
+        &default_unified_ledger_path(),
+        Path::new(&receipt.original_path),
+    )
+    .unwrap_or_else(|_| "TOKEN_UNAVAILABLE".to_string());
     state.push_event(serde_json::json!({
         "event": "SHRED_COMPLETE",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "original_path": receipt.original_path,
+        "path_token": path_token,
         "passes_completed": receipt.passes_completed,
         "rename_cycles_completed": receipt.rename_cycles_completed,
         "flush_succeeded": receipt.flush_succeeded,
@@ -1965,6 +2333,68 @@ pub fn build_dashboard_router(state: Arc<DashboardAppState>) -> Router {
 /// - Enforces CSRF validation (`X-Sentinel-CSRF`) on `POST /api/v1/scan` and `POST /api/v1/shred` (`Rows 175, 227`)
 /// - Restricts scanning and shredding to `ui_staging_root` with bounded concurrency (`Semaphore::new(2)`)
 /// - Exports all 7 labeled Prometheus metrics on `GET /api/v1/metrics` (`Row 206`)
+fn is_restricted_runtime_dir_writable(dir: &Path) -> bool {
+    if sentinel_sys::create_restricted_dir_atomic(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(
+        ".sentinel_rt_probe_{}_{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    match sentinel_sys::create_restricted_file_handle_atomic(&probe) {
+        Ok(f) => {
+            drop(f);
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(test))]
+fn resolve_restricted_runtime_dir(subpath: &str, fallback_cwd: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(pd) = std::env::var("ProgramData") {
+            let p = PathBuf::from(pd).join("OmniConnect").join(subpath);
+            if is_restricted_runtime_dir_writable(&p) {
+                return p;
+            }
+        }
+        if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+            let p = PathBuf::from(lad).join("OmniConnect").join(subpath);
+            if is_restricted_runtime_dir_writable(&p) {
+                return p;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let p = PathBuf::from("/var/lib/omniconnect").join(subpath.to_ascii_lowercase());
+        if is_restricted_runtime_dir_writable(&p) {
+            return p;
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let p = PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("omniconnect")
+                .join(subpath.to_ascii_lowercase());
+            if is_restricted_runtime_dir_writable(&p) {
+                return p;
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let p = cwd.join(fallback_cwd);
+        if is_restricted_runtime_dir_writable(&p) {
+            return p;
+        }
+    }
+    std::env::temp_dir().join(fallback_cwd)
+}
+
 async fn serve_dashboard_ui(port: u16, demo_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = SocketAddr::from(([127, 0, 0, 1], port));
     let std_listener = std::net::TcpListener::bind(bind_addr)?;
@@ -1982,12 +2412,8 @@ async fn serve_dashboard_ui(port: u16, demo_mode: bool) -> Result<(), Box<dyn st
         }
         #[cfg(not(test))]
         {
-            #[cfg(windows)]
-            let base = PathBuf::from(r"C:\ProgramData\OmniConnect\UIStaging");
-            #[cfg(not(windows))]
-            let base = PathBuf::from("/var/lib/omniconnect/ui_staging");
-            let _ = sentinel_sys::create_restricted_dir_atomic(&base);
-            base.join(format!("sentinel_ui_staging_{actual_port}"))
+            resolve_restricted_runtime_dir("UIStaging", ".sentinel_ui_staging")
+                .join(format!("sentinel_ui_staging_{actual_port}"))
         }
     };
     let _ = sentinel_sys::create_restricted_dir_atomic(&ui_staging_root);
@@ -2169,9 +2595,32 @@ mod tests {
         let exchange_json: serde_json::Value =
             serde_json::from_slice(&exchange_bytes).unwrap_or_default();
         assert_eq!(exchange_json["csrf_token"], csrf_token);
+        assert!(
+            exchange_json.get("session_token").is_none(),
+            "Session ID must NEVER be leaked in /api/v1/session/exchange JSON body (HttpOnly cookie only)"
+        );
         assert_ne!(
             csrf_token, session_id,
             "CSRF token must be distinct from session ID"
+        );
+
+        // 5b. Authorization: Bearer <session_id> alone without HttpOnly cookie must be rejected
+        let req_bearer_only = Request::builder()
+            .uri("/api/v1/status")
+            .header(header::HOST, "127.0.0.1:8088")
+            .header(header::ORIGIN, "http://127.0.0.1:8088")
+            .header(header::AUTHORIZATION, format!("Bearer {session_id}"))
+            .body(Body::empty())
+            .unwrap_or_else(|_| Request::new(Body::empty()));
+        let resp_bearer_only = app
+            .clone()
+            .oneshot(req_bearer_only)
+            .await
+            .unwrap_or_else(|_| http::Response::new(Body::empty()).into_response());
+        assert_eq!(
+            resp_bearer_only.status(),
+            StatusCode::UNAUTHORIZED,
+            "Session auth must rely strictly on HttpOnly cookie, never JS-readable bearer token"
         );
 
         // 6. Replay attack on single-use bootstrap code MUST return 401
@@ -2391,6 +2840,8 @@ mod tests {
         assert!(app_js.contains("window.history.replaceState"));
         assert!(app_js.contains("#bootstrap="));
         assert!(app_js.contains("exchangeBootstrapCode"));
+        assert!(!app_js.contains("sessionBearerToken"));
+        assert!(!app_js.contains("session_token"));
 
         let _ = fs::remove_dir_all(&staging_root);
     }
@@ -2552,44 +3003,82 @@ mod tests {
             );
         }
 
-        // Probe 6: Zero File Existence Oracle Probe
-        let existing_host_file = "C:\\Windows\\System32\\cmd.exe";
-        let non_existing_host_file =
-            "C:\\Windows\\System32\\definitely_nonexistent_secret_probe_9999.xyz";
+        // Probe 6: Zero File Existence Oracle Probe (Absolute, Windows rooted `\...`, `/` rooted, and drive-relative `C:...`)
+        let oracle_pairs = [
+            (
+                "C:\\Windows\\System32\\cmd.exe",
+                "C:\\Windows\\System32\\definitely_nonexistent_secret_probe_9999.xyz",
+            ),
+            (
+                "\\Windows\\System32\\cmd.exe",
+                "\\Windows\\System32\\definitely_nonexistent_secret_probe_9999.xyz",
+            ),
+            (
+                "/Windows/System32/cmd.exe",
+                "/Windows/System32/definitely_nonexistent_secret_probe_9999.xyz",
+            ),
+            (
+                "C:Windows\\System32\\cmd.exe",
+                "C:Windows\\System32\\definitely_nonexistent_secret_probe_9999.xyz",
+            ),
+        ];
 
-        let req_exist = Request::builder()
-            .method("POST")
-            .uri("/api/v1/scan")
-            .header(header::HOST, "127.0.0.1:9191")
-            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
-            .header("x-sentinel-csrf", &csrf_token)
-            .body(Body::from(format!(
-                r#"{{"path":"{}"}}"#,
-                existing_host_file.replace('\\', "\\\\")
-            )))?;
-        let resp_exist = app.clone().oneshot(req_exist).await?;
-        let status_exist = resp_exist.status();
-        let body_exist = axum::body::to_bytes(resp_exist.into_body(), 64 * 1024).await?;
+        for (existing_host_file, non_existing_host_file) in oracle_pairs {
+            let req_exist = Request::builder()
+                .method("POST")
+                .uri("/api/v1/scan")
+                .header(header::HOST, "127.0.0.1:9191")
+                .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+                .header("x-sentinel-csrf", &csrf_token)
+                .body(Body::from(format!(
+                    r#"{{"path":"{}"}}"#,
+                    existing_host_file.replace('\\', "\\\\")
+                )))?;
+            let resp_exist = app.clone().oneshot(req_exist).await?;
+            let status_exist = resp_exist.status();
+            let body_exist = axum::body::to_bytes(resp_exist.into_body(), 64 * 1024).await?;
 
-        let req_nonexist = Request::builder()
-            .method("POST")
-            .uri("/api/v1/scan")
-            .header(header::HOST, "127.0.0.1:9191")
-            .header(header::COOKIE, format!("sentinel_sid={session_id}"))
-            .header("x-sentinel-csrf", &csrf_token)
-            .body(Body::from(format!(
-                r#"{{"path":"{}"}}"#,
-                non_existing_host_file.replace('\\', "\\\\")
-            )))?;
-        let resp_nonexist = app.clone().oneshot(req_nonexist).await?;
-        let status_nonexist = resp_nonexist.status();
-        let body_nonexist = axum::body::to_bytes(resp_nonexist.into_body(), 64 * 1024).await?;
+            let req_nonexist = Request::builder()
+                .method("POST")
+                .uri("/api/v1/scan")
+                .header(header::HOST, "127.0.0.1:9191")
+                .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+                .header("x-sentinel-csrf", &csrf_token)
+                .body(Body::from(format!(
+                    r#"{{"path":"{}"}}"#,
+                    non_existing_host_file.replace('\\', "\\\\")
+                )))?;
+            let resp_nonexist = app.clone().oneshot(req_nonexist).await?;
+            let status_nonexist = resp_nonexist.status();
+            let body_nonexist = axum::body::to_bytes(resp_nonexist.into_body(), 64 * 1024).await?;
 
-        assert_eq!(status_exist, StatusCode::FORBIDDEN);
-        assert_eq!(status_nonexist, StatusCode::FORBIDDEN);
-        assert_eq!(
-            body_exist, body_nonexist,
-            "Responses for existing and non-existing host paths outside staging root must be byte-for-byte identical (Zero Existence Oracle)"
+            assert_eq!(
+                status_exist,
+                StatusCode::FORBIDDEN,
+                "Host path {existing_host_file} must return 403 Forbidden"
+            );
+            assert_eq!(
+                status_nonexist,
+                StatusCode::FORBIDDEN,
+                "Host path {non_existing_host_file} must return 403 Forbidden"
+            );
+            assert_eq!(
+                body_exist, body_nonexist,
+                "Responses for existing ({existing_host_file}) and non-existing ({non_existing_host_file}) host paths must be byte-for-byte identical (Zero Existence Oracle)"
+            );
+        }
+
+        let top_alias = Cli::try_parse_from([
+            "sentinel",
+            "vault-verify-escrow",
+            "--vault-dir",
+            ".sentinel_vault",
+            "--soc-priv-key",
+            "soc.priv",
+        ]);
+        assert!(
+            top_alias.is_ok(),
+            "Top-level `sentinel vault-verify-escrow` CLI alias must parse cleanly"
         );
 
         // Probe 7: Sensitive Vault Keyword Probes (Must be 403 even for non-existent files)
@@ -2720,6 +3209,42 @@ mod tests {
         assert!(!idx_str.contains(&csrf_token));
         assert!(!idx_str.contains("style="));
         assert!(!idx_str.contains("fonts.googleapis.com"));
+
+        // Probe 12: Absolute path NTFS ADS colon oracle & multi-Cookie extraction (`CEA-DEFECT-05`)
+        let abs_ads_existing = format!(
+            "{}:secret_ads",
+            staging_root.join("canary_probe.txt").display()
+        );
+        let abs_ads_nonexisting = format!(
+            "{}:nonexistent_ads",
+            staging_root.join("missing_probe.txt").display()
+        );
+        fs::write(staging_root.join("canary_probe.txt"), b"ok")?;
+        let r_ads1 = resolve_contained_ui_target(Path::new(&abs_ads_existing), &staging_root);
+        let r_ads2 = resolve_contained_ui_target(Path::new(&abs_ads_nonexisting), &staging_root);
+        match r_ads1 {
+            Err((code, _)) => assert_eq!(code, StatusCode::FORBIDDEN),
+            Ok(p) => panic!("absolute ADS colon must return 403, got Ok({p:?})"),
+        }
+        match r_ads2 {
+            Err((code, _)) => assert_eq!(code, StatusCode::FORBIDDEN),
+            Ok(p) => {
+                panic!("absolute ADS colon on missing file must return uniform 403, got Ok({p:?})")
+            }
+        }
+
+        let mut multi_cookie_headers = HeaderMap::new();
+        multi_cookie_headers.append(header::COOKIE, "other=1".parse()?);
+        multi_cookie_headers.append(
+            header::COOKIE,
+            format!("sentinel_sid={session_id}").parse()?,
+        );
+        assert_eq!(
+            extract_cookie_value(&multi_cookie_headers, "sentinel_sid").as_deref(),
+            Some(session_id.as_str())
+        );
+
+        assert!(is_restricted_runtime_dir_writable(&staging_root));
 
         let _ = fs::remove_dir_all(&staging_root);
         Ok(())

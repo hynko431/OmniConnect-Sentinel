@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use sentinel_sys::{sign_ecdsa_p256_with_private_blob, verify_ecdsa_p256_digest};
 
-use crate::enterprise::ledger::AuditLedger;
+use crate::enterprise::ledger::{AuditLedger, AuditSubsystem, SharedAuditLedger};
 use crate::error::{DegradationEvent, SentinelError};
 use crate::scanner::content_scanner::ContentScanner;
 
@@ -367,6 +367,7 @@ pub struct Tier0YaraScanner {
     rules: Vec<CompiledYaraRule>,
     rule_pack_version: u32,
     ledger_path: PathBuf,
+    shared_ledger: Option<SharedAuditLedger>,
     intel_bloom: ThreatIntelBloomFilter,
 }
 
@@ -398,13 +399,34 @@ impl Tier0YaraScanner {
             rules,
             rule_pack_version: 1,
             ledger_path,
+            shared_ledger: None,
             intel_bloom: ThreatIntelBloomFilter::new(),
         }
     }
 
     pub fn with_ledger_path(mut self, ledger_path: PathBuf) -> Self {
         self.ledger_path = ledger_path;
+        self.shared_ledger = None;
         self
+    }
+
+    pub fn with_shared_ledger(mut self, shared_ledger: SharedAuditLedger) -> Self {
+        if let Ok(guard) = shared_ledger.lock() {
+            self.ledger_path = guard.path().to_path_buf();
+        }
+        self.shared_ledger = Some(shared_ledger);
+        self
+    }
+
+    fn record_ledger_event(&self, event: &str, details: serde_json::Value) {
+        if let Some(shared) = &self.shared_ledger {
+            if let Ok(mut guard) = shared.lock() {
+                let _ = guard.append_subsystem_event(AuditSubsystem::System, event, details);
+                return;
+            }
+        }
+        let mut ledger = AuditLedger::open(&self.ledger_path);
+        let _ = ledger.append_event(event, details);
     }
 
     pub fn intel_bloom_mut(&mut self) -> &mut ThreatIntelBloomFilter {
@@ -427,8 +449,7 @@ impl Tier0YaraScanner {
         trusted_public_key: &[u8],
     ) -> Result<u32, SentinelError> {
         if let Err(sig_err) = pack.verify_signature(trusted_public_key) {
-            let mut ledger = AuditLedger::open(&self.ledger_path);
-            let _ = ledger.append_event(
+            self.record_ledger_event(
                 DegradationEvent::PolicyRejected.event_code(),
                 serde_json::json!({
                     "component": "Tier0YaraScanner",
@@ -446,8 +467,7 @@ impl Tier0YaraScanner {
                 "YARA rule pack rollback rejected: candidate version {} <= active version {}",
                 pack.version, self.rule_pack_version
             ));
-            let mut ledger = AuditLedger::open(&self.ledger_path);
-            let _ = ledger.append_event(
+            self.record_ledger_event(
                 DegradationEvent::PolicyRejected.event_code(),
                 serde_json::json!({
                     "component": "Tier0YaraScanner",
@@ -491,8 +511,7 @@ impl Tier0YaraScanner {
         self.rules.extend(compiled_additions);
         self.rule_pack_version = pack.version;
 
-        let mut ledger = AuditLedger::open(&self.ledger_path);
-        let _ = ledger.append_event(
+        self.record_ledger_event(
             "YARA_RULEPACK_UPDATED",
             serde_json::json!({
                 "pack_id": pack.pack_id,

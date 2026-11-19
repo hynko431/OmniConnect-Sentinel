@@ -80,10 +80,10 @@ jobs:
         with:
           command: check advisories licenses bans sources
 
-      - name: Install prebuilt supply-chain security tools (cargo-audit, cargo-machete, cargo-cyclonedx)
+      - name: Install prebuilt supply-chain security tools (cargo-audit, cargo-machete, cargo-cyclonedx, cargo-auditable)
         uses: taiki-e/install-action@b735db4db54b41300994fbc266fdbd42ea04652c # v2.49.20
         with:
-          tool: cargo-audit,cargo-machete,cargo-cyclonedx
+          tool: cargo-audit,cargo-machete,cargo-cyclonedx,cargo-auditable
 
       - name: Run cargo-audit (RustSec advisory database with zero-ignore policy)
         run: cargo audit --deny yanked
@@ -122,8 +122,13 @@ jobs:
           exit-code: '1'
           severity: 'CRITICAL,HIGH'
 
-      - name: Build release binaries for SLSA provenance & signing
-        run: cargo build --workspace --release --locked
+      - name: Build auditable release binaries (.dep-v0) for SLSA provenance & signing
+        run: |
+          cargo auditable build --workspace --release --locked
+          for bin in target/release/sentinel target/release/sentinel-agent target/release/sentinel-cdr-daemon target/release/sentinel-cdr-worker; do
+            test -f "$bin"
+            readelf -S "$bin" | grep -q '\.dep-v0'
+          done
 
       - name: Attest SLSA Build Provenance & CycloneDX SBOM
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
@@ -135,3 +140,4 @@ jobs:
             target/release/sentinel-cdr-daemon
             target/release/sentinel-cdr-worker
             sbom.cdx.json
+            sentinel-cbom.cdx.json

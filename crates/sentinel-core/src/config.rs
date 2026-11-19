@@ -6,12 +6,24 @@ pub struct SentinelConfig {
     pub node_id: String,
     pub environment: AgentMode,
     pub cdr_service_endpoint: String,
+    #[serde(default = "default_siem_syslog_endpoint")]
+    pub siem_syslog_endpoint: String,
     pub quarantine_vault_path: PathBuf,
     pub vfs_provider: VfsProviderPreference,
     pub auto_sanitize_removable_media: bool,
     pub charge_only_fallback_enabled: bool,
     pub telemetry_reporting_enabled: bool,
     pub hardware_whitelist: Vec<HardwareIdentifier>,
+}
+
+pub fn default_siem_syslog_endpoint() -> String {
+    if let Ok(ep) = std::env::var("SENTINEL_SIEM_ENDPOINT") {
+        let trimmed = ep.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "offline://siem.omniconnect.local:6514".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +54,7 @@ impl Default for SentinelConfig {
             node_id: uuid::Uuid::new_v4().to_string(),
             environment: AgentMode::EnterpriseManaged,
             cdr_service_endpoint: sentinel_sys::DEFAULT_NAMED_PIPE_ENDPOINT.to_string(),
+            siem_syslog_endpoint: default_siem_syslog_endpoint(),
             quarantine_vault_path: PathBuf::from(r"C:\ProgramData\OmniConnect\Quarantine"),
             vfs_provider: VfsProviderPreference::AutoDetect,
             auto_sanitize_removable_media: true,

@@ -2,10 +2,7 @@
 
 use sentinel_core::error::DegradationEvent;
 use sentinel_core::scanner::quarantine::QuarantineVault;
-use sentinel_sys::{
-    default_soc_rsa_private_blob, default_soc_rsa_public_blob, generate_soc_rsa_keypair,
-    SocEscrowBlob,
-};
+use sentinel_sys::{generate_soc_rsa_keypair, SocEscrowBlob};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -44,11 +41,16 @@ fn probe_adversarial_vault_recovery_and_cli_verify_escrow() {
     let priv_key_path = vault_dir.join("soc_offline.key");
     fs::write(&priv_key_path, &soc_priv).expect("write soc private key");
 
-    // 2. Test CLI verify-escrow command on valid vault
+    // 2. Test CLI verify-escrow command AND top-level vault-verify-escrow alias on valid vault
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
     let cli_path = if cfg!(windows) {
-        PathBuf::from("t/debug/sentinel.exe")
+        workspace_root
+            .join("target")
+            .join("debug")
+            .join("sentinel.exe")
     } else {
-        PathBuf::from("t/debug/sentinel")
+        workspace_root.join("target").join("debug").join("sentinel")
     };
 
     if cli_path.exists() {
@@ -70,6 +72,23 @@ fn probe_adversarial_vault_recovery_and_cli_verify_escrow() {
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("Offline SOC RSA escrow verified successfully"));
+
+        // Also test top-level `sentinel vault-verify-escrow` alias (`CEA-DEFECT-03`)
+        let alias_out = Command::new(&cli_path)
+            .args([
+                "vault-verify-escrow",
+                "--vault-dir",
+                vault_dir.to_str().unwrap(),
+                "--soc-priv-key",
+                priv_key_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("execute sentinel vault-verify-escrow");
+        assert!(
+            alias_out.status.success(),
+            "Top-level `sentinel vault-verify-escrow` must succeed! Stderr: {}",
+            String::from_utf8_lossy(&alias_out.stderr)
+        );
 
         // CLI verify-escrow with WRONG private key must fail
         let (_wrong_pub, wrong_priv) = generate_soc_rsa_keypair().expect("wrong keypair");
@@ -172,10 +191,6 @@ fn probe_adversarial_vault_recovery_and_cli_verify_escrow() {
     );
     assert!(!unconf_dir.join("vault_kek.escrow").exists());
     let _ = fs::remove_dir_all(&unconf_dir);
-
-    // 7. Verify default SOC blobs are genuine
-    assert_eq!(&default_soc_rsa_public_blob()[0..4], b"RSA1");
-    assert_eq!(&default_soc_rsa_private_blob()[0..4], b"RSA2");
 
     let _ = fs::remove_dir_all(&vault_dir);
 }

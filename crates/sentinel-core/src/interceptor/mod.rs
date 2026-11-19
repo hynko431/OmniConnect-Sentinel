@@ -33,20 +33,22 @@ pub trait DeviceInterceptor: Send + Sync {
 /// Pending physical user-presence confirmation entry for composite/input USB devices
 /// (Master Plan v2 §3.1 #6 / Row 3, 142). Plaintext challenge token is never persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PendingDeviceConfirmation {
     pub device_id: String,
-    #[serde(default)]
     pub challenge_id: String,
-    #[serde(default)]
     pub challenge_hash: String, // SHA256(device_id || ":" || challenge_token)
-    #[serde(default)]
-    pub challenge_code: String, // Retained for backwards compatibility; empty in v2
     pub created_at_unix: i64,
-    #[serde(default)]
     pub expires_at_unix: i64,
     #[serde(default)]
     pub failed_attempts: u32,
     pub confirmed: bool,
+}
+
+fn is_valid_challenge_id(challenge_id: &str) -> bool {
+    challenge_id.len() == 21
+        && challenge_id.starts_with("CHAL-")
+        && challenge_id[5..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Issued BadUSB challenge bundle separating public tracking identifier from private local token.
@@ -70,6 +72,26 @@ impl PendingDeviceConfirmationManager {
 
     pub fn default_state_file() -> PathBuf {
         PathBuf::from(".sentinel_vault").join("pending_device_confirmations.json")
+    }
+
+    fn token_dir(&self) -> &Path {
+        self.state_file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".sentinel_vault"))
+    }
+
+    fn purge_token_file(&self, challenge_id: &str) {
+        if !is_valid_challenge_id(challenge_id) {
+            return;
+        }
+        let token_path = self
+            .token_dir()
+            .join(format!("pending_challenge_{challenge_id}.token"));
+        if token_path.exists() {
+            let _ = create_restricted_file_atomic(&token_path, &[0u8; 32]);
+            let _ = fs::remove_file(&token_path);
+        }
     }
 
     fn load_map(&self) -> io::Result<HashMap<String, PendingDeviceConfirmation>> {
@@ -103,9 +125,45 @@ impl PendingDeviceConfirmationManager {
         &self,
         device_id: &str,
     ) -> io::Result<IssuedBadUsbChallenge> {
+        if device_id.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "device_id must not be empty",
+            ));
+        }
+
+        let mut map = self.load_map()?;
+        let now = chrono::Utc::now().timestamp();
+
+        // Purge any superseded `.token` file for the same `device_id` (e.g. USB bus re-enumeration)
+        if let Some(prev) = map.remove(device_id) {
+            self.purge_token_file(&prev.challenge_id);
+        }
+
+        // Opportunistically reap any expired unconfirmed challenges so stale `.token` files never accumulate
+        let expired_keys: Vec<(String, String)> = map
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.confirmed
+                    && (entry.created_at_unix <= 0
+                        || entry.expires_at_unix <= 0
+                        || entry.expires_at_unix < entry.created_at_unix
+                        || entry.expires_at_unix.saturating_sub(entry.created_at_unix)
+                            > BADUSB_CHALLENGE_TTL_SECS
+                        || now > entry.expires_at_unix
+                        || now.saturating_sub(entry.created_at_unix) > BADUSB_CHALLENGE_TTL_SECS)
+            })
+            .map(|(k, v)| (k.clone(), v.challenge_id.clone()))
+            .collect();
+        for (exp_dev, exp_chal_id) in expired_keys {
+            map.remove(&exp_dev);
+            self.purge_token_file(&exp_chal_id);
+        }
+
         let mut random_bytes = [0u8; 16]; // 128-bit cryptographic entropy (Row 3, 142)
         rand::rngs::OsRng.fill_bytes(&mut random_bytes);
         let challenge_token = hex::encode_upper(random_bytes);
+        sentinel_sys::zeroize_slice(&mut random_bytes);
 
         // Derive public challenge_id prefix
         let token_digest = Sha256::digest(challenge_token.as_bytes());
@@ -115,33 +173,30 @@ impl PendingDeviceConfirmationManager {
         let hash_input = format!("{device_id}:{challenge_token}");
         let challenge_hash = hex::encode(Sha256::digest(hash_input.as_bytes()));
 
-        let now = chrono::Utc::now().timestamp();
         let expires_at_unix = now + BADUSB_CHALLENGE_TTL_SECS;
 
         // Atomically write secret token to local console operator token file with restricted DACL
-        let token_dir = self
-            .state_file
-            .parent()
-            .unwrap_or_else(|| Path::new(".sentinel_vault"));
+        let token_dir = self.token_dir();
         let _ = create_restricted_dir_atomic(token_dir);
         let token_path = token_dir.join(format!("pending_challenge_{challenge_id}.token"));
         create_restricted_file_atomic(&token_path, challenge_token.as_bytes())?;
 
-        let mut map = self.load_map()?;
         map.insert(
             device_id.to_string(),
             PendingDeviceConfirmation {
                 device_id: device_id.to_string(),
                 challenge_id: challenge_id.clone(),
                 challenge_hash,
-                challenge_code: String::new(), // Never store raw secret token in state map
                 created_at_unix: now,
                 expires_at_unix,
                 failed_attempts: 0,
                 confirmed: false,
             },
         );
-        self.save_map(&map)?;
+        if let Err(e) = self.save_map(&map) {
+            self.purge_token_file(&challenge_id);
+            return Err(e);
+        }
 
         Ok(IssuedBadUsbChallenge {
             challenge_id,
@@ -151,7 +206,7 @@ impl PendingDeviceConfirmationManager {
     }
 
     /// Validates the user-provided challenge token with constant-time equality (`ct_eq`),
-    /// enforces 300s TTL and 3-strike lockout, and re-enables the USB device node upon match (`T35`).
+    /// enforces unconditional 300s TTL and 3-strike lockout, and re-enables the USB device node upon match (`T35`).
     pub fn confirm_device_with_challenge(
         &self,
         device_id: &str,
@@ -165,23 +220,35 @@ impl PendingDeviceConfirmationManager {
             )
         })?;
 
+        if entry.device_id != device_id || !is_valid_challenge_id(&entry.challenge_id) {
+            let challenge_id = entry.challenge_id.clone();
+            map.remove(device_id);
+            let _ = self.save_map(&map);
+            self.purge_token_file(&challenge_id);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("Corrupted confirmation state binding for device '{device_id}'; purged"),
+            ));
+        }
+
         if entry.confirmed {
             return Ok(());
         }
 
         let now = chrono::Utc::now().timestamp();
-        // 300s TTL check
-        if entry.expires_at_unix > 0 && now > entry.expires_at_unix {
+        // Unconditional fail-closed 300s TTL check (`expires_at_unix <= 0` or `created_at_unix <= 0` also rejected)
+        let ttl_invalid_or_expired = entry.created_at_unix <= 0
+            || entry.expires_at_unix <= 0
+            || entry.expires_at_unix < entry.created_at_unix
+            || entry.expires_at_unix.saturating_sub(entry.created_at_unix)
+                > BADUSB_CHALLENGE_TTL_SECS
+            || now > entry.expires_at_unix
+            || now.saturating_sub(entry.created_at_unix) > BADUSB_CHALLENGE_TTL_SECS;
+        if ttl_invalid_or_expired {
             let challenge_id = entry.challenge_id.clone();
             map.remove(device_id);
             let _ = self.save_map(&map);
-
-            let token_dir = self
-                .state_file
-                .parent()
-                .unwrap_or_else(|| Path::new(".sentinel_vault"));
-            let token_path = token_dir.join(format!("pending_challenge_{challenge_id}.token"));
-            let _ = fs::remove_file(token_path);
+            self.purge_token_file(&challenge_id);
 
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -196,13 +263,7 @@ impl PendingDeviceConfirmationManager {
             let challenge_id = entry.challenge_id.clone();
             map.remove(device_id);
             let _ = self.save_map(&map);
-
-            let token_dir = self
-                .state_file
-                .parent()
-                .unwrap_or_else(|| Path::new(".sentinel_vault"));
-            let token_path = token_dir.join(format!("pending_challenge_{challenge_id}.token"));
-            let _ = fs::remove_file(token_path);
+            self.purge_token_file(&challenge_id);
 
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -212,21 +273,19 @@ impl PendingDeviceConfirmationManager {
             ));
         }
 
-        // Constant-time validation
+        // Constant-time SHA-256 hash validation (legacy plaintext fallback strictly prohibited)
         let trimmed_challenge = provided_challenge.trim();
         let candidate_hash = hex::encode(Sha256::digest(
             format!("{device_id}:{trimmed_challenge}").as_bytes(),
         ));
 
-        let is_valid = if !entry.challenge_hash.is_empty() {
+        let is_valid = if entry.challenge_hash.len() == 64
+            && entry.challenge_hash.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            let expected_lower = entry.challenge_hash.to_ascii_lowercase();
             candidate_hash
                 .as_bytes()
-                .ct_eq(entry.challenge_hash.as_bytes())
-                .into()
-        } else if !entry.challenge_code.is_empty() {
-            trimmed_challenge
-                .as_bytes()
-                .ct_eq(entry.challenge_code.trim().as_bytes())
+                .ct_eq(expected_lower.as_bytes())
                 .into()
         } else {
             false
@@ -240,13 +299,7 @@ impl PendingDeviceConfirmationManager {
                 let challenge_id = entry.challenge_id.clone();
                 map.remove(device_id);
                 let _ = self.save_map(&map);
-
-                let token_dir = self
-                    .state_file
-                    .parent()
-                    .unwrap_or_else(|| Path::new(".sentinel_vault"));
-                let token_path = token_dir.join(format!("pending_challenge_{challenge_id}.token"));
-                let _ = fs::remove_file(token_path);
+                self.purge_token_file(&challenge_id);
 
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -269,13 +322,7 @@ impl PendingDeviceConfirmationManager {
         entry.confirmed = true;
         let challenge_id = entry.challenge_id.clone();
         self.save_map(&map)?;
-
-        let token_dir = self
-            .state_file
-            .parent()
-            .unwrap_or_else(|| Path::new(".sentinel_vault"));
-        let token_path = token_dir.join(format!("pending_challenge_{challenge_id}.token"));
-        let _ = fs::remove_file(token_path);
+        self.purge_token_file(&challenge_id);
 
         if let Err(e) = sentinel_sys::enable_device_node(device_id) {
             tracing::warn!("enable_device_node notice for {device_id}: {e}");
@@ -286,7 +333,10 @@ impl PendingDeviceConfirmationManager {
     pub fn is_confirmed(&self, device_id: &str) -> bool {
         self.load_map()
             .ok()
-            .and_then(|m| m.get(device_id).map(|e| e.confirmed))
+            .and_then(|m| {
+                m.get(device_id)
+                    .map(|e| e.confirmed && e.device_id == device_id)
+            })
             .unwrap_or(false)
     }
 

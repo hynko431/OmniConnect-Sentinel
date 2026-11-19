@@ -28,15 +28,72 @@ pub struct SealedKeyBlob {
 }
 
 /// Offline SOC Recovery Escrow Blob (`Master Plan v2 §1.1 #2`, `ADR-005`).
-/// Contains ONLY the RSA-2048-OAEP-SHA256 ciphertext of the 32-byte Master KEK encrypted
+/// Contains ONLY the RSA-3072-OAEP-SHA256 (or stronger) ciphertext of the 32-byte Master KEK encrypted
 /// under the offline SOC public key. No private key material is stored on the endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SocEscrowBlob {
     pub version: u16,
     pub algorithm: String,
     pub kek_id: String,
     pub soc_key_fingerprint: String,
     pub rsa_oaep_ciphertext: Vec<u8>,
+}
+
+/// Wire magic for Hybrid Post-Quantum SOC Escrow Envelope `v3` (`OCESCROW3`, `Sub-Phase 2.2`, `CSE-14`).
+pub const OCESCROW3_MAGIC: &[u8; 9] = b"OCESCROW3";
+/// NIST FIPS 203 `ML-KEM-768` Encapsulation Key byte length (`1184` bytes).
+pub const MLKEM768_EK_LEN: usize = 1184;
+/// NIST FIPS 203 `ML-KEM-768` Decapsulation Key byte length (`2400` bytes).
+pub const MLKEM768_DK_LEN: usize = 2400;
+/// NIST FIPS 203 `ML-KEM-768` Ciphertext byte length (`1088` bytes).
+pub const MLKEM768_CT_LEN: usize = 1088;
+
+/// Offline SOC Hybrid Post-Quantum Public Key Bundle (`RSA-3072-OAEP` + `FIPS 203 ML-KEM-768`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HybridSocPublicKeyBundle {
+    pub version: u16,
+    pub rsa_public_blob: Vec<u8>,
+    pub mlkem768_encapsulation_key: Vec<u8>,
+}
+
+/// Offline Air-Gapped SOC Hybrid Post-Quantum Private Key Bundle (volatile-zeroized on `Drop`).
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HybridSocPrivateKeyBundle {
+    pub rsa_private_blob: Vec<u8>,
+    pub mlkem768_decapsulation_key: Vec<u8>,
+}
+
+impl Drop for HybridSocPrivateKeyBundle {
+    fn drop(&mut self) {
+        zeroize_slice(&mut self.rsa_private_blob);
+        zeroize_slice(&mut self.mlkem768_decapsulation_key);
+    }
+}
+
+/// Hybrid Post-Quantum SOC Recovery Escrow Envelope `v3` (`OCESCROW3`, `Master Plan v2 Sub-Phase 2.2`, `CSE-14`).
+///
+/// Combines a classical `RSA-3072-OAEP-SHA256` shared secret (`ss_rsa`, 32 bytes) with a NIST FIPS 203
+/// `ML-KEM-768` shared secret (`ss_mlkem768`, 32 bytes) via `HKDF-SHA256` bound to both ciphertexts,
+/// wrapping the 32-byte Vault Master KEK under `AES-256-GCM`. Security holds if EITHER `RSA-OAEP` OR
+/// `ML-KEM-768` remains unbroken ("harvest-now, decrypt-later" protection).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HybridSocEscrowBlobV3 {
+    pub magic: String,
+    pub version: u16,
+    pub algorithm: String,
+    pub kek_id: String,
+    pub soc_rsa_fingerprint: String,
+    pub soc_mlkem768_fingerprint: String,
+    pub hkdf_salt: Vec<u8>,
+    pub aes_gcm_nonce: Vec<u8>,
+    pub rsa_oaep_ciphertext: Vec<u8>,
+    pub mlkem768_ciphertext: Vec<u8>,
+    pub wrapped_kek_ciphertext: Vec<u8>,
+    pub ocescrow3_wire_bytes: Vec<u8>,
 }
 
 /// Sealed Asymmetric ECDSA P-256 Keypair Blob for Tamper-Evident Audit Ledger & Policy Signing (`Phase 4.2`, `Phase 4.4`).
@@ -51,28 +108,6 @@ pub struct SealedEcdsaKeyPair {
     pub sealed_private_key: Option<SealedKeyBlob>,
     #[serde(default)]
     pub reduced_posture_event: Option<String>,
-}
-
-use std::sync::OnceLock;
-
-static DEFAULT_SOC_RSA_KEYPAIR: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
-
-fn get_or_init_default_soc_rsa_keypair() -> &'static (Vec<u8>, Vec<u8>) {
-    DEFAULT_SOC_RSA_KEYPAIR.get_or_init(|| {
-        generate_soc_rsa_keypair_software().unwrap_or_else(|e| {
-            panic!("Failed generating default SOC RSA keypair: {e}");
-        })
-    })
-}
-
-/// Returns a genuine 2048-bit RSA public key blob in CNG `RSAPUBLICBLOB` format (`Master Plan v2 §4 Sub-Phase 0.2`, `CSE-04`).
-pub fn default_soc_rsa_public_blob() -> Vec<u8> {
-    get_or_init_default_soc_rsa_keypair().0.clone()
-}
-
-/// Returns the matching genuine 2048-bit RSA private key blob in CNG `RSAPRIVATEBLOB` format.
-pub fn default_soc_rsa_private_blob() -> Vec<u8> {
-    get_or_init_default_soc_rsa_keypair().1.clone()
 }
 
 #[cfg(windows)]
@@ -365,8 +400,9 @@ fn tpm_pcp_rsa_seal(raw_key: &[u8], entropy_tag: &[u8], kek_id: &str) -> io::Res
     }
 
     if open_status != 0 || h_key == 0 {
-        // Create a non-exportable 2048-bit RSA key in the TPM 2.0 PCP (omitting NCRYPT_ALLOW_EXPORT_FLAG)
-        let mut create_status = unsafe {
+        // Strictly require NCRYPT_MACHINE_KEY_FLAG so persisted TPM keys are machine-scoped
+        // (never bound to an ephemeral user/container SID).
+        let create_status = unsafe {
             NCryptCreatePersistedKey(
                 h_prov,
                 &mut h_key,
@@ -376,18 +412,6 @@ fn tpm_pcp_rsa_seal(raw_key: &[u8], entropy_tag: &[u8], kek_id: &str) -> io::Res
                 NCRYPT_MACHINE_KEY_FLAG,
             )
         };
-        if create_status != 0 || h_key == 0 {
-            create_status = unsafe {
-                NCryptCreatePersistedKey(
-                    h_prov,
-                    &mut h_key,
-                    alg_rsa.as_ptr(),
-                    key_name.as_ptr(),
-                    0,
-                    0,
-                )
-            };
-        }
         if create_status != 0 || h_key == 0 {
             unsafe {
                 let _ = NCryptFreeObject(h_prov);
@@ -1003,8 +1027,8 @@ fn unix_authenticated_unseal(
     unix_authenticated_unseal_with_secret(sealed, master_secret, entropy_tag, kek_id)
 }
 
-/// Generates an ephemeral 2048-bit RSA keypair `(rsapublicblob, rsaprivateblob)` via Windows CNG `BCryptGenerateKeyPair`
-/// for offline SOC escrow testing and key provisioning.
+/// Generates a 3072-bit RSA keypair `(rsapublicblob, rsaprivateblob)` via Windows CNG `BCryptGenerateKeyPair`
+/// for offline SOC escrow provisioning and testing (`CNSA 2.0` / `CEA-DEFECT-03`).
 pub fn generate_soc_rsa_keypair() -> io::Result<(Vec<u8>, Vec<u8>)> {
     #[cfg(windows)]
     {
@@ -1023,13 +1047,13 @@ pub fn generate_soc_rsa_keypair() -> io::Result<(Vec<u8>, Vec<u8>)> {
         }
 
         let mut h_key: usize = 0;
-        let gen_status = unsafe { BCryptGenerateKeyPair(h_alg, &mut h_key, 2048, 0) };
+        let gen_status = unsafe { BCryptGenerateKeyPair(h_alg, &mut h_key, 3072, 0) };
         if gen_status != 0 || h_key == 0 {
             unsafe {
                 let _ = BCryptCloseAlgorithmProvider(h_alg, 0);
             }
             return Err(io::Error::other(format!(
-                "BCryptGenerateKeyPair(2048) failed: 0x{:08X}",
+                "BCryptGenerateKeyPair(3072) failed: 0x{:08X}",
                 gen_status as u32
             )));
         }
@@ -1113,16 +1137,27 @@ pub fn generate_soc_rsa_keypair() -> io::Result<(Vec<u8>, Vec<u8>)> {
     }
 }
 
-/// Asymmetrically encrypts the 32-byte Master KEK to the offline SOC RSA-2048 public key
+/// Asymmetrically encrypts the 32-byte Master KEK to the offline SOC RSA-3072 (or stronger) public key
 /// using Windows CNG `BCryptImportKeyPair("RSAPUBLICBLOB")` + `BCryptEncrypt(BCRYPT_PAD_OAEP)` (`Master Plan v2 §1.1 #2`).
 ///
-/// The resulting `SocEscrowBlob` can ONLY be decrypted by the offline SOC RSA-2048 private key,
-/// surviving total host/TPM/motherboard destruction.
+/// The resulting `SocEscrowBlob` can ONLY be decrypted by the offline SOC RSA private key,
+/// surviving total host/TPM/motherboard destruction. Rejects RSA keys weaker than 3072 bits.
 pub fn encrypt_kek_for_soc_escrow(
     kek: &[u8; 32],
     soc_rsa_pub_blob: &[u8],
     kek_id: &str,
 ) -> io::Result<SocEscrowBlob> {
+    use rsa::traits::PublicKeyParts;
+
+    let pub_key = parse_rsa_public_key(soc_rsa_pub_blob)?;
+    let rsa_bits = pub_key.n().bit_width();
+    if rsa_bits < 3072 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("SOC RSA public key strength ({rsa_bits} bits) must be >= 3072 bits"),
+        ));
+    }
+
     let mut fp_hasher = Sha256::new();
     fp_hasher.update(soc_rsa_pub_blob);
     let soc_key_fingerprint = hex_encode(&fp_hasher.finalize()[..16]);
@@ -1216,7 +1251,7 @@ pub fn encrypt_kek_for_soc_escrow(
 
         Ok(SocEscrowBlob {
             version: 2,
-            algorithm: "RSA-2048-OAEP-SHA256".to_string(),
+            algorithm: format!("RSA-{rsa_bits}-OAEP-SHA256"),
             kek_id: kek_id.to_string(),
             soc_key_fingerprint,
             rsa_oaep_ciphertext: ciphertext,
@@ -1230,11 +1265,50 @@ pub fn encrypt_kek_for_soc_escrow(
 }
 
 /// Decrypts an offline `SocEscrowBlob` back into the 32-byte Master KEK using the offline SOC
-/// RSA-2048 private key (`BCryptImportKeyPair("RSAPRIVATEBLOB")` + `BCryptDecrypt(BCRYPT_PAD_OAEP)`).
+/// RSA-3072+ private key (`BCryptImportKeyPair("RSAPRIVATEBLOB")` + `BCryptDecrypt(BCRYPT_PAD_OAEP)`).
 pub fn decrypt_kek_from_soc_escrow(
     escrow: &SocEscrowBlob,
     soc_rsa_priv_blob: &[u8],
 ) -> io::Result<[u8; 32]> {
+    use rsa::traits::PublicKeyParts;
+
+    if escrow.version != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Unsupported SocEscrowBlob version {} (expected 2)",
+                escrow.version
+            ),
+        ));
+    }
+    let priv_key = parse_rsa_private_key(soc_rsa_priv_blob)?;
+    let rsa_bits = priv_key.n().bit_width();
+    if rsa_bits < 3072 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("SOC RSA private key strength ({rsa_bits} bits) must be >= 3072 bits"),
+        ));
+    }
+    let expected_alg = format!("RSA-{rsa_bits}-OAEP-SHA256");
+    if escrow.algorithm != expected_alg {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Unsupported SocEscrowBlob algorithm '{}' (expected '{expected_alg}')",
+                escrow.algorithm
+            ),
+        ));
+    }
+    if escrow.rsa_oaep_ciphertext.len() < 384 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "RSA-OAEP ciphertext length {} is below 3072-bit minimum (384 bytes)",
+                escrow.rsa_oaep_ciphertext.len()
+            ),
+        ));
+    }
+
     #[cfg(windows)]
     {
         let alg_rsa = to_wide("RSA");
@@ -1275,7 +1349,7 @@ pub fn decrypt_kek_from_soc_escrow(
             cb_label: label.len() as u32,
         };
 
-        let mut plain = vec![0u8; escrow.rsa_oaep_ciphertext.len().max(256)];
+        let mut plain = vec![0u8; escrow.rsa_oaep_ciphertext.len().max(384)];
         let mut cb_plain: u32 = 0;
         let dec_status = unsafe {
             BCryptDecrypt(
@@ -1612,19 +1686,57 @@ pub fn sign_ecdsa_p256_digest_software(
     let signature: p256::ecdsa::Signature = signing_key
         .sign_prehash(sha256_digest)
         .map_err(|e| io::Error::other(format!("ECDSA P-256 prehash signing failed: {e}")))?;
-    Ok(signature.to_bytes().to_vec())
+    Ok(signature.normalize_s().to_bytes().to_vec())
 }
 
-/// Pure-Rust constant-time ECDSA P-256 signature verification accepting both 72-byte ECS1 and 65-byte SEC1.
+/// Normalizes a 64-byte `(r || s)` ECDSA P-256 signature to canonical low-S (`s <= (n - 1) / 2`)
+/// so `(r, n - s)` signature malleability is eliminated across TPM 2.0 PCP, Windows CNG, and pure-Rust paths.
+fn normalize_ecdsa_p256_signature_low_s(raw_sig: &[u8]) -> io::Result<Vec<u8>> {
+    let sig = p256::ecdsa::Signature::from_slice(raw_sig).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid 64-byte ECDSA P-256 signature encoding: {e}"),
+        )
+    })?;
+    Ok(sig.normalize_s().to_bytes().to_vec())
+}
+
+fn is_canonical_low_s_ecdsa_p256_signature(raw_sig: &[u8]) -> bool {
+    use p256::elliptic_curve::subtle::ConstantTimeEq;
+    match p256::ecdsa::Signature::from_slice(raw_sig) {
+        Ok(sig) => bool::from(sig.normalize_s().to_bytes().as_slice().ct_eq(raw_sig)),
+        Err(_) => false,
+    }
+}
+
+/// Validates that a 65-byte uncompressed SEC1 (`0x04 || X[32] || Y[32]`) byte slice represents
+/// a valid affine point on the NIST P-256 (`secp256r1`) curve.
+pub fn validate_p256_uncompressed_point(sec1_65: &[u8]) -> io::Result<()> {
+    if sec1_65.len() != 65 || sec1_65[0] != 0x04 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid P-256 uncompressed SEC1 length or prefix",
+        ));
+    }
+    p256::ecdsa::VerifyingKey::from_sec1_bytes(sec1_65).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid secp256r1 curve point: {e}"),
+        )
+    })?;
+    Ok(())
+}
+
+/// Pure-Rust constant-time ECDSA P-256 signature verification accepting canonical 72-byte ECS1 and 65-byte SEC1.
 pub fn verify_ecdsa_p256_digest_software(
     ecc_public_blob: &[u8],
     sha256_digest: &[u8; 32],
     signature: &[u8],
 ) -> io::Result<bool> {
-    if signature.len() != 64 {
+    if signature.len() != 64 || !is_canonical_low_s_ecdsa_p256_signature(signature) {
         return Ok(false);
     }
-    let verifying_key = if ecc_public_blob.len() >= 72 && &ecc_public_blob[0..4] == b"ECS1" {
+    let verifying_key = if ecc_public_blob.len() == 72 && &ecc_public_blob[0..4] == b"ECS1" {
         let cb_key = u32::from_le_bytes([
             ecc_public_blob[4],
             ecc_public_blob[5],
@@ -1680,7 +1792,7 @@ fn tpm_pcp_ecdsa_create_or_open_pubkey(key_id: &str) -> io::Result<Vec<u8>> {
     let pub_type = to_wide("ECCPUBLICBLOB");
     let mut h_key: usize = 0;
 
-    let mut open_status = unsafe {
+    let open_status = unsafe {
         NCryptOpenKey(
             h_prov,
             &mut h_key,
@@ -1690,10 +1802,7 @@ fn tpm_pcp_ecdsa_create_or_open_pubkey(key_id: &str) -> io::Result<Vec<u8>> {
         )
     };
     if open_status != 0 || h_key == 0 {
-        open_status = unsafe { NCryptOpenKey(h_prov, &mut h_key, key_name.as_ptr(), 0, 0) };
-    }
-    if open_status != 0 || h_key == 0 {
-        let mut create_status = unsafe {
+        let create_status = unsafe {
             NCryptCreatePersistedKey(
                 h_prov,
                 &mut h_key,
@@ -1704,24 +1813,12 @@ fn tpm_pcp_ecdsa_create_or_open_pubkey(key_id: &str) -> io::Result<Vec<u8>> {
             )
         };
         if create_status != 0 || h_key == 0 {
-            create_status = unsafe {
-                NCryptCreatePersistedKey(
-                    h_prov,
-                    &mut h_key,
-                    alg_ecdsa.as_ptr(),
-                    key_name.as_ptr(),
-                    0,
-                    0,
-                )
-            };
-        }
-        if create_status != 0 || h_key == 0 {
             unsafe {
                 let _ = NCryptFreeObject(h_prov);
             }
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "NCryptCreatePersistedKey(ECDSA_P256) failed on TPM PCP",
+                "NCryptCreatePersistedKey(ECDSA_P256, NCRYPT_MACHINE_KEY_FLAG) failed on TPM PCP",
             ));
         }
         let fin_status = unsafe { NCryptFinalizeKey(h_key, NCRYPT_SILENT_FLAG) };
@@ -1735,12 +1832,12 @@ fn tpm_pcp_ecdsa_create_or_open_pubkey(key_id: &str) -> io::Result<Vec<u8>> {
             ));
         }
 
-        // Verify key was actually persisted and can be reopened by NCryptOpenKey across processes
+        // Verify machine-scoped key was persisted and can be reopened with NCRYPT_MACHINE_KEY_FLAG
         unsafe {
             let _ = NCryptFreeObject(h_key);
         }
         let mut reopen_key: usize = 0;
-        let mut reopen_status = unsafe {
+        let reopen_status = unsafe {
             NCryptOpenKey(
                 h_prov,
                 &mut reopen_key,
@@ -1749,10 +1846,6 @@ fn tpm_pcp_ecdsa_create_or_open_pubkey(key_id: &str) -> io::Result<Vec<u8>> {
                 NCRYPT_MACHINE_KEY_FLAG,
             )
         };
-        if reopen_status != 0 || reopen_key == 0 {
-            reopen_status =
-                unsafe { NCryptOpenKey(h_prov, &mut reopen_key, key_name.as_ptr(), 0, 0) };
-        }
         if reopen_status != 0 || reopen_key == 0 {
             unsafe {
                 let _ = NCryptFreeObject(h_prov);
@@ -1904,7 +1997,7 @@ pub fn sign_with_sealed_ecdsa_p256(
                 )));
             }
             sig.truncate(cb_sig as usize);
-            return Ok(sig);
+            return normalize_ecdsa_p256_signature_low_s(&sig);
         }
     }
 
@@ -1991,7 +2084,7 @@ pub fn sign_ecdsa_p256_with_private_blob(
             )));
         }
         sig.truncate(cb_sig as usize);
-        Ok(sig)
+        normalize_ecdsa_p256_signature_low_s(&sig)
     }
 
     #[cfg(not(windows))]
@@ -2007,10 +2100,13 @@ pub fn verify_ecdsa_p256_digest(
     sha256_digest: &[u8; 32],
     signature: &[u8],
 ) -> io::Result<bool> {
-    if signature.len() != 64 {
+    if signature.len() != 64 || !is_canonical_low_s_ecdsa_p256_signature(signature) {
         return Ok(false);
     }
-    if ecc_public_blob.len() != 65 && ecc_public_blob.len() < 72 {
+    if ecc_public_blob.len() != 65 && ecc_public_blob.len() != 72 {
+        return Ok(false);
+    }
+    if ecc_public_blob.len() == 72 && &ecc_public_blob[0..8] != b"ECS1\x20\x00\x00\x00" {
         return Ok(false);
     }
 
@@ -2206,23 +2302,50 @@ pub fn export_rsa_private_key_to_cng(priv_key: &rsa::PrivateKey) -> io::Result<V
 
 /// Parses an RSA public key from Windows CNG `RSAPUBLICBLOB` format.
 pub fn parse_rsa_public_key(blob: &[u8]) -> io::Result<rsa::PublicKey> {
+    use rsa::traits::PublicKeyParts;
     use rsa::BoxedUint;
     if blob.len() >= 24 && &blob[0..4] == b"RSA1" {
         let bit_len = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
         let cb_exp = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]) as usize;
         let cb_mod = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]) as usize;
+        let cb_p1 = u32::from_le_bytes([blob[16], blob[17], blob[18], blob[19]]) as usize;
+        let cb_p2 = u32::from_le_bytes([blob[20], blob[21], blob[22], blob[23]]) as usize;
 
-        if bit_len < 2048 {
+        if cb_p1 != 0 || cb_p2 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Insecure RSA key length: {bit_len} bits (must be >= 2048)"),
+                "Malformed RSAPUBLICBLOB: non-zero prime lengths in public blob header",
+            ));
+        }
+        if !(1..=8).contains(&cb_exp) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid RSA public exponent byte length: {cb_exp}"),
+            ));
+        }
+        if !(384..=1024).contains(&cb_mod) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Insecure or unsupported RSA modulus byte length: {cb_mod} (must be 384..=1024 bytes / 3072..=8192 bits)"),
+            ));
+        }
+        if bit_len < 3072 || bit_len != cb_mod * 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid RSAPUBLICBLOB bit_len header: bit_len={bit_len}, cb_mod={cb_mod} (expected {} bits >= 3072)",
+                    cb_mod * 8
+                ),
             ));
         }
         let total_required = 24 + cb_exp + cb_mod;
-        if blob.len() < total_required {
+        if blob.len() != total_required {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Truncated RSAPUBLICBLOB",
+                format!(
+                    "Malformed RSAPUBLICBLOB length: expected {total_required} bytes, got {}",
+                    blob.len()
+                ),
             ));
         }
         let exp_bytes = &blob[24..24 + cb_exp];
@@ -2238,12 +2361,22 @@ pub fn parse_rsa_public_key(blob: &[u8]) -> io::Result<rsa::PublicKey> {
             )
         })?;
 
-        rsa::PublicKey::new(n, e).map_err(|err| {
+        let pub_key = rsa::PublicKey::new(n, e).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Invalid RSA public key: {err}"),
             )
-        })
+        })?;
+        let actual_bits = pub_key.n().bit_width() as usize;
+        if actual_bits < 3072 || actual_bits <= (cb_mod - 1) * 8 || actual_bits > cb_mod * 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "RSA public key mathematical modulus width ({actual_bits} bits) fails >= 3072-bit floor or mismatches declared {bit_len}-bit strength"
+                ),
+            ));
+        }
+        Ok(pub_key)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2254,26 +2387,65 @@ pub fn parse_rsa_public_key(blob: &[u8]) -> io::Result<rsa::PublicKey> {
 
 /// Parses an RSA private key from Windows CNG `RSAPRIVATEBLOB` format.
 pub fn parse_rsa_private_key(blob: &[u8]) -> io::Result<rsa::PrivateKey> {
+    use rsa::traits::PublicKeyParts;
     use rsa::BoxedUint;
     if blob.len() >= 24 && &blob[0..4] == b"RSA2" {
-        let _bit_len = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
+        let bit_len = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
         let cb_exp = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]) as usize;
         let cb_mod = u32::from_le_bytes([blob[12], blob[13], blob[14], blob[15]]) as usize;
         let cb_p1 = u32::from_le_bytes([blob[16], blob[17], blob[18], blob[19]]) as usize;
         let cb_p2 = u32::from_le_bytes([blob[20], blob[21], blob[22], blob[23]]) as usize;
 
-        let total_required = 24 + cb_exp + cb_mod + cb_p1 + cb_p2;
-        if blob.len() < total_required {
+        if !(1..=8).contains(&cb_exp) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Truncated RSAPRIVATEBLOB",
+                format!("Invalid RSA exponent byte length: {cb_exp}"),
+            ));
+        }
+        if !(384..=1024).contains(&cb_mod) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Insecure or unsupported RSA private modulus byte length: {cb_mod} (must be 384..=1024 bytes / >= 3072 bits)"),
+            ));
+        }
+        if bit_len < 3072 || bit_len != cb_mod * 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid RSAPRIVATEBLOB bit_len header: bit_len={bit_len}, cb_mod={cb_mod} (must be >= 3072 bits)"
+                ),
+            ));
+        }
+        if cb_p1 < 192 || cb_p2 < 192 || cb_p1 + cb_p2 != cb_mod {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid RSAPRIVATEBLOB prime lengths: cb_p1={cb_p1}, cb_p2={cb_p2}, cb_mod={cb_mod}"),
+            ));
+        }
+
+        let total_required = 24 + cb_exp + cb_mod + cb_p1 + cb_p2;
+        if blob.len() != total_required {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Malformed RSAPRIVATEBLOB length: expected {total_required} bytes, got {}",
+                    blob.len()
+                ),
             ));
         }
 
         let exp_bytes = &blob[24..24 + cb_exp];
+        let mod_bytes = &blob[24 + cb_exp..24 + cb_exp + cb_mod];
         let p1_bytes = &blob[24 + cb_exp + cb_mod..24 + cb_exp + cb_mod + cb_p1];
         let p2_bytes = &blob[24 + cb_exp + cb_mod + cb_p1..24 + cb_exp + cb_mod + cb_p1 + cb_p2];
 
+        let declared_n =
+            BoxedUint::from_be_slice(mod_bytes, (cb_mod * 8) as u32).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Invalid modulus in RSAPRIVATEBLOB: {err}"),
+                )
+            })?;
         let e = BoxedUint::from_be_slice(exp_bytes, (cb_exp * 8) as u32).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2293,12 +2465,26 @@ pub fn parse_rsa_private_key(blob: &[u8]) -> io::Result<rsa::PrivateKey> {
             )
         })?;
 
-        rsa::PrivateKey::from_primes(vec![p, q], e).map_err(|err| {
+        let priv_key = rsa::PrivateKey::from_primes(vec![p, q], e).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Invalid RSA private key: {err}"),
             )
-        })
+        })?;
+        let actual_bits = priv_key.n().bit_width() as usize;
+        if **priv_key.n() != declared_n
+            || actual_bits < 3072
+            || actual_bits <= (cb_mod - 1) * 8
+            || actual_bits > cb_mod * 8
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "RSAPRIVATEBLOB modulus consistency/strength check failed ({actual_bits} bits < 3072)"
+                ),
+            ));
+        }
+        Ok(priv_key)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2307,28 +2493,31 @@ pub fn parse_rsa_private_key(blob: &[u8]) -> io::Result<rsa::PrivateKey> {
     }
 }
 
-/// Pure-Rust software RSA keypair generator producing genuine 2048-bit keys in CNG layout.
+/// Pure-Rust software RSA keypair generator producing genuine 3072-bit keys in CNG layout (`CNSA 2.0`).
 pub fn generate_soc_rsa_keypair_software() -> io::Result<(Vec<u8>, Vec<u8>)> {
-    let mut rng = RsaRngAdapter;
-    let priv_key = rsa::PrivateKey::new(&mut rng, 2048)
-        .map_err(|e| io::Error::other(format!("RSA 2048-bit keypair generation failed: {e}")))?;
-    let pub_key = rsa::PublicKey::from(&priv_key);
-    let pub_blob = export_rsa_public_key_to_cng(&pub_key);
-    let priv_blob = export_rsa_private_key_to_cng(&priv_key)?;
-    Ok((pub_blob, priv_blob))
+    generate_soc_rsa_3072_keypair_software()
 }
 
-/// Pure-Rust software RSA-OAEP-SHA256 encryption.
+/// Pure-Rust software RSA-OAEP-SHA256 encryption (enforces RSA >= 3072 bits).
 pub fn encrypt_kek_for_soc_escrow_software(
     kek: &[u8; 32],
     soc_rsa_pub_blob: &[u8],
     kek_id: &str,
 ) -> io::Result<SocEscrowBlob> {
+    use rsa::traits::PublicKeyParts;
+
     let mut fp_hasher = Sha256::new();
     fp_hasher.update(soc_rsa_pub_blob);
     let soc_key_fingerprint = hex_encode(&fp_hasher.finalize()[..16]);
 
     let pub_key = parse_rsa_public_key(soc_rsa_pub_blob)?;
+    let rsa_bits = pub_key.n().bit_width();
+    if rsa_bits < 3072 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("SOC RSA public key strength ({rsa_bits} bits) must be >= 3072 bits"),
+        ));
+    }
     let label = format!("SOC-OFFLINE-ESCROW-RECOVERY-V2:{kek_id}")
         .into_bytes()
         .into_boxed_slice();
@@ -2342,19 +2531,56 @@ pub fn encrypt_kek_for_soc_escrow_software(
 
     Ok(SocEscrowBlob {
         version: 2,
-        algorithm: "RSA-2048-OAEP-SHA256".to_string(),
+        algorithm: format!("RSA-{rsa_bits}-OAEP-SHA256"),
         kek_id: kek_id.to_string(),
         soc_key_fingerprint,
         rsa_oaep_ciphertext: ciphertext,
     })
 }
 
-/// Pure-Rust software RSA-OAEP-SHA256 decryption.
+/// Pure-Rust software RSA-OAEP-SHA256 decryption (enforces RSA >= 3072 bits).
 pub fn decrypt_kek_from_soc_escrow_software(
     escrow: &SocEscrowBlob,
     soc_rsa_priv_blob: &[u8],
 ) -> io::Result<[u8; 32]> {
+    use rsa::traits::PublicKeyParts;
+
+    if escrow.version != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Unsupported SocEscrowBlob version {} (expected 2)",
+                escrow.version
+            ),
+        ));
+    }
     let priv_key = parse_rsa_private_key(soc_rsa_priv_blob)?;
+    let rsa_bits = priv_key.n().bit_width();
+    if rsa_bits < 3072 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("SOC RSA private key strength ({rsa_bits} bits) must be >= 3072 bits"),
+        ));
+    }
+    let expected_alg = format!("RSA-{rsa_bits}-OAEP-SHA256");
+    if escrow.algorithm != expected_alg {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Unsupported SocEscrowBlob algorithm '{}' (expected '{expected_alg}')",
+                escrow.algorithm
+            ),
+        ));
+    }
+    if escrow.rsa_oaep_ciphertext.len() < 384 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "RSA-OAEP ciphertext length {} is below 3072-bit minimum (384 bytes)",
+                escrow.rsa_oaep_ciphertext.len()
+            ),
+        ));
+    }
     let label = format!("SOC-OFFLINE-ESCROW-RECOVERY-V2:{}", escrow.kek_id)
         .into_bytes()
         .into_boxed_slice();
@@ -2385,6 +2611,674 @@ pub fn decrypt_kek_from_soc_escrow_software(
     kek.copy_from_slice(&plaintext);
     zeroize_slice(&mut plaintext);
     Ok(kek)
+}
+
+/// Generates a genuine 3072-bit RSA keypair in CNG `RSAPUBLICBLOB` / `RSAPRIVATEBLOB` format (`CNSA 2.0` / `Sub-Phase 2.2`).
+pub fn generate_soc_rsa_3072_keypair_software() -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut rng = RsaRngAdapter;
+    let priv_key = rsa::PrivateKey::new(&mut rng, 3072)
+        .map_err(|e| io::Error::other(format!("RSA 3072-bit keypair generation failed: {e}")))?;
+    let pub_key = rsa::PublicKey::from(&priv_key);
+    let pub_blob = export_rsa_public_key_to_cng(&pub_key);
+    let priv_blob = export_rsa_private_key_to_cng(&priv_key)?;
+    Ok((pub_blob, priv_blob))
+}
+
+/// Generates a NIST FIPS 203 `ML-KEM-768` `(encapsulation_key_1184, decapsulation_key_2400)` pair using `OsRng`.
+pub fn generate_mlkem768_keypair() -> (Vec<u8>, Vec<u8>) {
+    use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
+    type MlKem768Dk = <MlKem768 as KemCore>::DecapsulationKey;
+    type MlKem768Ek = <MlKem768 as KemCore>::EncapsulationKey;
+
+    let (dk, ek): (MlKem768Dk, MlKem768Ek) = MlKem768::generate(&mut rand::rngs::OsRng);
+    let ek_bytes = ek.as_bytes().as_slice().to_vec();
+    let dk_bytes = dk.as_bytes().as_slice().to_vec();
+    (ek_bytes, dk_bytes)
+}
+
+/// Generates an offline SOC Hybrid Post-Quantum Keypair (`RSA-3072` + `FIPS 203 ML-KEM-768`) for `OCESCROW3`.
+pub fn generate_hybrid_soc_keypair_v3(
+) -> io::Result<(HybridSocPublicKeyBundle, HybridSocPrivateKeyBundle)> {
+    generate_hybrid_soc_keypair_with_bits(3072)
+}
+
+/// Generates an offline SOC Hybrid Post-Quantum Keypair with configurable RSA modulus size (`>= 3072` bits) + `ML-KEM-768`.
+pub fn generate_hybrid_soc_keypair_with_bits(
+    rsa_bits: usize,
+) -> io::Result<(HybridSocPublicKeyBundle, HybridSocPrivateKeyBundle)> {
+    if rsa_bits < 3072 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Insecure RSA bit length {rsa_bits}: must be >= 3072 bits (CNSA 2.0 / CEA-DEFECT-03)"),
+        ));
+    }
+    let mut rng = RsaRngAdapter;
+    let priv_key = rsa::PrivateKey::new(&mut rng, rsa_bits).map_err(|e| {
+        io::Error::other(format!("RSA {rsa_bits}-bit keypair generation failed: {e}"))
+    })?;
+    let pub_key = rsa::PublicKey::from(&priv_key);
+    let rsa_public_blob = export_rsa_public_key_to_cng(&pub_key);
+    let rsa_private_blob = export_rsa_private_key_to_cng(&priv_key)?;
+    let (mlkem768_encapsulation_key, mlkem768_decapsulation_key) = generate_mlkem768_keypair();
+
+    Ok((
+        HybridSocPublicKeyBundle {
+            version: 3,
+            rsa_public_blob,
+            mlkem768_encapsulation_key,
+        },
+        HybridSocPrivateKeyBundle {
+            rsa_private_blob,
+            mlkem768_decapsulation_key,
+        },
+    ))
+}
+
+fn derive_ocescrow3_wrap_key(
+    ss_rsa: &[u8; 32],
+    ss_mlkem768: &[u8; 32],
+    hkdf_salt: &[u8; 16],
+    kek_id: &str,
+    ct_rsa: &[u8],
+    ct_mlkem768: &[u8],
+) -> io::Result<crate::mem_guard::ZeroizingBytes<32>> {
+    use hkdf::Hkdf;
+
+    // Concatenate classical + post-quantum shared secrets in pinned zeroizing memory:
+    // IKM = ss_rsa (32B) || ss_mlkem768 (32B)
+    let mut ikm_raw = [0u8; 64];
+    ikm_raw[..32].copy_from_slice(ss_rsa);
+    ikm_raw[32..64].copy_from_slice(ss_mlkem768);
+    let ikm = crate::mem_guard::ZeroizingBytes::new(ikm_raw);
+    zeroize_slice(&mut ikm_raw);
+
+    // Bind both ciphertexts and kek_id into HKDF info for IND-CCA2 hybrid KEM security
+    let ct_rsa_hash = Sha256::digest(ct_rsa);
+    let ct_mlkem_hash = Sha256::digest(ct_mlkem768);
+    let mut info = Vec::with_capacity(32 + kek_id.len() + 64);
+    info.extend_from_slice(b"OMNICONNECT-HYBRID-ESCROW-V3|");
+    info.extend_from_slice(kek_id.as_bytes());
+    info.push(b'|');
+    info.extend_from_slice(&ct_rsa_hash);
+    info.extend_from_slice(&ct_mlkem_hash);
+
+    let hk = Hkdf::<Sha256>::new(Some(hkdf_salt), ikm.as_slice());
+    let mut okm = [0u8; 32];
+    hk.expand(&info, &mut okm)
+        .map_err(|_| io::Error::other("HKDF-SHA256 expand failed in OCESCROW3 combiner"))?;
+    let wrap_key = crate::mem_guard::ZeroizingBytes::new(okm);
+    zeroize_slice(&mut okm);
+    Ok(wrap_key)
+}
+
+/// Encodes an `OCESCROW3` binary wire envelope:
+/// `b"OCESCROW3" (9B) || version_u16_le (2B) || hkdf_salt (16B) || aes_nonce (12B) || ct_rsa_len_u32_le (4B) || ct_rsa || ct_mlkem768 (1088B) || wrapped_kek_tag (48B)`.
+pub fn encode_ocescrow3_wire(
+    hkdf_salt: &[u8; 16],
+    aes_nonce: &[u8; 12],
+    ct_rsa: &[u8],
+    ct_mlkem768: &[u8],
+    wrapped_kek_ct: &[u8],
+) -> Vec<u8> {
+    let mut wire = Vec::with_capacity(
+        9 + 2 + 16 + 12 + 4 + ct_rsa.len() + ct_mlkem768.len() + wrapped_kek_ct.len(),
+    );
+    wire.extend_from_slice(OCESCROW3_MAGIC);
+    wire.extend_from_slice(&3u16.to_le_bytes());
+    wire.extend_from_slice(hkdf_salt);
+    wire.extend_from_slice(aes_nonce);
+    wire.extend_from_slice(&(ct_rsa.len() as u32).to_le_bytes());
+    wire.extend_from_slice(ct_rsa);
+    wire.extend_from_slice(ct_mlkem768);
+    wire.extend_from_slice(wrapped_kek_ct);
+    wire
+}
+
+/// NIST FIPS 202 SHA3-256 (`Keccak[512](M || 01, 256)`) for NIST FIPS 203 §7.3 `H(ek)` verification.
+fn fips202_sha3_256(msg: &[u8]) -> [u8; 32] {
+    const RC: [u64; 24] = [
+        0x0000000000000001,
+        0x0000000000008082,
+        0x800000000000808a,
+        0x8000000080008000,
+        0x000000000000808b,
+        0x0000000080000001,
+        0x8000000080008081,
+        0x8000000000008009,
+        0x000000000000008a,
+        0x0000000000000088,
+        0x0000000080008009,
+        0x000000008000000a,
+        0x000000008000808b,
+        0x800000000000008b,
+        0x8000000000008089,
+        0x8000000000008003,
+        0x8000000000008002,
+        0x8000000000000080,
+        0x000000000000800a,
+        0x800000008000000a,
+        0x8000000080008081,
+        0x8000000000008080,
+        0x0000000080000001,
+        0x8000000080008008,
+    ];
+    const RHO: [u32; 24] = [
+        1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
+    ];
+    const PI: [usize; 24] = [
+        10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
+    ];
+
+    fn keccak_f1600(st: &mut [u64; 25]) {
+        for &rc in &RC {
+            let mut c = [0u64; 5];
+            for x in 0..5 {
+                c[x] = st[x] ^ st[x + 5] ^ st[x + 10] ^ st[x + 15] ^ st[x + 20];
+            }
+            for x in 0..5 {
+                let d = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+                for y in (0..25).step_by(5) {
+                    st[y + x] ^= d;
+                }
+            }
+            let mut cur = st[1];
+            for t in 0..24 {
+                let next_idx = PI[t];
+                let tmp = st[next_idx];
+                st[next_idx] = cur.rotate_left(RHO[t]);
+                cur = tmp;
+            }
+            for y in (0..25).step_by(5) {
+                let row = [st[y], st[y + 1], st[y + 2], st[y + 3], st[y + 4]];
+                for x in 0..5 {
+                    st[y + x] = row[x] ^ ((!row[(x + 1) % 5]) & row[(x + 2) % 5]);
+                }
+            }
+            st[0] ^= rc;
+        }
+    }
+
+    const RATE: usize = 136;
+    let mut state = [0u64; 25];
+    let (blocks, rem) = msg.as_chunks::<RATE>();
+    for block in blocks {
+        for (i, lane_bytes) in block.as_chunks::<8>().0.iter().enumerate() {
+            state[i] ^= u64::from_le_bytes(*lane_bytes);
+        }
+        keccak_f1600(&mut state);
+    }
+    let mut pad = [0u8; RATE];
+    pad[..rem.len()].copy_from_slice(rem);
+    pad[rem.len()] ^= 0x06;
+    pad[RATE - 1] ^= 0x80;
+    for (i, lane_bytes) in pad.as_chunks::<8>().0.iter().enumerate() {
+        state[i] ^= u64::from_le_bytes(*lane_bytes);
+    }
+    keccak_f1600(&mut state);
+
+    let mut out = [0u8; 32];
+    for i in 0..4 {
+        out[i * 8..(i + 1) * 8].copy_from_slice(&state[i].to_le_bytes());
+    }
+    out
+}
+
+fn validate_mlkem768_12bit_poly_vec(encoded_1152: &[u8], label: &str) -> io::Result<()> {
+    const MLKEM_Q: u16 = 3329;
+    if encoded_1152.len() != 1152 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Invalid {label} polynomial vector length: {}",
+                encoded_1152.len()
+            ),
+        ));
+    }
+    for triple in encoded_1152.as_chunks::<3>().0 {
+        let c0 = u16::from(triple[0]) | (u16::from(triple[1] & 0x0F) << 8);
+        let c1 = (u16::from(triple[1]) >> 4) | (u16::from(triple[2]) << 4);
+        if c0 >= MLKEM_Q || c1 >= MLKEM_Q {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "NIST FIPS 203 modulus check failed on {label}: non-canonical 12-bit coefficient >= q ({MLKEM_Q})"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates a 1184-byte `ML-KEM-768` encapsulation key per **NIST FIPS 203 §7.2**
+/// (exact length + 12-bit NTT polynomial coefficients strictly `< q = 3329`).
+pub fn validate_fips203_mlkem768_encapsulation_key(ek_bytes: &[u8]) -> io::Result<()> {
+    if ek_bytes.len() != MLKEM768_EK_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Invalid ML-KEM-768 encapsulation key length: expected {MLKEM768_EK_LEN}, got {}",
+                ek_bytes.len()
+            ),
+        ));
+    }
+    validate_mlkem768_12bit_poly_vec(&ek_bytes[0..1152], "ML-KEM-768 encapsulation key")
+}
+
+/// Validates a 2400-byte `ML-KEM-768` decapsulation key per **NIST FIPS 203 §7.3**
+/// (`dk_pke` 12-bit modulus check, embedded `ek` §7.2 modulus check, and `SHA3-256(ek) == H(ek)` hash check),
+/// returning the canonical 1184-byte encapsulation key slice.
+pub fn validate_fips203_mlkem768_decapsulation_key(dk_bytes: &[u8]) -> io::Result<Vec<u8>> {
+    use p256::elliptic_curve::subtle::ConstantTimeEq;
+    if dk_bytes.len() != MLKEM768_DK_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Invalid ML-KEM-768 decapsulation key length: expected {MLKEM768_DK_LEN}, got {}",
+                dk_bytes.len()
+            ),
+        ));
+    }
+    validate_mlkem768_12bit_poly_vec(&dk_bytes[0..1152], "ML-KEM-768 secret key vector")?;
+    let ek_slice = &dk_bytes[1152..2336];
+    validate_fips203_mlkem768_encapsulation_key(ek_slice)?;
+    let expected_h_ek = fips202_sha3_256(ek_slice);
+    let h_matches: bool = dk_bytes[2336..2368].ct_eq(&expected_h_ek).into();
+    if !h_matches {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "NIST FIPS 203 §7.3 decapsulation key check failed: H(ek) != SHA3-256(ek)",
+        ));
+    }
+    Ok(ek_slice.to_vec())
+}
+
+/// Wraps a 32-byte Vault Master KEK into a Hybrid Post-Quantum `OCESCROW3` (`v3`) envelope combining
+/// `RSA-OAEP-SHA256` (`>= 2048` / `3072` bits) + `FIPS 203 ML-KEM-768` via `HKDF-SHA256` + `AES-256-GCM`.
+pub fn encrypt_kek_for_soc_escrow_hybrid_v3(
+    kek: &[u8; 32],
+    pub_bundle: &HybridSocPublicKeyBundle,
+    kek_id: &str,
+) -> io::Result<HybridSocEscrowBlobV3> {
+    use aes_gcm::{
+        aead::{Aead, KeyInit, Payload},
+        Aes256Gcm, Key, Nonce,
+    };
+    use ml_kem::kem::Encapsulate;
+    use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
+    use rand::RngCore;
+    use rsa::traits::PublicKeyParts;
+
+    if pub_bundle.version != 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Unsupported HybridSocPublicKeyBundle version {} (expected 3)",
+                pub_bundle.version
+            ),
+        ));
+    }
+    if kek_id.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "OCESCROW3 kek_id must not be empty",
+        ));
+    }
+    validate_fips203_mlkem768_encapsulation_key(&pub_bundle.mlkem768_encapsulation_key)?;
+
+    // 1. Classical KEM leg: generate fresh 32-byte `ss_rsa` via `OsRng` and encrypt with RSA-OAEP-SHA256
+    let rsa_pub = parse_rsa_public_key(&pub_bundle.rsa_public_blob)?;
+    let rsa_bits = rsa_pub.n().bit_width();
+    if rsa_bits < 3072 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("OCESCROW3 RSA public key strength ({rsa_bits} bits) must be >= 3072 bits"),
+        ));
+    }
+    let mut ss_rsa_raw = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut ss_rsa_raw);
+    let ss_rsa = crate::mem_guard::ZeroizingBytes::new(ss_rsa_raw);
+    zeroize_slice(&mut ss_rsa_raw);
+
+    let oaep_label = format!("SOC-OFFLINE-ESCROW-HYBRID-V3-RSA:{kek_id}")
+        .into_bytes()
+        .into_boxed_slice();
+    let padding =
+        rsa::Oaep::<rsa::sha2::Sha256, rsa::sha2::Sha256>::new_with_mgf_hash_and_label(oaep_label);
+    let mut rsa_rng = RsaRngAdapter;
+    let ct_rsa = rsa_pub
+        .encrypt(&mut rsa_rng, padding, ss_rsa.as_slice())
+        .map_err(|e| io::Error::other(format!("OCESCROW3 RSA-OAEP encapsulation failed: {e}")))?;
+    if !(384..=1024).contains(&ct_rsa.len()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "OCESCROW3 RSA ciphertext length {} outside recoverable wire range 384..=1024",
+                ct_rsa.len()
+            ),
+        ));
+    }
+
+    // 2. Post-Quantum KEM leg: encapsulate with FIPS 203 ML-KEM-768
+    type MlKem768Ek = <MlKem768 as KemCore>::EncapsulationKey;
+    let ek_encoded = Encoded::<MlKem768Ek>::try_from(
+        pub_bundle.mlkem768_encapsulation_key.as_slice(),
+    )
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Failed decoding ML-KEM-768 encapsulation key array",
+        )
+    })?;
+    let ek = MlKem768Ek::from_bytes(&ek_encoded);
+    let (ct_mlkem_arr, ss_mlkem_arr) = ek
+        .encapsulate(&mut rand::rngs::OsRng)
+        .map_err(|_| io::Error::other("ML-KEM-768 encapsulation failed"))?;
+
+    let mut ss_mlkem_raw = [0u8; 32];
+    ss_mlkem_raw.copy_from_slice(ss_mlkem_arr.as_slice());
+    let ss_mlkem = crate::mem_guard::ZeroizingBytes::new(ss_mlkem_raw);
+    zeroize_slice(&mut ss_mlkem_raw);
+    let ct_mlkem768 = ct_mlkem_arr.as_slice().to_vec();
+
+    // 3. Hybrid KEM Combiner: K_wrap = HKDF-SHA256(salt, ss_rsa || ss_mlkem768, transcript_info)
+    let mut hkdf_salt = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut hkdf_salt);
+    let wrap_key = derive_ocescrow3_wrap_key(
+        &ss_rsa,
+        &ss_mlkem,
+        &hkdf_salt,
+        kek_id,
+        &ct_rsa,
+        &ct_mlkem768,
+    )?;
+
+    // 4. Authenticated KEK Wrapping: AES-256-GCM with AAD = "OCESCROW3|<kek_id>"
+    let mut aes_nonce = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut aes_nonce);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(wrap_key.as_slice()));
+    let aad = format!("OCESCROW3|{kek_id}");
+    let wrapped_kek_ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&aes_nonce),
+            Payload {
+                msg: kek,
+                aad: aad.as_bytes(),
+            },
+        )
+        .map_err(|_| io::Error::other("OCESCROW3 AES-256-GCM KEK wrapping failed"))?;
+
+    let ocescrow3_wire_bytes = encode_ocescrow3_wire(
+        &hkdf_salt,
+        &aes_nonce,
+        &ct_rsa,
+        &ct_mlkem768,
+        &wrapped_kek_ciphertext,
+    );
+
+    let soc_rsa_fingerprint = hex_encode(&Sha256::digest(&pub_bundle.rsa_public_blob)[..16]);
+    let soc_mlkem768_fingerprint =
+        hex_encode(&Sha256::digest(&pub_bundle.mlkem768_encapsulation_key)[..16]);
+
+    Ok(HybridSocEscrowBlobV3 {
+        magic: "OCESCROW3".to_string(),
+        version: 3,
+        algorithm: format!("OCESCROW3-RSA-{rsa_bits}-OAEP-ML-KEM-768-HKDF-SHA256-AES256GCM"),
+        kek_id: kek_id.to_string(),
+        soc_rsa_fingerprint,
+        soc_mlkem768_fingerprint,
+        hkdf_salt: hkdf_salt.to_vec(),
+        aes_gcm_nonce: aes_nonce.to_vec(),
+        rsa_oaep_ciphertext: ct_rsa,
+        mlkem768_ciphertext: ct_mlkem768,
+        wrapped_kek_ciphertext,
+        ocescrow3_wire_bytes,
+    })
+}
+
+/// Decrypts a binary `OCESCROW3` wire envelope back into the 32-byte Master KEK using BOTH the
+/// offline SOC RSA private key AND the `ML-KEM-768` decapsulation key. Fails closed if either key
+/// is wrong or any byte of the envelope/AAD is tampered.
+pub fn decrypt_ocescrow3_wire_envelope(
+    wire: &[u8],
+    kek_id: &str,
+    priv_bundle: &HybridSocPrivateKeyBundle,
+) -> io::Result<[u8; 32]> {
+    use aes_gcm::{
+        aead::{Aead, KeyInit, Payload},
+        Aes256Gcm, Key, Nonce,
+    };
+    use ml_kem::kem::Decapsulate;
+    use ml_kem::{Ciphertext, Encoded, EncodedSizeUser, KemCore, MlKem768};
+
+    const HEADER_FIXED: usize = 9 + 2 + 16 + 12 + 4;
+    const TRAILER_FIXED: usize = MLKEM768_CT_LEN + 48; // 1088B ML-KEM ct + (32B KEK + 16B GCM tag)
+    if wire.len() < HEADER_FIXED + 384 + TRAILER_FIXED {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Truncated or sub-3072-bit OCESCROW3 wire envelope ({} bytes)",
+                wire.len()
+            ),
+        ));
+    }
+    if &wire[0..9] != OCESCROW3_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid OCESCROW3 magic header",
+        ));
+    }
+    let version = u16::from_le_bytes([wire[9], wire[10]]);
+    if version != 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported OCESCROW3 version {version} (expected 3)"),
+        ));
+    }
+
+    let mut hkdf_salt = [0u8; 16];
+    hkdf_salt.copy_from_slice(&wire[11..27]);
+    let mut aes_nonce = [0u8; 12];
+    aes_nonce.copy_from_slice(&wire[27..39]);
+    let ct_rsa_len = u32::from_le_bytes([wire[39], wire[40], wire[41], wire[42]]) as usize;
+    if !(384..=1024).contains(&ct_rsa_len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid or sub-3072-bit RSA ciphertext length {ct_rsa_len} in OCESCROW3"),
+        ));
+    }
+    let expected_total = HEADER_FIXED + ct_rsa_len + TRAILER_FIXED;
+    if wire.len() != expected_total {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "OCESCROW3 envelope length mismatch: expected {expected_total}, got {}",
+                wire.len()
+            ),
+        ));
+    }
+
+    let rsa_end = HEADER_FIXED + ct_rsa_len;
+    let mlkem_end = rsa_end + MLKEM768_CT_LEN;
+    let ct_rsa = &wire[HEADER_FIXED..rsa_end];
+    let ct_mlkem = &wire[rsa_end..mlkem_end];
+    let wrapped_kek_ct = &wire[mlkem_end..];
+
+    let _ = validate_fips203_mlkem768_decapsulation_key(&priv_bundle.mlkem768_decapsulation_key)?;
+
+    // 1. Classical RSA-OAEP decapsulation
+    let rsa_priv = parse_rsa_private_key(&priv_bundle.rsa_private_blob)?;
+    let oaep_label = format!("SOC-OFFLINE-ESCROW-HYBRID-V3-RSA:{kek_id}")
+        .into_bytes()
+        .into_boxed_slice();
+    let padding =
+        rsa::Oaep::<rsa::sha2::Sha256, rsa::sha2::Sha256>::new_with_mgf_hash_and_label(oaep_label);
+    let mut ss_rsa_vec = rsa_priv.decrypt(padding, ct_rsa).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("OCESCROW3 RSA-OAEP decapsulation failed: {e}"),
+        )
+    })?;
+    if ss_rsa_vec.len() != 32 {
+        zeroize_slice(&mut ss_rsa_vec);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OCESCROW3 RSA shared secret length mismatch",
+        ));
+    }
+    let mut ss_rsa_arr = [0u8; 32];
+    ss_rsa_arr.copy_from_slice(&ss_rsa_vec);
+    zeroize_slice(&mut ss_rsa_vec);
+    let ss_rsa = crate::mem_guard::ZeroizingBytes::new(ss_rsa_arr);
+    zeroize_slice(&mut ss_rsa_arr);
+
+    // 2. Post-Quantum ML-KEM-768 decapsulation
+    type MlKem768Dk = <MlKem768 as KemCore>::DecapsulationKey;
+    let dk_encoded =
+        Encoded::<MlKem768Dk>::try_from(priv_bundle.mlkem768_decapsulation_key.as_slice())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Failed decoding ML-KEM-768 decapsulation key",
+                )
+            })?;
+    let dk = MlKem768Dk::from_bytes(&dk_encoded);
+    let ct_mlkem_arr = Ciphertext::<MlKem768>::try_from(ct_mlkem).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid ML-KEM-768 ciphertext slice",
+        )
+    })?;
+    let ss_mlkem_shared = dk.decapsulate(&ct_mlkem_arr).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ML-KEM-768 decapsulation failed",
+        )
+    })?;
+    let mut ss_mlkem_arr = [0u8; 32];
+    ss_mlkem_arr.copy_from_slice(ss_mlkem_shared.as_slice());
+    let ss_mlkem = crate::mem_guard::ZeroizingBytes::new(ss_mlkem_arr);
+    zeroize_slice(&mut ss_mlkem_arr);
+
+    // 3. Hybrid HKDF-SHA256 combiner
+    let wrap_key =
+        derive_ocescrow3_wrap_key(&ss_rsa, &ss_mlkem, &hkdf_salt, kek_id, ct_rsa, ct_mlkem)?;
+
+    // 4. AES-256-GCM authenticated unwrap
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(wrap_key.as_slice()));
+    let aad = format!("OCESCROW3|{kek_id}");
+    let mut plain = cipher
+        .decrypt(
+            Nonce::from_slice(&aes_nonce),
+            Payload {
+                msg: wrapped_kek_ct,
+                aad: aad.as_bytes(),
+            },
+        )
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "OCESCROW3 AES-256-GCM authentication tag verification failed (key mismatch or tampered ciphertext)",
+            )
+        })?;
+
+    if plain.len() != 32 {
+        zeroize_slice(&mut plain);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OCESCROW3 unwrapped KEK length != 32",
+        ));
+    }
+    let mut out_kek = [0u8; 32];
+    out_kek.copy_from_slice(&plain);
+    zeroize_slice(&mut plain);
+    Ok(out_kek)
+}
+
+/// Decrypts a structured `HybridSocEscrowBlobV3` after cross-checking consistency between its
+/// JSON fields and its canonical `OCESCROW3` binary wire envelope (`fail-closed` on any mismatch).
+pub fn decrypt_kek_from_soc_escrow_hybrid_v3(
+    escrow: &HybridSocEscrowBlobV3,
+    priv_bundle: &HybridSocPrivateKeyBundle,
+) -> io::Result<[u8; 32]> {
+    use p256::elliptic_curve::subtle::ConstantTimeEq;
+    use rsa::traits::PublicKeyParts;
+
+    if escrow.magic != "OCESCROW3" || escrow.version != 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Invalid HybridSocEscrowBlobV3 header: magic='{}', version={}",
+                escrow.magic, escrow.version
+            ),
+        ));
+    }
+    if escrow.hkdf_salt.len() != 16 || escrow.aes_gcm_nonce.len() != 12 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid salt or nonce length in HybridSocEscrowBlobV3",
+        ));
+    }
+
+    // Authenticate `algorithm`, `soc_rsa_fingerprint`, and `soc_mlkem768_fingerprint` against `priv_bundle`
+    let rsa_priv = parse_rsa_private_key(&priv_bundle.rsa_private_blob)?;
+    let rsa_pub = rsa::PublicKey::from(&rsa_priv);
+    let rsa_bits = rsa_pub.n().bit_width();
+    let expected_algorithm =
+        format!("OCESCROW3-RSA-{rsa_bits}-OAEP-ML-KEM-768-HKDF-SHA256-AES256GCM");
+    if escrow.algorithm != expected_algorithm {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "HybridSocEscrowBlobV3 algorithm metadata mismatch: expected '{expected_algorithm}', found '{}'",
+                escrow.algorithm
+            ),
+        ));
+    }
+    let expected_rsa_pub_blob = export_rsa_public_key_to_cng(&rsa_pub);
+    let expected_rsa_fp = hex_encode(&Sha256::digest(&expected_rsa_pub_blob)[..16]);
+    let ek_bytes =
+        validate_fips203_mlkem768_decapsulation_key(&priv_bundle.mlkem768_decapsulation_key)?;
+    let expected_mlkem_fp = hex_encode(&Sha256::digest(&ek_bytes)[..16]);
+
+    let rsa_fp_ok = escrow.soc_rsa_fingerprint.len() == expected_rsa_fp.len()
+        && bool::from(
+            escrow
+                .soc_rsa_fingerprint
+                .as_bytes()
+                .ct_eq(expected_rsa_fp.as_bytes()),
+        );
+    let mlkem_fp_ok = escrow.soc_mlkem768_fingerprint.len() == expected_mlkem_fp.len()
+        && bool::from(
+            escrow
+                .soc_mlkem768_fingerprint
+                .as_bytes()
+                .ct_eq(expected_mlkem_fp.as_bytes()),
+        );
+    if !rsa_fp_ok || !mlkem_fp_ok {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HybridSocEscrowBlobV3 key fingerprint metadata mismatch (tampered or wrong key bundle)",
+        ));
+    }
+
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&escrow.hkdf_salt);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&escrow.aes_gcm_nonce);
+    let expected_wire = encode_ocescrow3_wire(
+        &salt,
+        &nonce,
+        &escrow.rsa_oaep_ciphertext,
+        &escrow.mlkem768_ciphertext,
+        &escrow.wrapped_kek_ciphertext,
+    );
+    if escrow.ocescrow3_wire_bytes != expected_wire {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HybridSocEscrowBlobV3 field-to-wire integrity mismatch (empty or tampered wire envelope)",
+        ));
+    }
+    decrypt_ocescrow3_wire_envelope(&expected_wire, &escrow.kek_id, priv_bundle)
 }
 
 #[cfg(test)]
@@ -2479,7 +3373,7 @@ mod tests {
         use rsa::{Oaep, PrivateKey, PublicKey};
 
         let mut rng = RsaRngAdapter;
-        let priv_key = PrivateKey::new(&mut rng, 2048)?;
+        let priv_key = PrivateKey::new(&mut rng, 3072)?;
         let pub_key = PublicKey::from(&priv_key);
         let label = b"SOC-OFFLINE-ESCROW-RECOVERY-V2:test-kek"
             .to_vec()
@@ -2496,7 +3390,7 @@ mod tests {
         let _e_bytes = priv_key.e().to_be_bytes();
         let _d_bytes = priv_key.d().to_be_bytes();
         let primes = priv_key.primes();
-        assert_eq!(n_bytes.len(), 256);
+        assert_eq!(n_bytes.len(), 384);
         assert_eq!(primes.len(), 2);
         Ok(())
     }

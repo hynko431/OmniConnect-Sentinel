@@ -488,6 +488,15 @@ impl WorkerLauncher {
         self
     }
 
+    pub fn with_worker_bin(mut self, worker_bin: PathBuf) -> Self {
+        self.worker_bin = Some(worker_bin);
+        self
+    }
+
+    pub fn has_worker_binary(&self) -> bool {
+        self.worker_bin.is_some()
+    }
+
     pub fn active_workers_count() -> u64 {
         ACTIVE_WORKERS.load(Ordering::Acquire)
     }
@@ -507,51 +516,37 @@ impl WorkerLauncher {
             "sentinel-cdr-worker"
         };
 
-        if let Some(env_bin) = std::env::var_os("CARGO_BIN_EXE_sentinel-cdr-worker") {
-            let p = PathBuf::from(env_bin);
-            if p.exists() {
-                return Some(p);
-            }
+        let current_exe = std::env::current_exe().ok()?;
+        let dir = current_exe.parent()?;
+        let candidate = dir.join(exe_name);
+
+        if sentinel_sys::ensure_not_symlink_or_reparse_point(&candidate).is_err() {
+            return None;
         }
-        if let Some(env_bin) = std::env::var_os("SENTINEL_CDR_WORKER_BIN") {
-            let p = PathBuf::from(env_bin);
-            if p.exists() {
-                return Some(p);
+
+        let meta = std::fs::symlink_metadata(&candidate).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if (meta.permissions().mode() & 0o002) != 0 {
+                return None;
             }
         }
 
-        if let Ok(current_exe) = std::env::current_exe() {
-            if let Some(dir) = current_exe.parent() {
-                let candidate = dir.join(exe_name);
-                if candidate.exists() {
-                    return Some(candidate);
-                }
-                if let Some(parent_dir) = dir.parent() {
-                    let parent_candidate = parent_dir.join(exe_name);
-                    static ENSURE_BUILT: OnceLock<()> = OnceLock::new();
-                    ENSURE_BUILT.get_or_init(|| {
-                        let needs_build = match (
-                            current_exe.metadata().and_then(|m| m.modified()),
-                            parent_candidate.metadata().and_then(|m| m.modified()),
-                        ) {
-                            (Ok(test_mtime), Ok(worker_mtime)) => worker_mtime < test_mtime,
-                            _ => !parent_candidate.exists(),
-                        };
-                        if needs_build {
-                            let _ = std::process::Command::new("cargo")
-                                .args(["build", "--offline", "--bin", "sentinel-cdr-worker"])
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .status();
-                        }
-                    });
-                    if parent_candidate.exists() {
-                        return Some(parent_candidate);
-                    }
-                }
+        #[cfg(windows)]
+        {
+            if sentinel_sys::verify_binary_authenticode_signature(&current_exe).unwrap_or(false)
+                && !sentinel_sys::verify_binary_authenticode_signature(&candidate).unwrap_or(false)
+            {
+                return None;
             }
         }
-        None
+
+        Some(candidate)
     }
 
     /// Executes CDR sanitization strictly inside an isolated per-file worker process (`Invariant I3`).
@@ -568,10 +563,12 @@ impl WorkerLauncher {
                     .to_string(),
             )
         })?;
-        if !bin_path.exists() {
+        if sentinel_sys::ensure_not_symlink_or_reparse_point(bin_path).is_err()
+            || !bin_path.is_file()
+        {
             PROCESSED_TOTAL_ERR.fetch_add(1, Ordering::AcqRel);
             return Err(CdrError::SandboxFailure(format!(
-                "CDR_WORKER_FAILED: sentinel-cdr-worker binary missing at {}; refusing in-process parsing (Invariant I3)",
+                "CDR_WORKER_FAILED: sentinel-cdr-worker binary missing or invalid at {}; refusing in-process parsing (Invariant I3)",
                 bin_path.display()
             )));
         }
@@ -593,10 +590,12 @@ impl WorkerLauncher {
                     .to_string(),
             )
         })?;
-        if !bin_path.exists() {
+        if sentinel_sys::ensure_not_symlink_or_reparse_point(bin_path).is_err()
+            || !bin_path.is_file()
+        {
             PROCESSED_TOTAL_ERR.fetch_add(1, Ordering::AcqRel);
             return Err(CdrError::SandboxFailure(format!(
-                "CDR_WORKER_FAILED: sentinel-cdr-worker binary missing at {}; refusing in-process inspection (Invariant I3)",
+                "CDR_WORKER_FAILED: sentinel-cdr-worker binary missing or invalid at {}; refusing in-process inspection (Invariant I3)",
                 bin_path.display()
             )));
         }

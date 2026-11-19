@@ -22,12 +22,15 @@ use walkdir::WalkDir;
 
 use sentinel_cdr::{SanitizationPolicy, WorkerLauncher, WorkerRequest};
 use sentinel_sys::{
-    create_restricted_dir_atomic, create_restricted_file_atomic, is_reparse_point_or_symlink,
-    normalize_file_attributes, open_untrusted_readonly_nofollow, read_untrusted_to_end_bounded,
-    set_volume_offline, set_volume_online_readonly, write_mark_of_the_web, ZeroizingBytes,
+    create_restricted_dir_atomic, create_restricted_file_atomic, is_projfs_reparse_point,
+    is_reparse_point_or_symlink, normalize_file_attributes, open_untrusted_readonly_nofollow,
+    read_untrusted_to_end_bounded, set_volume_offline, set_volume_online_readonly,
+    write_mark_of_the_web, ZeroizingBytes,
 };
 
-use crate::enterprise::ledger::AuditLedger;
+use crate::enterprise::ledger::{
+    tokenize_path_for_ledger, AuditLedger, AuditSubsystem, SharedAuditLedger,
+};
 use crate::error::{DegradationEvent, SentinelError};
 use crate::scanner::secure_shredder::{SecureShredder, ShredMethod};
 use crate::scanner::universal_scanner::{UniversalScanner, UniversalThreat};
@@ -93,6 +96,7 @@ pub struct ShadowCacheManager {
     max_cache_bytes: u64,
     max_files: usize,
     ledger_path: PathBuf,
+    shared_ledger: Option<SharedAuditLedger>,
 }
 
 struct ShadowSessionState {
@@ -119,6 +123,7 @@ impl ShadowCacheManager {
             max_cache_bytes: DEFAULT_MAX_SHADOW_CACHE_BYTES,
             max_files: DEFAULT_MAX_SHADOW_CACHE_FILES,
             ledger_path: Self::default_ledger_path(),
+            shared_ledger: None,
         }
     }
 
@@ -130,6 +135,7 @@ impl ShadowCacheManager {
             max_cache_bytes,
             max_files: DEFAULT_MAX_SHADOW_CACHE_FILES,
             ledger_path,
+            shared_ledger: None,
         }
     }
 
@@ -145,26 +151,49 @@ impl ShadowCacheManager {
 
     pub fn with_ledger_path(mut self, ledger_path: PathBuf) -> Self {
         self.ledger_path = ledger_path;
+        self.shared_ledger = None;
+        self
+    }
+
+    pub fn with_shared_ledger(mut self, shared_ledger: SharedAuditLedger) -> Self {
+        if let Ok(guard) = shared_ledger.lock() {
+            self.ledger_path = guard.path().to_path_buf();
+        }
+        self.shared_ledger = Some(shared_ledger);
         self
     }
 
     fn default_ledger_path() -> PathBuf {
+        const LEDGER_NAME: &str = "shadow_cache_audit.jsonl";
         #[cfg(windows)]
         {
-            let p =
-                PathBuf::from(r"C:\ProgramData\OmniConnect\AuditLedger\shadow_cache_audit.jsonl");
-            if let Some(parent) = p.parent() {
-                if create_restricted_dir_atomic(parent).is_ok() {
-                    return p;
+            if let Ok(pd) = std::env::var("ProgramData") {
+                let dir = PathBuf::from(pd).join("OmniConnect").join("AuditLedger");
+                if crate::enterprise::ledger::is_restricted_ledger_dir_writable(&dir, LEDGER_NAME) {
+                    return dir.join(LEDGER_NAME);
+                }
+            }
+            if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+                let dir = PathBuf::from(lad).join("OmniConnect").join("AuditLedger");
+                if crate::enterprise::ledger::is_restricted_ledger_dir_writable(&dir, LEDGER_NAME) {
+                    return dir.join(LEDGER_NAME);
                 }
             }
         }
         #[cfg(not(windows))]
         {
-            let p = PathBuf::from("/var/lib/omniconnect/audit_ledger/shadow_cache_audit.jsonl");
-            if let Some(parent) = p.parent() {
-                if create_restricted_dir_atomic(parent).is_ok() {
-                    return p;
+            let dir = PathBuf::from("/var/lib/omniconnect/audit_ledger");
+            if crate::enterprise::ledger::is_restricted_ledger_dir_writable(&dir, LEDGER_NAME) {
+                return dir.join(LEDGER_NAME);
+            }
+            if let Ok(home) = std::env::var("HOME") {
+                let dir = PathBuf::from(home)
+                    .join(".local")
+                    .join("share")
+                    .join("omniconnect")
+                    .join("audit_ledger");
+                if crate::enterprise::ledger::is_restricted_ledger_dir_writable(&dir, LEDGER_NAME) {
+                    return dir.join(LEDGER_NAME);
                 }
             }
         }
@@ -172,10 +201,16 @@ impl ShadowCacheManager {
         {
             std::env::temp_dir()
                 .join(format!("OmniConnect_ShadowCache_{}", std::process::id()))
-                .join("shadow_cache_audit.jsonl")
+                .join(LEDGER_NAME)
         }
         #[cfg(not(test))]
         {
+            if let Ok(cwd) = std::env::current_dir() {
+                let dir = cwd.join(".sentinel_audit");
+                if crate::enterprise::ledger::is_restricted_ledger_dir_writable(&dir, LEDGER_NAME) {
+                    return dir.join(LEDGER_NAME);
+                }
+            }
             #[cfg(windows)]
             {
                 PathBuf::from(r"C:\ProgramData\OmniConnect\AuditLedger\shadow_cache_audit.jsonl")
@@ -187,6 +222,23 @@ impl ShadowCacheManager {
         }
     }
 
+    fn is_shadow_cache_root_writable(dir: &Path) -> bool {
+        if create_restricted_dir_atomic(dir).is_err() {
+            return false;
+        }
+        let probe = dir.join(format!(
+            ".shadow_write_probe_{}_{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        if create_restricted_file_atomic(&probe, b"ok").is_ok() {
+            let _ = fs::remove_file(&probe);
+            true
+        } else {
+            false
+        }
+    }
+
     fn resolve_session_cipher_dir(&self, session_id: &str) -> Result<PathBuf, String> {
         let base_dir = if let Some(ref custom_root) = self.cache_root_override {
             custom_root.clone()
@@ -194,7 +246,7 @@ impl ShadowCacheManager {
             #[cfg(windows)]
             {
                 let prog_data = PathBuf::from(r"C:\ProgramData\OmniConnect\ShadowCache");
-                if create_restricted_dir_atomic(&prog_data).is_ok() {
+                if Self::is_shadow_cache_root_writable(&prog_data) {
                     prog_data
                 } else {
                     #[cfg(test)]
@@ -203,17 +255,50 @@ impl ShadowCacheManager {
                     }
                     #[cfg(not(test))]
                     {
-                        return Err(
-                            "Production shadow cache path 'C:\\ProgramData\\OmniConnect\\ShadowCache' is inaccessible"
-                                .to_string(),
-                        );
+                        if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+                            let lad_dir =
+                                PathBuf::from(lad).join("OmniConnect").join("ShadowCache");
+                            if Self::is_shadow_cache_root_writable(&lad_dir) {
+                                lad_dir
+                            } else if let Ok(cwd) = std::env::current_dir() {
+                                let cwd_dir = cwd.join(".sentinel_shadow_cache");
+                                if Self::is_shadow_cache_root_writable(&cwd_dir) {
+                                    cwd_dir
+                                } else {
+                                    return Err(
+                                        "Production shadow cache path 'C:\\ProgramData\\OmniConnect\\ShadowCache' is inaccessible"
+                                            .to_string(),
+                                    );
+                                }
+                            } else {
+                                return Err(
+                                    "Production shadow cache path 'C:\\ProgramData\\OmniConnect\\ShadowCache' is inaccessible"
+                                        .to_string(),
+                                );
+                            }
+                        } else if let Ok(cwd) = std::env::current_dir() {
+                            let cwd_dir = cwd.join(".sentinel_shadow_cache");
+                            if Self::is_shadow_cache_root_writable(&cwd_dir) {
+                                cwd_dir
+                            } else {
+                                return Err(
+                                    "Production shadow cache path 'C:\\ProgramData\\OmniConnect\\ShadowCache' is inaccessible"
+                                        .to_string(),
+                                );
+                            }
+                        } else {
+                            return Err(
+                                "Production shadow cache path 'C:\\ProgramData\\OmniConnect\\ShadowCache' is inaccessible"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
             }
             #[cfg(not(windows))]
             {
                 let var_lib = PathBuf::from("/var/lib/omniconnect/shadow_cache");
-                if create_restricted_dir_atomic(&var_lib).is_ok() {
+                if Self::is_shadow_cache_root_writable(&var_lib) {
                     var_lib
                 } else {
                     #[cfg(test)]
@@ -224,10 +309,26 @@ impl ShadowCacheManager {
                     }
                     #[cfg(not(test))]
                     {
-                        return Err(
-                            "Production shadow cache path '/var/lib/omniconnect/shadow_cache' is inaccessible"
-                                .to_string(),
-                        );
+                        if let Ok(home) = std::env::var("HOME") {
+                            let home_dir = PathBuf::from(home)
+                                .join(".local")
+                                .join("share")
+                                .join("omniconnect")
+                                .join("shadow_cache");
+                            if Self::is_shadow_cache_root_writable(&home_dir) {
+                                home_dir
+                            } else {
+                                return Err(
+                                    "Production shadow cache path '/var/lib/omniconnect/shadow_cache' is inaccessible"
+                                        .to_string(),
+                                );
+                            }
+                        } else {
+                            return Err(
+                                "Production shadow cache path '/var/lib/omniconnect/shadow_cache' is inaccessible"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
             }
@@ -244,30 +345,192 @@ impl ShadowCacheManager {
         Ok(session_dir)
     }
 
-    fn append_ledger(&self, event: &str, details: &str) {
-        let mut ledger = AuditLedger::open(&self.ledger_path);
-        let _ = ledger.append_event(event, details);
+    pub(crate) fn tokenize_path_for_audit(&self, raw_path: &Path) -> String {
+        tokenize_path_for_ledger(self.shared_ledger.as_ref(), &self.ledger_path, raw_path)
+            .unwrap_or_else(|_| "TOKENIZATION_UNAVAILABLE".to_string())
     }
 
-    fn cleanup_cipher_dir(dir: &Path) {
-        if !dir.exists() {
+    fn append_ledger(&self, event: &str, details: &str) {
+        if let Some(ref shared) = self.shared_ledger {
+            if let Ok(mut guard) = shared.lock() {
+                let _ = guard.append_subsystem_event(
+                    AuditSubsystem::VfsShadow,
+                    event,
+                    serde_json::Value::String(details.to_string()),
+                );
+            }
             return;
         }
-        for entry in WalkDir::new(dir)
-            .contents_first(true)
-            .follow_links(false)
-            .into_iter()
-            .flatten()
-        {
+        let mut ledger = AuditLedger::open(&self.ledger_path);
+        let _ = ledger.append_subsystem_event(
+            AuditSubsystem::VfsShadow,
+            event,
+            serde_json::Value::String(details.to_string()),
+        );
+    }
+
+    fn cleanup_cipher_dir(&self, dir: &Path) {
+        let _ = Self::cleanup_dir_with_method(
+            dir,
+            ShredMethod::ClearMultiPass { passes: 3 },
+            Some(&self.ledger_path),
+            self.shared_ledger.as_ref(),
+        );
+    }
+
+    fn cleanup_inception_encrypted_cipher_dir(&self, dir: &Path) -> Result<(), String> {
+        Self::cleanup_dir_with_method(
+            dir,
+            ShredMethod::CryptoErase,
+            Some(&self.ledger_path),
+            self.shared_ledger.as_ref(),
+        )
+    }
+
+    fn cleanup_dir_with_method(
+        dir: &Path,
+        method: ShredMethod,
+        ledger_path: Option<&Path>,
+        shared_ledger: Option<&SharedAuditLedger>,
+    ) -> Result<(), String> {
+        match fs::symlink_metadata(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(format!(
+                    "ShadowCache cleanup failed inspecting directory '{}': {e}",
+                    dir.display()
+                ))
+            }
+            Ok(meta) if is_reparse_point_or_symlink(&meta) && !is_projfs_reparse_point(dir) => {
+                return fs::remove_file(dir)
+                    .or_else(|_| fs::remove_dir(dir))
+                    .map_err(|e| {
+                        format!(
+                            "ShadowCache cleanup failed unlinking symlink/reparse root '{}': {e}",
+                            dir.display()
+                        )
+                    });
+            }
+            Ok(_) => {}
+        }
+
+        let mut shred_errors = Vec::new();
+        for entry_res in WalkDir::new(dir).contents_first(true).follow_links(false) {
+            let entry = match entry_res {
+                Ok(e) => e,
+                Err(walk_err) => {
+                    warn!(
+                        "ShadowCache WalkDir error under '{}': {walk_err}",
+                        dir.display()
+                    );
+                    shred_errors.push(format!("Walk error: {walk_err}"));
+                    continue;
+                }
+            };
+
             let p = entry.path();
+            let is_link_or_reparse = entry.path_is_symlink()
+                || match fs::symlink_metadata(p) {
+                    Ok(m) => is_reparse_point_or_symlink(&m),
+                    Err(e) => {
+                        warn!(
+                            "ShadowCache symlink_metadata failed for '{}': {e}",
+                            p.display()
+                        );
+                        shred_errors.push(format!("Metadata error for '{}': {e}", p.display()));
+                        continue;
+                    }
+                };
+
+            if is_link_or_reparse {
+                if is_projfs_reparse_point(p) {
+                    let _ = normalize_file_attributes(p);
+                    let rm_res = if entry.file_type().is_dir() {
+                        fs::remove_dir(p)
+                    } else {
+                        fs::remove_file(p)
+                    };
+                    if let Err(e) = rm_res {
+                        warn!(
+                            "ShadowCache failed removing ProjFS placeholder '{}': {e}",
+                            p.display()
+                        );
+                        shred_errors.push(format!(
+                            "Failed removing ProjFS placeholder '{}': {e}",
+                            p.display()
+                        ));
+                    }
+                } else if let Err(e) = fs::remove_file(p).or_else(|_| fs::remove_dir(p)) {
+                    warn!(
+                        "ShadowCache failed unlinking symlink/reparse '{}': {e}",
+                        p.display()
+                    );
+                    shred_errors.push(format!(
+                        "Failed unlinking symlink/reparse '{}': {e}",
+                        p.display()
+                    ));
+                }
+                continue;
+            }
+
             if entry.file_type().is_file() {
                 let _ = normalize_file_attributes(p);
-                let _ = SecureShredder::shred_file(p, ShredMethod::ClearMultiPass { passes: 3 });
-            } else if entry.file_type().is_dir() && p != dir {
-                let _ = fs::remove_dir(p);
+                let res = if let Some(sl) = shared_ledger {
+                    SecureShredder::shred_file_with_shared_ledger(p, method, Some(sl))
+                } else if let Some(lp) = ledger_path {
+                    SecureShredder::shred_file_with_ledger(p, method, lp)
+                } else {
+                    SecureShredder::shred_file(p, method)
+                };
+                if let Err(e) = res {
+                    warn!("ShadowCache SecureShredder error on '{}': {e}", p.display());
+                    shred_errors.push(format!("{}: {e}", p.display()));
+                }
+            } else if entry.file_type().is_dir() {
+                let _ = normalize_file_attributes(p);
+                if let Err(e) = fs::remove_dir(p) {
+                    warn!(
+                        "ShadowCache directory remove error on '{}': {e}",
+                        p.display()
+                    );
+                    shred_errors.push(format!(
+                        "Directory remove failed for '{}': {e}",
+                        p.display()
+                    ));
+                }
+            } else if let Err(e) = fs::remove_file(p) {
+                shred_errors.push(format!(
+                    "Special file remove failed for '{}': {e}",
+                    p.display()
+                ));
             }
         }
-        let _ = fs::remove_dir_all(dir);
+
+        match fs::symlink_metadata(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                shred_errors.push(format!(
+                    "Directory '{}' still exists after ShadowCache teardown",
+                    dir.display()
+                ));
+            }
+            Err(e) => {
+                shred_errors.push(format!(
+                    "Post-teardown verification failed for '{}': {e}",
+                    dir.display()
+                ));
+            }
+        }
+
+        if shred_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "ShadowCache cleanup encountered {} shred/teardown error(s): {}",
+                shred_errors.len(),
+                shred_errors.join("; ")
+            ))
+        }
     }
 
     /// Alias for `ingest_volume_read_once` (`Sub-Phase 3.1`).
@@ -294,7 +557,11 @@ impl ShadowCacheManager {
                 raw_volume_path.display()
             ))
             .to_string();
-            self.append_ledger("SHADOW_CACHE_INGEST_INCOMPLETE", &msg);
+            let vol_token = self.tokenize_path_for_audit(raw_volume_path);
+            self.append_ledger(
+                "SHADOW_CACHE_INGEST_INCOMPLETE",
+                &format!("reason=volume_inaccessible volume_token={vol_token}"),
+            );
             return Err(msg);
         }
 
@@ -338,7 +605,7 @@ impl ShadowCacheManager {
             let entry = match entry_res {
                 Ok(e) => e,
                 Err(walk_err) => {
-                    Self::cleanup_cipher_dir(&shadow_cipher_dir);
+                    self.cleanup_cipher_dir(&shadow_cipher_dir);
                     if is_volume_device {
                         let _ = set_volume_offline(raw_volume_path, true);
                     }
@@ -348,7 +615,11 @@ impl ShadowCacheManager {
                         walk_err
                     ))
                     .to_string();
-                    self.append_ledger("SHADOW_CACHE_INGEST_INCOMPLETE", &msg);
+                    let vol_token = self.tokenize_path_for_audit(raw_volume_path);
+                    self.append_ledger(
+                        "SHADOW_CACHE_INGEST_INCOMPLETE",
+                        &format!("reason=walk_failed volume_token={vol_token}"),
+                    );
                     return Err(msg);
                 }
             };
@@ -361,7 +632,7 @@ impl ShadowCacheManager {
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(meta_err) => {
-                    Self::cleanup_cipher_dir(&shadow_cipher_dir);
+                    self.cleanup_cipher_dir(&shadow_cipher_dir);
                     if is_volume_device {
                         let _ = set_volume_offline(raw_volume_path, true);
                     }
@@ -371,7 +642,11 @@ impl ShadowCacheManager {
                         meta_err
                     ))
                     .to_string();
-                    self.append_ledger("SHADOW_CACHE_INGEST_INCOMPLETE", &msg);
+                    let path_token = self.tokenize_path_for_audit(path);
+                    self.append_ledger(
+                        "SHADOW_CACHE_INGEST_INCOMPLETE",
+                        &format!("reason=metadata_failed path_token={path_token}"),
+                    );
                     return Err(msg);
                 }
             };
@@ -413,7 +688,7 @@ impl ShadowCacheManager {
 
             files_scanned += 1;
             if files_scanned > self.max_files {
-                Self::cleanup_cipher_dir(&shadow_cipher_dir);
+                self.cleanup_cipher_dir(&shadow_cipher_dir);
                 if is_volume_device {
                     let _ = set_volume_offline(raw_volume_path, true);
                 }
@@ -423,7 +698,14 @@ impl ShadowCacheManager {
                     raw_volume_path.display()
                 ))
                 .to_string();
-                self.append_ledger("SHADOW_CACHE_INGEST_INCOMPLETE", &msg);
+                let vol_token = self.tokenize_path_for_audit(raw_volume_path);
+                self.append_ledger(
+                    "SHADOW_CACHE_INGEST_INCOMPLETE",
+                    &format!(
+                        "reason=max_files_exceeded limit={} volume_token={vol_token}",
+                        self.max_files
+                    ),
+                );
                 return Err(msg);
             }
 
@@ -432,7 +714,7 @@ impl ShadowCacheManager {
                 let mut untrusted_file = match open_untrusted_readonly_nofollow(path) {
                     Ok(f) => f,
                     Err(open_err) => {
-                        Self::cleanup_cipher_dir(&shadow_cipher_dir);
+                        self.cleanup_cipher_dir(&shadow_cipher_dir);
                         if is_volume_device {
                             let _ = set_volume_offline(raw_volume_path, true);
                         }
@@ -442,24 +724,36 @@ impl ShadowCacheManager {
                             open_err
                         ))
                         .to_string();
-                        self.append_ledger("SHADOW_CACHE_INGEST_INCOMPLETE", &msg);
+                        let path_token = self.tokenize_path_for_audit(path);
+                        self.append_ledger(
+                            "SHADOW_CACHE_INGEST_INCOMPLETE",
+                            &format!("reason=open_nofollow_failed path_token={path_token}"),
+                        );
                         return Err(msg);
                     }
                 };
                 match read_untrusted_to_end_bounded(&mut untrusted_file, self.max_cache_bytes) {
                     Ok(b) => b,
                     Err(read_err) => {
-                        Self::cleanup_cipher_dir(&shadow_cipher_dir);
+                        self.cleanup_cipher_dir(&shadow_cipher_dir);
                         if is_volume_device {
                             let _ = set_volume_offline(raw_volume_path, true);
                         }
-                        let msg = SentinelError::WalkAccessDenied(format!(
+                        let detail = format!(
                             "ShadowCache bounded single-read failed for '{}': {}",
                             path.display(),
                             read_err
-                        ))
-                        .to_string();
-                        self.append_ledger("SHADOW_CACHE_INGEST_INCOMPLETE", &msg);
+                        );
+                        let msg = if read_err.kind() == std::io::ErrorKind::InvalidData {
+                            SentinelError::CacheQuotaExceeded(detail).to_string()
+                        } else {
+                            SentinelError::WalkAccessDenied(detail).to_string()
+                        };
+                        let path_token = self.tokenize_path_for_audit(path);
+                        self.append_ledger(
+                            "SHADOW_CACHE_INGEST_INCOMPLETE",
+                            &format!("reason=bounded_read_failed path_token={path_token}"),
+                        );
                         return Err(msg);
                     }
                 }
@@ -485,9 +779,10 @@ impl ShadowCacheManager {
                     path.display(),
                     source_sha256
                 );
+                let path_token = self.tokenize_path_for_audit(path);
                 self.append_ledger(
                     "SHADOW_CACHE_THREAT_WITHHELD",
-                    &format!("path={} sha256={}", path.display(), source_sha256),
+                    &format!("path_token={path_token} sha256={source_sha256}"),
                 );
                 continue;
             }
@@ -505,14 +800,10 @@ impl ShadowCacheManager {
                         path.display(),
                         e
                     );
+                    let path_token = self.tokenize_path_for_audit(path);
                     self.append_ledger(
                         "SHADOW_CACHE_CDR_WITHHELD",
-                        &format!(
-                            "path={} sha256={} reason={}",
-                            path.display(),
-                            source_sha256,
-                            e
-                        ),
+                        &format!("path_token={path_token} sha256={source_sha256} reason={e}"),
                     );
                     continue;
                 }
@@ -521,7 +812,7 @@ impl ShadowCacheManager {
             let sanitized_size = release_bytes.len() as u64;
             total_cached_bytes = total_cached_bytes.saturating_add(sanitized_size);
             if total_cached_bytes > self.max_cache_bytes {
-                Self::cleanup_cipher_dir(&shadow_cipher_dir);
+                self.cleanup_cipher_dir(&shadow_cipher_dir);
                 if is_volume_device {
                     let _ = set_volume_offline(raw_volume_path, true);
                 }
@@ -532,7 +823,14 @@ impl ShadowCacheManager {
                     path.display()
                 ))
                 .to_string();
-                self.append_ledger(DegradationEvent::CacheQuotaExceeded.event_code(), &msg);
+                let path_token = self.tokenize_path_for_audit(path);
+                self.append_ledger(
+                    DegradationEvent::CacheQuotaExceeded.event_code(),
+                    &format!(
+                        "cached_bytes={} max_cache_bytes={} path_token={path_token}",
+                        total_cached_bytes, self.max_cache_bytes
+                    ),
+                );
                 return Err(msg);
             }
 
@@ -590,14 +888,12 @@ impl ShadowCacheManager {
             );
         }
 
+        let cipher_dir_token = self.tokenize_path_for_audit(&shadow_cipher_dir);
         self.append_ledger(
             "SHADOW_CACHE_INGEST_COMPLETE",
             &format!(
-                "session={} files={} bytes={} cipher_dir={}",
-                session_id,
-                projected_count,
-                total_cached_bytes,
-                shadow_cipher_dir.display()
+                "session={} files={} bytes={} cipher_dir_token={}",
+                session_id, projected_count, total_cached_bytes, cipher_dir_token
             ),
         );
 
@@ -644,7 +940,7 @@ impl ShadowCacheManager {
             )
         })?;
 
-        let rel_str = relative_path.to_string_lossy();
+        let rel_str = entry.relative_path.to_string_lossy();
         let mut file_id = [0u8; 16];
         let hash_bytes = Sha256::digest(rel_str.as_bytes());
         file_id.copy_from_slice(&hash_bytes[..16]);
@@ -669,6 +965,190 @@ impl ShadowCacheManager {
         }
 
         Ok(plaintext)
+    }
+
+    fn normalize_relative_components(relative_path: &Path) -> Result<Vec<String>, String> {
+        let raw = relative_path
+            .to_str()
+            .ok_or_else(|| "Projected relative path is not valid UTF-8".to_string())?;
+        if raw.is_empty()
+            || raw.contains('\0')
+            || raw.contains(':')
+            || raw.starts_with('/')
+            || raw.starts_with('\\')
+        {
+            return Err(format!(
+                "Rejected invalid or non-relative projected path '{}'",
+                relative_path.display()
+            ));
+        }
+        let mut parts = Vec::new();
+        for seg in raw.split(['/', '\\']) {
+            if seg.is_empty() || seg == "." || seg == ".." {
+                return Err(format!(
+                    "Rejected path traversal or empty segment in '{}'",
+                    relative_path.display()
+                ));
+            }
+            parts.push(seg.to_string());
+        }
+        if parts.is_empty() {
+            return Err("Projected relative path cannot be empty".to_string());
+        }
+        Ok(parts)
+    }
+
+    /// Lists all sanitized entries and synthesized intermediate directories for `virtual_mount_point`.
+    pub fn list_projected_entries(
+        &self,
+        virtual_mount_point: &Path,
+    ) -> Result<Vec<sentinel_sys::ProjFsProjectedEntry>, String> {
+        let guard = self.sessions.lock().map_err(|e| e.to_string())?;
+        let session = guard.get(virtual_mount_point).ok_or_else(|| {
+            format!(
+                "No active ShadowCache session for mount '{}'",
+                virtual_mount_point.display()
+            )
+        })?;
+
+        let mut deduped: HashMap<String, sentinel_sys::ProjFsProjectedEntry> = HashMap::new();
+
+        for entry in session.entries.values() {
+            let parts = Self::normalize_relative_components(&entry.relative_path)?;
+            for prefix_len in 1..parts.len() {
+                let ancestor_parts = &parts[..prefix_len];
+                let key = if cfg!(windows) {
+                    ancestor_parts.join("/").to_lowercase()
+                } else {
+                    ancestor_parts.join("/")
+                };
+                let ancestor_path: PathBuf = ancestor_parts.iter().collect();
+                deduped
+                    .entry(key)
+                    .or_insert(sentinel_sys::ProjFsProjectedEntry {
+                        relative_path: ancestor_path,
+                        is_directory: true,
+                        file_size: 0,
+                        content_sha256: [0u8; 32],
+                    });
+            }
+
+            let canonical_rel: PathBuf = parts.iter().collect();
+            let key = if cfg!(windows) {
+                parts.join("/").to_lowercase()
+            } else {
+                parts.join("/")
+            };
+
+            if entry.is_directory {
+                deduped.insert(
+                    key,
+                    sentinel_sys::ProjFsProjectedEntry {
+                        relative_path: canonical_rel,
+                        is_directory: true,
+                        file_size: 0,
+                        content_sha256: [0u8; 32],
+                    },
+                );
+            } else {
+                let decoded = hex::decode(&entry.sanitized_sha256).map_err(|e| {
+                    format!(
+                        "Invalid sanitized_sha256 hex for '{}': {e}",
+                        entry.relative_path.display()
+                    )
+                })?;
+                if decoded.len() != 32 {
+                    return Err(format!(
+                        "Invalid sanitized_sha256 length ({}) for '{}'",
+                        decoded.len(),
+                        entry.relative_path.display()
+                    ));
+                }
+                let mut content_sha256 = [0u8; 32];
+                content_sha256.copy_from_slice(&decoded);
+                deduped.insert(
+                    key,
+                    sentinel_sys::ProjFsProjectedEntry {
+                        relative_path: canonical_rel,
+                        is_directory: false,
+                        file_size: entry.sanitized_size,
+                        content_sha256,
+                    },
+                );
+            }
+        }
+
+        let mut list: Vec<sentinel_sys::ProjFsProjectedEntry> = deduped.into_values().collect();
+        list.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        Ok(list)
+    }
+
+    /// Decrypts and SHA-256-verifies `relative_path`, validates `byte_offset`, and returns
+    /// the verified slice `[start .. (start + length).min(len)]` (`Row 148`).
+    pub fn read_projected_range(
+        &self,
+        virtual_mount_point: &Path,
+        relative_path: &Path,
+        byte_offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, String> {
+        let req_parts = Self::normalize_relative_components(relative_path)?;
+
+        let matched_key = {
+            let guard = self.sessions.lock().map_err(|e| e.to_string())?;
+            let session = guard.get(virtual_mount_point).ok_or_else(|| {
+                format!(
+                    "No active ShadowCache session for mount '{}'",
+                    virtual_mount_point.display()
+                )
+            })?;
+
+            let mut exact_match: Option<PathBuf> = None;
+            let mut ci_match: Option<PathBuf> = None;
+            for (k, entry) in &session.entries {
+                if entry.is_directory {
+                    continue;
+                }
+                let Ok(entry_parts) = Self::normalize_relative_components(&entry.relative_path)
+                else {
+                    continue;
+                };
+                if entry_parts == req_parts {
+                    exact_match = Some(k.clone());
+                    break;
+                }
+                if cfg!(windows)
+                    && ci_match.is_none()
+                    && entry_parts.len() == req_parts.len()
+                    && entry_parts
+                        .iter()
+                        .zip(req_parts.iter())
+                        .all(|(a, b)| a.to_lowercase() == b.to_lowercase())
+                {
+                    ci_match = Some(k.clone());
+                }
+            }
+
+            exact_match.or(ci_match).ok_or_else(|| {
+                format!(
+                    "Projected file '{}' not found in shadow cache",
+                    relative_path.display()
+                )
+            })?
+        };
+
+        let plaintext = self.read_projected_file(virtual_mount_point, &matched_key)?;
+        let len = plaintext.len();
+        let start = usize::try_from(byte_offset).map_err(|_| {
+            format!("Requested byte_offset {byte_offset} exceeds addressable range")
+        })?;
+        if start > len {
+            return Err(format!(
+                "Requested byte_offset {byte_offset} exceeds verified file length {len}"
+            ));
+        }
+        let end = start.saturating_add(length).min(len);
+        Ok(plaintext[start..end].to_vec())
     }
 
     /// Returns the recorded `(source_sha256, sanitized_sha256)` for a cached file entry.
@@ -752,14 +1232,18 @@ impl ShadowCacheManager {
         // Read stream ONCE into memory (`Invariant I2`)
         let mut raw_bytes = Vec::new();
         if let Err(read_err) = reader.read_to_end(&mut raw_bytes) {
-            Self::cleanup_cipher_dir(&shadow_cipher_dir);
+            self.cleanup_cipher_dir(&shadow_cipher_dir);
             let msg = SentinelError::WalkAccessDenied(format!(
                 "ShadowCache single-read stream failed for '{}': {}",
                 relative_path.display(),
                 read_err
             ))
             .to_string();
-            self.append_ledger("SHADOW_CACHE_INGEST_INCOMPLETE", &msg);
+            let rel_token = self.tokenize_path_for_audit(relative_path);
+            self.append_ledger(
+                "SHADOW_CACHE_INGEST_INCOMPLETE",
+                &format!("reason=stream_read_failed rel_token={rel_token}"),
+            );
             return Err(msg);
         }
 
@@ -776,13 +1260,17 @@ impl ShadowCacheManager {
             .iter()
             .any(|t| !t.can_disarm_via_cdr || t.stream_name.is_some())
         {
-            Self::cleanup_cipher_dir(&shadow_cipher_dir);
+            self.cleanup_cipher_dir(&shadow_cipher_dir);
             let msg = format!(
                 "ShadowCache blocked non-disarmable threat in stream '{}' (source_sha256={})",
                 relative_path.display(),
                 source_sha256
             );
-            self.append_ledger("SHADOW_CACHE_THREAT_WITHHELD", &msg);
+            let rel_token = self.tokenize_path_for_audit(relative_path);
+            self.append_ledger(
+                "SHADOW_CACHE_THREAT_WITHHELD",
+                &format!("rel_token={rel_token} source_sha256={source_sha256}"),
+            );
             return Err(msg);
         }
 
@@ -794,7 +1282,7 @@ impl ShadowCacheManager {
                 raw_bytes,
             })
             .map_err(|e| {
-                Self::cleanup_cipher_dir(&shadow_cipher_dir);
+                self.cleanup_cipher_dir(&shadow_cipher_dir);
                 let msg = format!("CDR_WORKER_FAILED: {e}");
                 self.append_ledger("CDR_WORKER_FAILED", &msg);
                 msg
@@ -803,7 +1291,7 @@ impl ShadowCacheManager {
         let release_bytes = outcome.clean_bytes;
         let sanitized_size = release_bytes.len() as u64;
         if sanitized_size > self.max_cache_bytes {
-            Self::cleanup_cipher_dir(&shadow_cipher_dir);
+            self.cleanup_cipher_dir(&shadow_cipher_dir);
             let msg = SentinelError::CacheQuotaExceeded(format!(
                 "ShadowCache quota exceeded ({} > {} bytes)",
                 sanitized_size, self.max_cache_bytes
@@ -984,22 +1472,139 @@ impl ShadowCacheManager {
             // is volatile-zeroed and unlocked in RAM before disk cleanup (`Row 149`).
             drop(session);
 
-            Self::cleanup_cipher_dir(&cipher_dir);
-            Self::cleanup_cipher_dir(&proj_root);
+            let cipher_cleanup_res = self.cleanup_inception_encrypted_cipher_dir(&cipher_dir);
+            let proj_cleanup_res = Self::cleanup_dir_with_method(
+                &proj_root,
+                ShredMethod::ClearMultiPass { passes: 3 },
+                Some(&self.ledger_path),
+                self.shared_ledger.as_ref(),
+            );
 
+            let cipher_failed = cipher_cleanup_res.is_err();
+            let proj_failed = proj_cleanup_res.is_err();
+            if cipher_failed || proj_failed {
+                let mut combined = Vec::new();
+                if let Err(e) = cipher_cleanup_res {
+                    combined.push(format!("cipher_dir: {e}"));
+                }
+                if let Err(e) = proj_cleanup_res {
+                    combined.push(format!("projection_root: {e}"));
+                }
+                let err_summary = combined.join(" | ");
+                let cipher_token = self.tokenize_path_for_audit(&cipher_dir);
+                let proj_token = self.tokenize_path_for_audit(&proj_root);
+                self.append_ledger(
+                    "SHADOW_CACHE_TEARDOWN_ERROR",
+                    &format!(
+                        "session={} bytes={} cipher_dir_token={} projection_root_token={} cipher_err={} proj_err={}",
+                        session_id,
+                        cached_bytes,
+                        cipher_token,
+                        proj_token,
+                        cipher_failed,
+                        proj_failed
+                    ),
+                );
+                return Err(format!(
+                    "ShadowCache teardown failed closed for session '{}': {}",
+                    session_id, err_summary
+                ));
+            }
+
+            let cipher_token = self.tokenize_path_for_audit(&cipher_dir);
+            let proj_token = self.tokenize_path_for_audit(&proj_root);
             self.append_ledger(
                 "SHADOW_CACHE_SESSION_TEARDOWN",
                 &format!(
-                    "session={} bytes={} cipher_dir={} projection_root={}",
-                    session_id,
-                    cached_bytes,
-                    cipher_dir.display(),
-                    proj_root.display()
+                    "session={} bytes={} cipher_dir_token={} projection_root_token={}",
+                    session_id, cached_bytes, cipher_token, proj_token
                 ),
             );
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl ShadowCacheManager {
+    pub(crate) fn stage_test_encrypted_session_entry(
+        &self,
+        virtual_mount_point: &Path,
+        relative_path: &Path,
+        sanitized_payload: &[u8],
+    ) -> Result<PathBuf, String> {
+        fs::create_dir_all(virtual_mount_point).map_err(|e| {
+            format!(
+                "Failed creating test virtual projection root '{}': {}",
+                virtual_mount_point.display(),
+                e
+            )
+        })?;
+
+        let mut guard = self.sessions.lock().map_err(|e| e.to_string())?;
+        if !guard.contains_key(virtual_mount_point) {
+            let session_id = Uuid::new_v4().to_string();
+            let shadow_cipher_dir = self.resolve_session_cipher_dir(&session_id)?;
+            let mut raw_key = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut raw_key);
+            let session_key = ZeroizingBytes::new(raw_key);
+            sentinel_sys::zeroize_slice(&mut raw_key);
+
+            guard.insert(
+                virtual_mount_point.to_path_buf(),
+                ShadowSessionState {
+                    session_id,
+                    session_key,
+                    entries: HashMap::new(),
+                    projection_root: virtual_mount_point.to_path_buf(),
+                    shadow_cipher_dir,
+                    total_cached_bytes: 0,
+                    withheld_threats: Vec::new(),
+                },
+            );
+        }
+
+        let session = guard
+            .get_mut(virtual_mount_point)
+            .ok_or_else(|| "Failed retrieving staged ShadowCache test session".to_string())?;
+
+        let sanitized_size = sanitized_payload.len() as u64;
+        let sanitized_sha256 = hex::encode(Sha256::digest(sanitized_payload));
+        let rel_str = relative_path.to_string_lossy();
+        let entry_id_hash = hex::encode(Sha256::digest(rel_str.as_bytes()));
+        let mut file_id = [0u8; 16];
+        let hash_bytes = Sha256::digest(rel_str.as_bytes());
+        file_id.copy_from_slice(&hash_bytes[..16]);
+
+        let enc_path = session
+            .shadow_cipher_dir
+            .join(format!("{}.enc", &entry_id_hash[..32]));
+        encrypt_chunked_stream(
+            session.session_key.as_slice(),
+            &file_id,
+            sanitized_payload,
+            &enc_path,
+        )
+        .map_err(|e| format!("Test staged ShadowCache encryption failed: {e}"))?;
+
+        session.total_cached_bytes = session.total_cached_bytes.saturating_add(sanitized_size);
+        session.entries.insert(
+            relative_path.to_path_buf(),
+            VirtualFileEntry {
+                relative_path: relative_path.to_path_buf(),
+                original_size: sanitized_size,
+                sanitized_size,
+                source_sha256: sanitized_sha256.clone(),
+                sanitized_sha256,
+                is_directory: false,
+                is_sanitized: true,
+                encrypted_cache_path: Some(enc_path.clone()),
+                cached_clean_path: None,
+            },
+        );
+
+        Ok(enc_path)
     }
 }
 
@@ -1026,6 +1631,11 @@ impl StagingFolderProvider {
             active_mount: Mutex::new(None),
         }
     }
+
+    pub fn with_shared_ledger(mut self, shared_ledger: SharedAuditLedger) -> Self {
+        self.shadow_cache = self.shadow_cache.with_shared_ledger(shared_ledger);
+        self
+    }
 }
 
 #[async_trait]
@@ -1045,12 +1655,12 @@ impl VirtualFileSystemProvider for StagingFolderProvider {
             event_code,
             virtual_mount_point.display()
         );
+        let mount_token = self
+            .shadow_cache
+            .tokenize_path_for_audit(virtual_mount_point);
         self.shadow_cache.append_ledger(
             event_code,
-            &format!(
-                "ProjFS unavailable; using StagingFolderProvider for {}",
-                virtual_mount_point.display()
-            ),
+            &format!("ProjFS unavailable; using StagingFolderProvider mount_token={mount_token}"),
         );
         self.shadow_cache
             .ingest_volume_read_once(raw_volume_path, virtual_mount_point)?;
@@ -1086,22 +1696,44 @@ impl VirtualFileSystemProvider for StagingFolderProvider {
 ///   otherwise records `POSTURE_REDUCED_NO_PROJFS` and selects `StagingFolderProvider`.
 /// - Linux: `FuseVfsProvider` (Linux FUSE3 userspace mount)
 pub fn resolve_best_vfs_provider() -> Box<dyn VirtualFileSystemProvider> {
+    resolve_best_vfs_provider_with_ledger(None)
+}
+
+/// Resolves the inbox OS userspace VFS provider wired to the unified `SharedAuditLedger` (`CEA-DEFECT-06`).
+pub fn resolve_best_vfs_provider_with_ledger(
+    shared_ledger: Option<SharedAuditLedger>,
+) -> Box<dyn VirtualFileSystemProvider> {
     #[cfg(target_os = "windows")]
     {
         if sentinel_sys::is_projfs_available() {
             info!("Selected VFS Backend: Windows Projected File System (ProjFS + Read-Once ShadowCache)");
-            Box::new(projfs::ProjFsProvider::new())
+            let p = projfs::ProjFsProvider::new();
+            let p = match shared_ledger {
+                Some(sl) => p.with_shared_ledger(sl),
+                None => p,
+            };
+            Box::new(p)
         } else {
             warn!(
                 "[{}] ProjectedFSLib.dll not enabled; selecting Read-Only StagingFolderProvider fallback",
                 DegradationEvent::PostureReducedNoProjfs.event_code()
             );
-            Box::new(StagingFolderProvider::new())
+            let p = StagingFolderProvider::new();
+            let p = match shared_ledger {
+                Some(sl) => p.with_shared_ledger(sl),
+                None => p,
+            };
+            Box::new(p)
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
         info!("Selected VFS Backend: Linux FUSE3 Userspace Mount (+ Read-Once ShadowCache)");
-        Box::new(fuse::FuseVfsProvider::new())
+        let p = fuse::FuseVfsProvider::new();
+        let p = match shared_ledger {
+            Some(sl) => p.with_shared_ledger(sl),
+            None => p,
+        };
+        Box::new(p)
     }
 }

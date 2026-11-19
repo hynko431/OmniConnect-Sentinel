@@ -4,6 +4,10 @@
 *.pdb
 .sentinel_vault/
 **/.sentinel_vault/
+.sentinel_audit/
+**/.sentinel_audit/
+.sentinel_shadow_cache/
+**/.sentinel_shadow_cache/
 sbom.cdx.json
 *.sealed
 *.escrow

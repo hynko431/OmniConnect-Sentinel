@@ -14,7 +14,6 @@
   'use strict';
 
   document.addEventListener('DOMContentLoaded', () => {
-    let sessionBearerToken = '';
     let csrfToken = '';
     let reconnectDelayMs = 1000;
 
@@ -74,9 +73,6 @@
         if (res.ok) {
           const data = await res.json();
           csrfToken = (data && data.csrf_token) || '';
-          if (data && data.session_token) {
-            sessionBearerToken = data.session_token;
-          }
           closeSessionModal();
           return true;
         }
@@ -104,9 +100,6 @@
       const headers = {
         'Accept': 'application/json'
       };
-      if (sessionBearerToken) {
-        headers['Authorization'] = `Bearer ${sessionBearerToken}`;
-      }
       if (includeCsrf && csrfToken) {
         headers['X-Sentinel-CSRF'] = csrfToken;
       }
@@ -363,16 +356,22 @@
       const renderedRows = eventsList.slice().reverse().map((ev) => {
         const evType = ev.event || 'EVENT';
         if (evType === 'SHRED_COMPLETE') {
+          const targetLabel = ev.path_token
+            ? `Token ${String(ev.path_token).slice(0, 16)}`
+            : (ev.original_path || 'Target');
           return {
-            name: `Shred Receipt: ${ev.original_path || 'Target'}`,
-            detail: `${ev.sanitization_level || 'NIST SP 800-88 Rev. 1 Clear (logical)'} • Passes: ${ev.passes_completed} • Renames: ${ev.rename_cycles_completed} • Flush: ${ev.flush_succeeded}`,
+            name: `Shred Receipt: ${targetLabel}`,
+            detail: `${ev.sanitization_level || 'NIST SP 800-88 Rev. 2 Clear (logical)'} • Passes: ${ev.passes_completed} • Renames: ${ev.rename_cycles_completed} • Flush: ${ev.flush_succeeded}`,
             badgeClass: 'cdr-badge sanitized',
             badgeText: 'Clear (logical)'
           };
         }
         if (evType === 'SCAN_COMPLETE') {
+          const scanLabel = ev.path_token
+            ? `Token ${String(ev.path_token).slice(0, 16)}`
+            : (ev.path || '.sentinel_vault');
           return {
-            name: `Directory Walk: ${ev.path || '.sentinel_vault'}`,
+            name: `Directory Walk: ${scanLabel}`,
             detail: `Files Scanned: ${ev.files_scanned || 0} • Threats: ${ev.threats_found || 0} • Errors: ${ev.errors || 0}`,
             badgeClass: ev.complete ? 'cdr-badge sanitized' : 'cdr-badge purged',
             badgeText: ev.complete ? 'Scan Complete' : 'Scan Incomplete'

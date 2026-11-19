@@ -20,10 +20,12 @@ use uuid::Uuid;
 use sentinel_core::enterprise::falcon::{
     CrowdStrikeFalconBridge, FalconTelemetryEvent, MAX_SPOOL_SIZE_BYTES,
 };
+use sentinel_core::enterprise::kiosk::{KioskConfig, KioskEnforcer, PostureReport};
 use sentinel_core::enterprise::ledger::{
     create_shared_audit_ledger, tokenize_path_for_privacy, AuditLedger, AuditSubsystem,
 };
 use sentinel_core::scanner::quarantine::QuarantineVault;
+use sentinel_core::scanner::secure_shredder::{SecureShredder, ShredMethod};
 use sentinel_core::scanner::tier3_sandbox::{
     validate_crlf_safe, validate_egress_ip, SandboxDetonationRequest, Tier3SandboxConnector,
 };
@@ -405,6 +407,258 @@ fn test_t33_rfc5425_octet_counted_framing() {
         cef.len(),
         "RFC 5425 octet count must match CEF payload byte count"
     );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_t33_siem_spool_sealed_key_fail_closed_and_port_514_rejected() {
+    use sentinel_core::enterprise::falcon::SiemSpoolRecord;
+
+    let dir = create_test_dir("siem_sealed_key");
+    let spool_path = dir.join("siem_spool.sealed");
+    let falcon = CrowdStrikeFalconBridge::with_spool_path(
+        "offline://siem.corporate.local:6514",
+        spool_path.clone(),
+    );
+
+    let event = FalconTelemetryEvent {
+        severity: 7,
+        signature_id: "SIG-SEAL-01".to_string(),
+        name: "Sealed Spool Test".to_string(),
+        device_vendor_id: "0781".to_string(),
+        device_product_id: "5583".to_string(),
+        serial_number: "SN-SEALED-9".to_string(),
+        file_sha256: None,
+        action_taken: "Blocked".to_string(),
+        details: "Sealed spool key test".to_string(),
+    };
+    falcon.emit_alert(&event).expect("emit alert");
+
+    // Verify dedicated OS-protected key file was provisioned (NOT derived purely from hostname)
+    let key_path = falcon.spool_key_path();
+    assert!(
+        key_path.exists(),
+        "Protected .spool_key.sealed must be created at {}",
+        key_path.display()
+    );
+    let orig_key_bytes = fs::read(&key_path).expect("read spool key");
+
+    // 1. Corrupting .spool_key.sealed MUST fail closed on both read AND append (no silent overwrite)
+    fs::write(&key_path, b"TAMPERED_SPOOL_KEY_JSON").expect("corrupt spool key");
+    assert!(
+        falcon.read_spool_records().is_err(),
+        "Corrupted spool key must fail closed on read"
+    );
+    assert!(
+        falcon
+            .append_spool_record(&SiemSpoolRecord {
+                timestamp_unix: 100,
+                timestamp_rfc3339: "2026-01-01T00:00:00Z".to_string(),
+                cef_payload: "CEF:0|t|t|1|t|t|1|".to_string(),
+                delivered: false,
+            })
+            .is_err(),
+        "Corrupted spool key must fail closed on append without wiping prior records"
+    );
+
+    // 2. Deleting .spool_key.sealed while siem_spool.sealed exists MUST fail closed (no hostname fallback)
+    fs::remove_file(&key_path).expect("delete spool key");
+    assert!(
+        falcon.read_spool_records().is_err(),
+        "Missing spool key must fail closed on read"
+    );
+    assert!(
+        falcon
+            .append_spool_record(&SiemSpoolRecord {
+                timestamp_unix: 100,
+                timestamp_rfc3339: "2026-01-01T00:00:00Z".to_string(),
+                cef_payload: "CEF:0|t|t|1|t|t|1|".to_string(),
+                delivered: false,
+            })
+            .is_err(),
+        "Missing spool key must fail closed on append"
+    );
+
+    // Restore original sealed key and verify original alert is still intact
+    fs::write(&key_path, orig_key_bytes).expect("restore spool key");
+    let intact = falcon.read_spool_records().expect("read intact spool");
+    assert_eq!(intact.len(), 1);
+    assert!(intact[0].cef_payload.contains("SIG-SEAL-01"));
+
+    // 3. Port 514 and cleartext schemes must fail closed
+    let bad_514 = CrowdStrikeFalconBridge::with_spool_path("127.0.0.1:514", dir.join("bad.sealed"))
+        .with_allow_loopback_for_testing(true);
+    assert!(bad_514.send_rfc5425_syslog("CEF:0|test").is_err());
+    let bad_udp = CrowdStrikeFalconBridge::with_spool_path(
+        "udp://siem.example.com:6514",
+        dir.join("bad2.sealed"),
+    );
+    assert!(bad_udp.send_rfc5425_syslog("CEF:0|test").is_err());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_t33_privacy_path_tokenization_in_quarantine_shred_and_siem_ledgers() {
+    let dir = create_test_dir("pii_tokenization");
+    let unified_ledger_path = dir.join("sentinel_unified_audit.jsonl");
+    let shared_ledger =
+        create_shared_audit_ledger(unified_ledger_path.clone()).expect("create shared ledger");
+
+    let secret_user_dir = dir.join("AliceSecretHRFolder");
+    fs::create_dir_all(&secret_user_dir).expect("create secret folder");
+    let secret_quar_src = secret_user_dir.join("TopSecretMergerPlan.pdf");
+    let secret_restore_dst = secret_user_dir.join("RestoredConfidentialOut.pdf");
+    let secret_shred_src = secret_user_dir.join("ExecutivePayroll2026.xlsx");
+    fs::write(&secret_quar_src, b"CONFIDENTIAL-MERGER-BYTES").expect("write quar target");
+    fs::write(&secret_shred_src, b"PAYROLL-SECRET-BYTES").expect("write shred target");
+
+    let (soc_pub, _soc_priv) = sentinel_sys::generate_soc_rsa_keypair().expect("RSA-3072 keygen");
+    let vault = QuarantineVault::open_with_soc_public_key(dir.join("vault"), &soc_pub)
+        .expect("open vault")
+        .with_shared_ledger(shared_ledger.clone());
+
+    let entry = vault
+        .quarantine_file(&secret_quar_src, "TEST-PII-QUAR")
+        .expect("quarantine secret file");
+    let _restored = vault
+        .restore_file(&entry.entry_id, &secret_restore_dst)
+        .expect("restore secret file");
+
+    let receipt = SecureShredder::shred_file_with_shared_ledger(
+        &secret_shred_src,
+        ShredMethod::ClearMultiPass { passes: 3 },
+        Some(&shared_ledger),
+    )
+    .expect("shred secret file");
+    assert!(receipt.original_path.contains("ExecutivePayroll2026.xlsx"));
+
+    let falcon = CrowdStrikeFalconBridge::with_spool_path(
+        "offline://siem.example.com:6514",
+        dir.join("SecretSiemDir").join("siem_spool.sealed"),
+    )
+    .with_shared_ledger(shared_ledger.clone());
+    falcon
+        .emit_alert(&FalconTelemetryEvent {
+            severity: 6,
+            signature_id: "SIG-PII-CHECK".to_string(),
+            name: "PII Check".to_string(),
+            device_vendor_id: "0781".to_string(),
+            device_product_id: "5583".to_string(),
+            serial_number: "SN-PII".to_string(),
+            file_sha256: None,
+            action_taken: "Quarantined".to_string(),
+            details: "Clean".to_string(),
+        })
+        .expect("emit alert");
+
+    let raw_ledger = fs::read_to_string(&unified_ledger_path).expect("read unified ledger");
+    for forbidden in [
+        "AliceSecretHRFolder",
+        "TopSecretMergerPlan.pdf",
+        "RestoredConfidentialOut.pdf",
+        "ExecutivePayroll2026.xlsx",
+        "SecretSiemDir",
+    ] {
+        assert!(
+            !raw_ledger.contains(forbidden),
+            "AuditLedger JSONL MUST NEVER leak raw PII path substring '{forbidden}'! Ledger:\n{raw_ledger}"
+        );
+    }
+    assert!(raw_ledger.contains("path_token"));
+    assert!(raw_ledger.contains("destination_token"));
+    assert!(raw_ledger.contains("spool_path_token"));
+    assert!(dir
+        .join("sentinel_unified_audit.privacy_hmac.sealed")
+        .exists());
+
+    let verified = shared_ledger
+        .lock()
+        .expect("lock ledger")
+        .verify_chain()
+        .expect("verify unified chain");
+    assert!(verified >= 5);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_t33_syslog_endpoint_validation_and_kiosk_ledger_redaction() {
+    for bad in [
+        "",
+        "   ",
+        "127.0.0.1:514",
+        "syslog://siem.example.com:6514",
+        "tls://siem.example.com:514/",
+        "udp://siem.example.com:514",
+        "tcp://siem.example.com:6514",
+        "http://siem.example.com:6514",
+        "ws://siem.example.com:6514",
+        "tls://[::1]:514",
+        "tls://siem.example.com:0",
+        "tls://user@siem.example.com:6514",
+        "tls://siem.example.com:6514/ingest",
+        "2001:db8::1:6514",
+    ] {
+        assert!(
+            CrowdStrikeFalconBridge::validate_syslog_endpoint(bad).is_err(),
+            "Endpoint '{bad}' MUST be rejected by validate_syslog_endpoint"
+        );
+    }
+
+    let (h_v6, p_v6, off_v6) =
+        CrowdStrikeFalconBridge::validate_syslog_endpoint("tls://[2001:db8::1]:6514")
+            .expect("bracketed IPv6 TLS endpoint must validate");
+    assert_eq!(h_v6, "2001:db8::1");
+    assert_eq!(p_v6, 6514);
+    assert!(!off_v6);
+
+    let (h_off, p_off, off_flag) =
+        CrowdStrikeFalconBridge::validate_syslog_endpoint("offline://siem.omniconnect.local:6514")
+            .expect("offline endpoint must validate");
+    assert_eq!(h_off, "siem.omniconnect.local");
+    assert_eq!(p_off, 6514);
+    assert!(off_flag);
+
+    // KioskEnforcer ledger entries must be PII-redacted and routed under AuditSubsystem::Kiosk
+    let dir = create_test_dir("kiosk_redaction");
+    let ledger_path = dir.join("sentinel_unified_audit.jsonl");
+    let shared_ledger = create_shared_audit_ledger(ledger_path.clone()).expect("shared ledger");
+    let secret_kiosk_dir = dir.join("SensitivePlantFloorKioskFolder");
+    let mut kiosk = KioskEnforcer::new(KioskConfig::default(), secret_kiosk_dir)
+        .with_shared_ledger(shared_ledger.clone());
+
+    let compliant = PostureReport {
+        automount_disabled: true,
+        removable_volumes_offline: vec![("E:\\".to_string(), true)],
+        user_deny_policy_present: true,
+        install_restrictions_active: true,
+        write_protect_active: true,
+        autoplay_suppressed: true,
+        linux_authorized_default_zero: Some(true),
+    };
+    let (_sid, _subdir) = kiosk
+        .start_kiosk_session("USB_SENSITIVE_01")
+        .expect("start kiosk session");
+    let _ = kiosk.begin_kiosk_session_with_posture(&compliant);
+    kiosk.end_kiosk_session().expect("end kiosk session");
+
+    let raw_ledger = fs::read_to_string(&ledger_path).expect("read kiosk unified ledger");
+    assert!(
+        !raw_ledger.contains("SensitivePlantFloorKioskFolder"),
+        "Kiosk ledger records MUST NOT leak raw session directory PII paths:\n{raw_ledger}"
+    );
+    assert!(raw_ledger.contains("session_dir_token"));
+    assert!(raw_ledger.contains("session_subdir_token"));
+    assert!(raw_ledger.contains(r#"\"subsystem\":\"Kiosk\""#));
+
+    let verified = shared_ledger
+        .lock()
+        .expect("lock")
+        .verify_chain()
+        .expect("verify kiosk chain");
+    assert!(verified >= 4);
 
     let _ = fs::remove_dir_all(&dir);
 }

@@ -8,6 +8,7 @@ use tracing::info;
 #[cfg(target_os = "linux")]
 use tracing::warn;
 
+use crate::enterprise::ledger::SharedAuditLedger;
 use crate::vfs::{ShadowCacheManager, VirtualFileSystemProvider};
 
 /// Linux FUSE3 Read-Only Userspace VFS Provider (`BUG-CORE-13`, `Row 150`, Phase 3.2)
@@ -34,6 +35,14 @@ impl FuseVfsProvider {
             shadow_cache: Arc::new(ShadowCacheManager::new()),
             active_root: Arc::new(Mutex::new(None)),
             fuse_mounted: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    pub fn with_shared_ledger(self, shared_ledger: SharedAuditLedger) -> Self {
+        Self {
+            shadow_cache: Arc::new(ShadowCacheManager::new().with_shared_ledger(shared_ledger)),
+            active_root: self.active_root,
+            fuse_mounted: self.fuse_mounted,
         }
     }
 

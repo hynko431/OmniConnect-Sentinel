@@ -11,13 +11,25 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use sentinel_core::config::SentinelConfig;
 use sentinel_core::enterprise::falcon::{CrowdStrikeFalconBridge, FalconTelemetryEvent};
 use sentinel_core::enterprise::intune::IntunePolicyManager;
-use sentinel_core::enterprise::ledger::AuditLedger;
+use sentinel_core::enterprise::ledger::{
+    get_or_init_global_shared_ledger, tokenize_path_for_ledger, AuditSubsystem, SharedAuditLedger,
+};
 use sentinel_core::error::SentinelMetrics;
 use sentinel_core::events::ConnectionVector;
 use sentinel_core::interceptor::{resolve_best_interceptor, PendingDeviceConfirmationManager};
 use sentinel_core::scanner::quarantine::QuarantineVault;
 use sentinel_core::scanner::tier1_cdr_client::Tier1CdrClient;
-use sentinel_core::vfs::resolve_best_vfs_provider;
+use sentinel_core::vfs::resolve_best_vfs_provider_with_ledger;
+
+fn append_system_ledger(shared_ledger: &SharedAuditLedger, event: &str, msg: &str) {
+    if let Ok(mut guard) = shared_ledger.lock() {
+        let _ = guard.append_subsystem_event(
+            AuditSubsystem::System,
+            event,
+            serde_json::Value::String(msg.to_string()),
+        );
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,10 +46,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("===========================================================");
 
     let config = SentinelConfig::default();
+    let shared_ledger = get_or_init_global_shared_ledger(None);
     info!("Loaded Agent Node ID: {}", config.node_id);
 
-    // 1. Synchronize Intune MDM Policies
-    let mut policy_mgr = IntunePolicyManager::new();
+    // 1. Synchronize Intune MDM Policies (wired to single-root unified AuditLedger)
+    let mut policy_mgr = IntunePolicyManager::new().with_shared_ledger(shared_ledger.clone());
     let intune_policy = policy_mgr.load_active_policy();
     info!(
         "Enforcing Policies: PolicyID={}, CDR Mandatory={}, BlockCompositeHID={}, Mode={}",
@@ -90,23 +103,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         posture.autoplay_suppressed
     );
 
-    let ledger_path = config
-        .quarantine_vault_path
-        .parent()
-        .unwrap_or(config.quarantine_vault_path.as_path())
-        .join("AuditLedger")
-        .join("sentinel_audit.jsonl");
-    let mut audit_ledger = AuditLedger::open(ledger_path);
-    let _ = audit_ledger.append_event(
+    append_system_ledger(
+        &shared_ledger,
         "AGENT_STARTUP",
-        format!(
+        &format!(
             "Node {} initialized with policy {}",
             config.node_id, intune_policy.policy_id
         ),
     );
-    let _ = audit_ledger.append_event(
+    append_system_ledger(
+        &shared_ledger,
         "STARTUP_POSTURE_CHECK",
-        format!(
+        &format!(
             "compliant={} automount_disabled={} user_deny={} install_restricted={} write_protect={} autoplay_suppressed={} volumes_offline={:?}",
             posture.is_compliant(),
             posture.automount_disabled,
@@ -119,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 4. Initialize VFS Provider (ProjFS on Windows with Read-Once Encrypted Shadow Cache)
-    let vfs_provider = resolve_best_vfs_provider();
+    let vfs_provider = resolve_best_vfs_provider_with_ledger(Some(shared_ledger.clone()));
     info!("Active VFS Provider: {}", vfs_provider.provider_name());
 
     // 5. Initialize Tier 1 CDR Client (Sandboxed Pipe Worker default), Quarantine Vault, Confirmation Manager, Metrics, and Falcon SIEM Bridge
@@ -128,14 +136,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Tier-1 CDR Client initialized for endpoint: {}",
         cdr_client.ipc_endpoint()
     );
-    let quarantine_vault = Arc::new(QuarantineVault::open(config.quarantine_vault_path.clone())?);
+    let quarantine_vault = Arc::new(
+        QuarantineVault::open(config.quarantine_vault_path.clone())?
+            .with_shared_ledger(shared_ledger.clone()),
+    );
     if let Some(deg) = quarantine_vault.degradation_event() {
-        let _ = audit_ledger.append_event("DEGRADATION_EVENT", deg.event_code());
+        append_system_ledger(&shared_ledger, "DEGRADATION_EVENT", deg.event_code());
     }
     let confirmation_mgr = PendingDeviceConfirmationManager::new(
         PendingDeviceConfirmationManager::default_state_file(),
     );
-    let falcon_bridge = Arc::new(CrowdStrikeFalconBridge::new("127.0.0.1:514"));
+    let falcon_bridge = Arc::new(
+        CrowdStrikeFalconBridge::new(&config.siem_syslog_endpoint)
+            .with_shared_ledger(shared_ledger.clone()),
+    );
     let metrics = Arc::new(SentinelMetrics::default());
 
     // 6. Start Universal Hardware Interceptor (retaining tx in background task - BUG-CORE-01)
@@ -181,9 +195,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Err(e) = interceptor.sever_data_lines(&device_id).await {
                                 warn!("sever_data_lines failed for {}: {}", device_id, e);
                             }
-                            let _ = audit_ledger.append_event(
+                            append_system_ledger(
+                                &shared_ledger,
                                 "HARDWARE_ID_BLOCKED",
-                                format!("Blocked unapproved hardware ID {device_id}"),
+                                &format!("Blocked unapproved hardware ID {device_id}"),
                             );
                             continue;
                         }
@@ -221,9 +236,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "Blocked composite device {device_id}; challenge_id={challenge_id}; physical console authorization token required (see pending_challenge_{challenge_id}.token)"
                                 ),
                             });
-                            let _ = audit_ledger.append_event(
+                            append_system_ledger(
+                                &shared_ledger,
                                 "BADUSB_BLOCKED",
-                                format!(
+                                &format!(
                                     "Severed data lines for composite device {device_id}; challenge_id={challenge_id} issued"
                                 ),
                             );
@@ -288,32 +304,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 warn!("set_volume_offline({}) notice: {}", volume_target.display(), e);
                             }
 
+                            let fallback_lp = config
+                                .quarantine_vault_path
+                                .join("AuditLedger")
+                                .join("sentinel_unified_audit.jsonl");
+                            let raw_tok = tokenize_path_for_ledger(
+                                Some(&shared_ledger),
+                                &fallback_lp,
+                                raw_mount,
+                            )
+                            .unwrap_or_else(|_| "TOKEN_ERR".to_string());
+                            let virt_tok = tokenize_path_for_ledger(
+                                Some(&shared_ledger),
+                                &fallback_lp,
+                                &virtual_mount,
+                            )
+                            .unwrap_or_else(|_| "TOKEN_ERR".to_string());
                             match mount_res {
                                 Ok(()) => {
-                                    let _ = audit_ledger.append_event(
+                                    append_system_ledger(
+                                        &shared_ledger,
                                         "VOLUME_PROJECTED",
-                                        format!(
-                                            "Projected {} -> {} via {} (raw USB volume returned offline)",
-                                            raw_mount.display(),
-                                            virtual_mount.display(),
+                                        &format!(
+                                            "Projected raw_token={raw_tok} -> mount_token={virt_tok} via {} (raw USB volume returned offline)",
                                             vfs_provider.provider_name()
                                         ),
                                     );
                                 }
                                 Err(e) => {
                                     warn!("Projection aborted for {}: {}", raw_mount.display(), e);
-                                    let _ = audit_ledger.append_event(
+                                    append_system_ledger(
+                                        &shared_ledger,
                                         "VOLUME_PROJECTION_ABORTED",
-                                        format!("Aborted projection for {}: {}", raw_mount.display(), e),
+                                        &format!("Aborted projection for raw_token={raw_tok}: {e}"),
                                     );
                                 }
                             }
                         }
                     }
                     _ => {
-                        let _ = audit_ledger.append_event(
+                        append_system_ledger(
+                            &shared_ledger,
                             "PERIPHERAL_OBSERVED",
-                            format!("Observed connection {:?}", event.connection_id),
+                            &format!("Observed connection {:?}", event.connection_id),
                         );
                     }
                 }
@@ -347,10 +380,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                     });
                 }
-                let _ = audit_ledger.append_event(
+                let ntp_status = sentinel_sys::query_ntp_sync_status();
+                append_system_ledger(
+                    &shared_ledger,
                     "HEARTBEAT_BEACON",
-                    format!("Node {} alive; posture_compliant={}", config.node_id, current_posture.is_compliant()),
+                    &format!(
+                        "Node {} alive; posture_compliant={}; ntp_synchronized={}; clock_source={}",
+                        config.node_id,
+                        current_posture.is_compliant(),
+                        ntp_status.ntp_synchronized,
+                        ntp_status.clock_source
+                    ),
                 );
+                if let Ok(mut guard) = shared_ledger.lock() {
+                    let _ = guard.emit_worm_checkpoint();
+                }
             }
         }
     }
@@ -359,9 +403,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = vfs_provider
         .unmount_volume(&PathBuf::from(r"C:\OmniConnect\SafeDrive"))
         .await;
-    let _ = audit_ledger.append_event(
+    append_system_ledger(
+        &shared_ledger,
         "AGENT_SHUTDOWN",
-        format!(
+        &format!(
             "Node {} shutting down; session cache crypto-erased",
             config.node_id
         ),

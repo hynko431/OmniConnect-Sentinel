@@ -1,0 +1,359 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "serialNumber": "urn:uuid:7c62b4d8-3072-4768-9f14-0c35c20bb0a3",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-11-16T10:30:00Z",
+    "lifecycles": [
+      {
+        "phase": "build"
+      }
+    ],
+    "component": {
+      "type": "application",
+      "bom-ref": "pkg:cargo/omniconnect-sentinel@0.1.0",
+      "name": "omniconnect-sentinel",
+      "version": "0.1.0",
+      "description": "Zero-Trust Hardware Peripheral Interceptor, Out-of-Process Deep CDR Engine, and Air-Gapped IEC 62443 SL-3 Kiosk Station"
+    },
+    "properties": [
+      {
+        "name": "sentinel:cbom:owner",
+        "value": "OmniConnect Cryptography & Product Security Engineering"
+      },
+      {
+        "name": "sentinel:cbom:pqc_envelope_version",
+        "value": "OCESCROW3 (RSA-3072-OAEP-SHA256 + FIPS 203 ML-KEM-768 via HKDF-SHA256 + AES-256-GCM)"
+      },
+      {
+        "name": "sentinel:cbom:classical_only_kem_retirement_target",
+        "value": "2030-12-31 (aligned with NIST IR 8547 transition horizon; OCESCROW3 hybrid active now)"
+      },
+      {
+        "name": "sentinel:cbom:review_by",
+        "value": "2027-05-16"
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto:alg:ml-kem-768",
+      "name": "ML-KEM-768",
+      "version": "FIPS-203",
+      "description": "Post-Quantum Module-Lattice-Based Key-Encapsulation Mechanism (1184B EK, 2400B DK, 1088B CT, 32B SS) in OCESCROW3 SOC Master KEK Escrow",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "oid": "2.16.840.1.101.3.4.4.2",
+        "algorithmProperties": {
+          "primitive": "kem",
+          "parameterSetIdentifier": "768",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "x86_64 / aarch64 (ml-kem v0.2.3)",
+          "certificationLevel": [
+            "none"
+          ],
+          "cryptoFunctions": [
+            "keygen",
+            "encapsulate",
+            "decapsulate"
+          ],
+          "classicalSecurityLevel": 192,
+          "nistQuantumSecurityLevel": 3
+        }
+      },
+      "properties": [
+        {
+          "name": "sentinel:crate",
+          "value": "ml-kem@0.2.3"
+        },
+        {
+          "name": "sentinel:module",
+          "value": "crates/sentinel-sys/src/crypto_seal.rs"
+        },
+        {
+          "name": "sentinel:data_lifetime",
+          "value": "Long-term forensic quarantine recovery (>= 10 years; harvest-now-decrypt-later protected)"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto:protocol:ocescrow3-hybrid-kem",
+      "name": "OCESCROW3-RSA-3072-OAEP-ML-KEM-768-HKDF-SHA256-AES256GCM",
+      "version": "3",
+      "description": "Transcript-bound IND-CCA2 Hybrid KEM Combiner wrapping 256-bit Quarantine Vault Master KEK",
+      "cryptoProperties": {
+        "assetType": "protocol",
+        "protocolProperties": {
+          "type": "other",
+          "version": "OCESCROW3"
+        }
+      },
+      "properties": [
+        {
+          "name": "sentinel:combiner_formula",
+          "value": "HKDF-SHA256(salt_16B, ss_rsa_32B || ss_mlkem768_32B, 'OMNICONNECT-HYBRID-ESCROW-V3|' || kek_id || '|' || SHA256(ct_rsa) || SHA256(ct_mlkem768))"
+        },
+        {
+          "name": "sentinel:crypto_agility_wire_magic",
+          "value": "OCESCROW3"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto:alg:rsa-3072-oaep-sha256",
+      "name": "RSA-3072-OAEP-SHA256",
+      "version": "SP800-56B-Rev2",
+      "description": "Classical asymmetric KEM leg in OCESCROW3 and v2 SOC escrow (>= 3072-bit RSA strictly enforced)",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "oid": "1.2.840.113549.1.1.7",
+        "algorithmProperties": {
+          "primitive": "pke",
+          "parameterSetIdentifier": "3072",
+          "padding": "oaep",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "Windows CNG BCrypt / rsa v0.10.0",
+          "cryptoFunctions": [
+            "keygen",
+            "encrypt",
+            "decrypt"
+          ],
+          "classicalSecurityLevel": 128,
+          "nistQuantumSecurityLevel": 0
+        }
+      },
+      "properties": [
+        {
+          "name": "sentinel:crate",
+          "value": "rsa@0.10.0"
+        },
+        {
+          "name": "sentinel:retirement_schedule",
+          "value": "Classical-only v2 SocEscrowBlob deprecated in favor of OCESCROW3 hybrid v3; scheduled removal by 2030-12-31"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto:alg:aes-256-gcm",
+      "name": "AES-256-GCM",
+      "version": "SP800-38D",
+      "description": "256-bit Authenticated Encryption for Quarantine Vault (SNTLQV02), 64 KiB Streaming VFS Shadow Cache, Kiosk Session Cache, OCSL2 Key Sealing, and OCESCROW3 KEK Wrapping",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "oid": "2.16.840.1.101.3.4.1.46",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "mode": "gcm",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "aes-gcm v0.10.3",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "tag"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        }
+      },
+      "properties": [
+        {
+          "name": "sentinel:crate",
+          "value": "aes-gcm@0.10.3"
+        },
+        {
+          "name": "sentinel:wire_envelopes",
+          "value": "SNTLQV02, OCSL2, OCESCROW3, ChunkedShadowCache64KiB"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto:alg:ecdsa-p256-sha256",
+      "name": "ECDSA-P256-SHA256",
+      "version": "FIPS-186-5",
+      "description": "Asymmetric signing for Unified Audit Ledger chain heads (.head.sig), Enterprise Intune MDM Policy Root Trust, and Kiosk CDR Passports (.sentinel-passport.json)",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "oid": "1.2.840.10045.4.3.2",
+        "algorithmProperties": {
+          "primitive": "signature",
+          "curve": "secp256r1",
+          "executionEnvironment": "hardware-tee",
+          "implementationPlatform": "Windows TPM 2.0 PCP / CNG BCrypt / p256 v0.14.0",
+          "cryptoFunctions": [
+            "keygen",
+            "sign",
+            "verify"
+          ],
+          "classicalSecurityLevel": 128,
+          "nistQuantumSecurityLevel": 0
+        }
+      },
+      "properties": [
+        {
+          "name": "sentinel:crate",
+          "value": "p256@0.14.0"
+        },
+        {
+          "name": "sentinel:pqc_roadmap",
+          "value": "Dual-signature ECDSA-P256 + FIPS 204 ML-DSA-65 planned for v2 policy & passport schemas prior to 2030-12-31"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto:alg:hkdf-sha256",
+      "name": "HKDF-SHA256",
+      "version": "RFC-5869",
+      "description": "Key derivation for SNTLQV02 per-entry DEKs, OCSL2 Unix key sealing, and OCESCROW3 hybrid KEM combiner",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "oid": "1.2.840.113549.1.9.16.3.28",
+        "algorithmProperties": {
+          "primitive": "kdf",
+          "parameterSetIdentifier": "256",
+          "cryptoFunctions": [
+            "keyderive"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 3
+        }
+      },
+      "properties": [
+        {
+          "name": "sentinel:crate",
+          "value": "hkdf@0.12.4"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto:alg:hmac-sha256",
+      "name": "HMAC-SHA256",
+      "version": "FIPS-198-1",
+      "description": "Keyed pseudonymization of personal file paths in CERT-In 180-day Audit Ledger (GDPR Art. 17 / DPDP §12)",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "oid": "1.2.840.113549.2.9",
+        "algorithmProperties": {
+          "primitive": "mac",
+          "parameterSetIdentifier": "256",
+          "cryptoFunctions": [
+            "tag"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 3
+        }
+      },
+      "properties": [
+        {
+          "name": "sentinel:crate",
+          "value": "hmac@0.12.1"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto:alg:sha2-256",
+      "name": "SHA-256",
+      "version": "FIPS-180-4",
+      "description": "Content hashing for Audit Ledger hash chain, 128-bit BadUSB salted challenges, and CDR Passport manifests",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "oid": "2.16.840.1.101.3.4.2.1",
+        "algorithmProperties": {
+          "primitive": "hash",
+          "parameterSetIdentifier": "256",
+          "cryptoFunctions": [
+            "digest"
+          ],
+          "classicalSecurityLevel": 128,
+          "nistQuantumSecurityLevel": 2
+        }
+      },
+      "properties": [
+        {
+          "name": "sentinel:crate",
+          "value": "sha2@0.10.9"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto:protocol:tls-1-3-mtls",
+      "name": "TLS-1.3-mTLS",
+      "version": "1.3",
+      "description": "Strict TLS 1.3 mutual-TLS transport for Tier-3 Sandbox Egress and RFC 5425 Syslog WORM SIEM Shipping",
+      "cryptoProperties": {
+        "assetType": "protocol",
+        "protocolProperties": {
+          "type": "tls",
+          "version": "1.3"
+        }
+      },
+      "properties": [
+        {
+          "name": "sentinel:crate",
+          "value": "rustls@0.23.46"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto:drbg:osrng",
+      "name": "OS-Kernel-CSPRNG",
+      "version": "OsRng",
+      "description": "Exclusive workspace-wide kernel CSPRNG source (Windows BCryptGenRandom / Linux getrandom(2); zero thread_rng user-space state)",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "drbg",
+          "cryptoFunctions": [
+            "generate"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        }
+      },
+      "properties": [
+        {
+          "name": "sentinel:crate",
+          "value": "rand@0.8.8"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "pkg:cargo/omniconnect-sentinel@0.1.0",
+      "dependsOn": [
+        "crypto:alg:ml-kem-768",
+        "crypto:protocol:ocescrow3-hybrid-kem",
+        "crypto:alg:rsa-3072-oaep-sha256",
+        "crypto:alg:aes-256-gcm",
+        "crypto:alg:ecdsa-p256-sha256",
+        "crypto:alg:hkdf-sha256",
+        "crypto:alg:hmac-sha256",
+        "crypto:alg:sha2-256",
+        "crypto:protocol:tls-1-3-mtls",
+        "crypto:drbg:osrng"
+      ]
+    },
+    {
+      "ref": "crypto:protocol:ocescrow3-hybrid-kem",
+      "dependsOn": [
+        "crypto:alg:rsa-3072-oaep-sha256",
+        "crypto:alg:ml-kem-768",
+        "crypto:alg:hkdf-sha256",
+        "crypto:alg:aes-256-gcm",
+        "crypto:drbg:osrng"
+      ]
+    }
+  ]
+}

@@ -43,6 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let launcher = WorkerLauncher::new();
+    if !launcher.has_worker_binary() {
+        eprintln!(
+            "FATAL: CDR_WORKER_FAILED: sentinel-cdr-worker binary not found adjacent to sentinel-cdr-daemon; refusing startup (Invariant I3)"
+        );
+        std::process::exit(1);
+    }
     let stdin = io::stdin();
     let stdout = io::stdout();
 

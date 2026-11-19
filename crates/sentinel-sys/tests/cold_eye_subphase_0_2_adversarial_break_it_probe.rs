@@ -1,18 +1,18 @@
 //! Cold-Eye Compliance Auditor - Sub-Phase 0.2 Adversarial Break-It Probe
-//! Relentlessly tests RSA-2048 semiprime properties, OAEP padding integrity,
-//! label binding, corrupted key handling, and escrow recovery isolation.
+//! Relentlessly tests RSA-3072 semiprime properties, OAEP padding integrity,
+//! label binding, corrupted/downgraded 2048-bit key rejection, and escrow recovery isolation.
 
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use sentinel_sys::crypto_seal::{
-    decrypt_kek_from_soc_escrow, decrypt_kek_from_soc_escrow_software,
-    default_soc_rsa_private_blob, default_soc_rsa_public_blob, encrypt_kek_for_soc_escrow,
-    encrypt_kek_for_soc_escrow_software, export_rsa_private_key_to_cng,
-    export_rsa_public_key_to_cng, generate_soc_rsa_keypair, generate_soc_rsa_keypair_software,
-    parse_rsa_private_key, parse_rsa_public_key, SocEscrowBlob,
+    decrypt_kek_from_soc_escrow, decrypt_kek_from_soc_escrow_software, encrypt_kek_for_soc_escrow,
+    encrypt_kek_for_soc_escrow_hybrid_v3, encrypt_kek_for_soc_escrow_software,
+    export_rsa_private_key_to_cng, export_rsa_public_key_to_cng, generate_hybrid_soc_keypair_v3,
+    generate_hybrid_soc_keypair_with_bits, generate_soc_rsa_keypair,
+    generate_soc_rsa_keypair_software, parse_rsa_private_key, parse_rsa_public_key, SocEscrowBlob,
 };
 
 #[test]
-fn probe_adversarial_rsa2048_semiprime_mathematical_soundness() {
+fn probe_adversarial_rsa3072_semiprime_mathematical_soundness() {
     // 1. Generate keypairs via software and CNG (if windows)
     let (sw_pub, sw_priv) = generate_soc_rsa_keypair_software().expect("software keygen");
     assert_eq!(&sw_pub[0..4], b"RSA1");
@@ -28,20 +28,20 @@ fn probe_adversarial_rsa2048_semiprime_mathematical_soundness() {
     let re_exported_priv = export_rsa_private_key_to_cng(&parsed_priv).expect("re-export priv");
     assert_eq!(re_exported_priv, sw_priv);
 
-    // Check modulus bit length
+    // Check modulus bit length (>= 3072 bits / 384 bytes)
     let n = parsed_priv.n();
     let n_bytes = n.to_be_bytes();
     assert_eq!(
         n_bytes.len(),
-        256,
-        "Modulus must be exactly 256 bytes (2048 bits)"
+        384,
+        "Modulus must be exactly 384 bytes (3072 bits)"
     );
     assert_eq!(
         n_bytes[0] & 0x80,
         0x80,
-        "MSB of modulus must be 1 (full 2048 bits)"
+        "MSB of modulus must be 1 (full 3072 bits)"
     );
-    assert_eq!(n_bytes[255] & 0x01, 0x01, "Modulus must be odd");
+    assert_eq!(n_bytes[383] & 0x01, 0x01, "Modulus must be odd");
 
     // Check exponent: F4 is 65537 (0x010001)
     let e = parsed_priv.e();
@@ -70,12 +70,12 @@ fn probe_adversarial_rsa2048_semiprime_mathematical_soundness() {
 
     let p_bytes = p.to_be_bytes();
     let q_bytes = q.to_be_bytes();
-    assert_eq!(p_bytes.len(), 128, "Prime p must be 1024 bits (128 bytes)");
-    assert_eq!(q_bytes.len(), 128, "Prime q must be 1024 bits (128 bytes)");
+    assert_eq!(p_bytes.len(), 192, "Prime p must be 1536 bits (192 bytes)");
+    assert_eq!(q_bytes.len(), 192, "Prime q must be 1536 bits (192 bytes)");
 
     // Both p and q must be odd
-    assert_eq!(p_bytes[127] & 0x01, 0x01, "Prime p must be odd");
-    assert_eq!(q_bytes[127] & 0x01, 0x01, "Prime q must be odd");
+    assert_eq!(p_bytes[191] & 0x01, 0x01, "Prime p must be odd");
+    assert_eq!(q_bytes[191] & 0x01, 0x01, "Prime q must be odd");
 
     // Public key n and e must match private key parts
     assert_eq!(
@@ -89,13 +89,12 @@ fn probe_adversarial_rsa2048_semiprime_mathematical_soundness() {
         "Public key exponent must match private key exponent"
     );
 
-    // 3. Default SOC keypair verification
-    let def_pub = default_soc_rsa_public_blob();
-    let def_priv = default_soc_rsa_private_blob();
-    let def_parsed_pub = parse_rsa_public_key(&def_pub).expect("parse default pub");
-    let def_parsed_priv = parse_rsa_private_key(&def_priv).expect("parse default priv");
-    assert_eq!(def_parsed_pub.n(), def_parsed_priv.n());
-    assert_eq!(def_parsed_priv.primes().len(), 2);
+    // 3. Hardware/primary SOC keygen must also produce >= 3072-bit RSA
+    let (gen_pub, gen_priv) = generate_soc_rsa_keypair().expect("generate primary RSA-3072");
+    let gen_parsed_pub = parse_rsa_public_key(&gen_pub).expect("parse primary pub");
+    let gen_parsed_priv = parse_rsa_private_key(&gen_priv).expect("parse primary priv");
+    assert_eq!(gen_parsed_pub.n(), gen_parsed_priv.n());
+    assert_eq!(gen_parsed_pub.n().to_be_bytes().len(), 384);
 }
 
 #[test]
@@ -107,9 +106,9 @@ fn probe_adversarial_rsa_oaep_label_and_ciphertext_tampering() {
     // Legitimate encryption
     let escrow = encrypt_kek_for_soc_escrow(&kek, &pub_blob, kek_id).expect("encrypt");
     assert_eq!(escrow.version, 2);
-    assert_eq!(escrow.algorithm, "RSA-2048-OAEP-SHA256");
+    assert_eq!(escrow.algorithm, "RSA-3072-OAEP-SHA256");
     assert_eq!(escrow.kek_id, kek_id);
-    assert_eq!(escrow.rsa_oaep_ciphertext.len(), 256);
+    assert_eq!(escrow.rsa_oaep_ciphertext.len(), 384);
 
     // Legitimate decryption
     let decrypted = decrypt_kek_from_soc_escrow(&escrow, &priv_blob).expect("decrypt");
@@ -118,6 +117,7 @@ fn probe_adversarial_rsa_oaep_label_and_ciphertext_tampering() {
     // Test software engine directly
     let sw_escrow =
         encrypt_kek_for_soc_escrow_software(&kek, &pub_blob, kek_id).expect("sw encrypt");
+    assert_eq!(sw_escrow.algorithm, "RSA-3072-OAEP-SHA256");
     let sw_decrypted =
         decrypt_kek_from_soc_escrow_software(&sw_escrow, &priv_blob).expect("sw decrypt");
     assert_eq!(sw_decrypted, kek);
@@ -126,9 +126,9 @@ fn probe_adversarial_rsa_oaep_label_and_ciphertext_tampering() {
     let cross_dec = decrypt_kek_from_soc_escrow(&sw_escrow, &priv_blob).expect("cross decrypt");
     assert_eq!(cross_dec, kek);
 
-    // Adversarial Scenario 1: Bit-flip every single byte in the 256-byte ciphertext
+    // Adversarial Scenario 1: Bit-flip across the 384-byte ciphertext
     // OAEP-SHA256 integrity verification MUST reject any tampered ciphertext without panicking.
-    for byte_idx in [0, 1, 15, 31, 63, 127, 200, 255] {
+    for byte_idx in [0, 1, 15, 31, 63, 127, 255, 300, 383] {
         let mut tampered_escrow = escrow.clone();
         tampered_escrow.rsa_oaep_ciphertext[byte_idx] ^= 0x01;
         let res = decrypt_kek_from_soc_escrow(&tampered_escrow, &priv_blob);
@@ -139,7 +139,7 @@ fn probe_adversarial_rsa_oaep_label_and_ciphertext_tampering() {
     }
 
     // Adversarial Scenario 2: Truncated ciphertext
-    for trunc_len in [0, 1, 16, 64, 128, 255] {
+    for trunc_len in [0, 1, 16, 64, 128, 255, 256, 383] {
         let mut tampered_escrow = escrow.clone();
         tampered_escrow.rsa_oaep_ciphertext.truncate(trunc_len);
         let res = decrypt_kek_from_soc_escrow(&tampered_escrow, &priv_blob);
@@ -173,7 +173,7 @@ fn probe_adversarial_rsa_oaep_label_and_ciphertext_tampering() {
     let wrong_key_res = decrypt_kek_from_soc_escrow(&escrow, &other_priv);
     assert!(
         wrong_key_res.is_err(),
-        "Decryption with an unrelated RSA-2048 private key must fail OAEP verification"
+        "Decryption with an unrelated RSA-3072 private key must fail OAEP verification"
     );
 }
 
@@ -182,10 +182,10 @@ fn probe_adversarial_malformed_rsa_blobs_never_panic() {
     let kek = [0x42u8; 32];
     let escrow = SocEscrowBlob {
         version: 2,
-        algorithm: "RSA-2048-OAEP-SHA256".to_string(),
+        algorithm: "RSA-3072-OAEP-SHA256".to_string(),
         kek_id: "test-malformed".to_string(),
         soc_key_fingerprint: "0123456789abcdef".to_string(),
-        rsa_oaep_ciphertext: vec![0u8; 256],
+        rsa_oaep_ciphertext: vec![0u8; 384],
     };
 
     // 1. Truncated blobs to parse_rsa_public_key
@@ -196,16 +196,60 @@ fn probe_adversarial_malformed_rsa_blobs_never_panic() {
     }
 
     // 2. Bad magic in public key
-    let mut bad_magic = vec![0u8; 24 + 3 + 256];
+    let mut bad_magic = vec![0u8; 24 + 3 + 384];
     bad_magic[0..4].copy_from_slice(b"BAD!");
     assert!(parse_rsa_public_key(&bad_magic).is_err());
     assert!(encrypt_kek_for_soc_escrow(&kek, &bad_magic, "test").is_err());
 
-    // 3. Insecure key length (< 2048 bits) in header
-    let mut weak_key = vec![0u8; 24 + 3 + 128];
-    weak_key[0..4].copy_from_slice(b"RSA1");
-    weak_key[4..8].copy_from_slice(&1024u32.to_le_bytes()); // 1024 bits < 2048
-    assert!(parse_rsa_public_key(&weak_key).is_err());
+    // 3. Insecure key lengths (< 3072 bits: 1024 and 2048 bits) MUST be rejected everywhere
+    let mut weak_key_1024 = vec![0u8; 24 + 3 + 128];
+    weak_key_1024[0..4].copy_from_slice(b"RSA1");
+    weak_key_1024[4..8].copy_from_slice(&1024u32.to_le_bytes());
+    assert!(parse_rsa_public_key(&weak_key_1024).is_err());
+
+    struct TestOsRng;
+    impl rsa::rand_core::TryRng for TestOsRng {
+        type Error = core::convert::Infallible;
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(rand::RngCore::next_u32(&mut rand::rngs::OsRng))
+        }
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(rand::RngCore::next_u64(&mut rand::rngs::OsRng))
+        }
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, dst);
+            Ok(())
+        }
+    }
+    impl rsa::rand_core::TryCryptoRng for TestOsRng {}
+
+    let mut test_rng = TestOsRng;
+    let rsa2048_priv = rsa::PrivateKey::new(&mut test_rng, 2048).expect("2048 test key");
+    let rsa2048_pub = rsa::PublicKey::from(&rsa2048_priv);
+    let rsa2048_pub_blob = export_rsa_public_key_to_cng(&rsa2048_pub);
+    let rsa2048_priv_blob = export_rsa_private_key_to_cng(&rsa2048_priv).expect("2048 priv blob");
+    assert!(
+        parse_rsa_public_key(&rsa2048_pub_blob).is_err(),
+        "2048-bit RSA public key must be rejected (< 3072 bits)"
+    );
+    assert!(
+        parse_rsa_private_key(&rsa2048_priv_blob).is_err(),
+        "2048-bit RSA private key must be rejected (< 3072 bits)"
+    );
+    assert!(
+        encrypt_kek_for_soc_escrow(&kek, &rsa2048_pub_blob, "downgrade-test").is_err(),
+        "encrypt_kek_for_soc_escrow must reject 2048-bit RSA downgrade"
+    );
+    assert!(
+        generate_hybrid_soc_keypair_with_bits(2048).is_err(),
+        "generate_hybrid_soc_keypair_with_bits(2048) must fail closed"
+    );
+    let (mut v3_pub, _v3_priv) = generate_hybrid_soc_keypair_v3().expect("v3 keygen");
+    v3_pub.rsa_public_blob = rsa2048_pub_blob;
+    assert!(
+        encrypt_kek_for_soc_escrow_hybrid_v3(&kek, &v3_pub, "downgrade-v3").is_err(),
+        "encrypt_kek_for_soc_escrow_hybrid_v3 must reject 2048-bit RSA downgrade"
+    );
 
     // 4. Truncated private key blobs to parse_rsa_private_key
     for len in [0, 1, 4, 12, 23, 24] {
@@ -215,8 +259,22 @@ fn probe_adversarial_malformed_rsa_blobs_never_panic() {
     }
 
     // 5. Bad magic in private key
-    let mut bad_priv_magic = vec![0u8; 24 + 3 + 256 + 128 + 128];
+    let mut bad_priv_magic = vec![0u8; 24 + 3 + 384 + 192 + 192];
     bad_priv_magic[0..4].copy_from_slice(b"RSA1"); // Wrong magic for private key (needs RSA2)
     assert!(parse_rsa_private_key(&bad_priv_magic).is_err());
     assert!(decrypt_kek_from_soc_escrow(&escrow, &bad_priv_magic).is_err());
+
+    // 6. Spoofed SocEscrowBlob metadata (version != 2 or RSA-2048 algorithm label) must be rejected
+    let (_rsa3072_pub_v, rsa3072_priv_v) = generate_soc_rsa_keypair().expect("RSA-3072 keygen");
+    let valid_escrow =
+        encrypt_kek_for_soc_escrow(&kek, &_rsa3072_pub_v, "meta-check").expect("valid escrow");
+    let mut bad_ver = valid_escrow.clone();
+    bad_ver.version = 1;
+    assert!(decrypt_kek_from_soc_escrow(&bad_ver, &rsa3072_priv_v).is_err());
+    assert!(decrypt_kek_from_soc_escrow_software(&bad_ver, &rsa3072_priv_v).is_err());
+
+    let mut bad_alg = valid_escrow;
+    bad_alg.algorithm = "RSA-2048-OAEP-SHA256".to_string();
+    assert!(decrypt_kek_from_soc_escrow(&bad_alg, &rsa3072_priv_v).is_err());
+    assert!(decrypt_kek_from_soc_escrow_software(&bad_alg, &rsa3072_priv_v).is_err());
 }

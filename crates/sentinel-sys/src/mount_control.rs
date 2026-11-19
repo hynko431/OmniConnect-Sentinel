@@ -43,6 +43,15 @@ pub struct UsbPnpDeviceInfo {
     pub is_composite_hid_storage: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NtpSyncStatus {
+    pub ntp_synchronized: bool,
+    pub clock_source: String,
+    pub stratum: Option<u8>,
+    pub max_error_us: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostureReport {
     pub automount_disabled: bool,
@@ -118,6 +127,23 @@ extern "system" {
         lpOverlapped: *mut core::ffi::c_void,
     ) -> i32;
     fn CloseHandle(hObject: isize) -> i32;
+    fn GetSystemTimeAdjustment(
+        lpTimeAdjustment: *mut u32,
+        lpTimeIncrement: *mut u32,
+        lpTimeAdjustmentDisabled: *mut i32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct Win32ServiceStatus {
+    dw_service_type: u32,
+    dw_current_state: u32,
+    dw_controls_accepted: u32,
+    dw_win32_exit_code: u32,
+    dw_service_specific_exit_code: u32,
+    dw_check_point: u32,
+    dw_wait_hint: u32,
 }
 
 #[cfg(windows)]
@@ -141,6 +167,14 @@ extern "system" {
         cbData: u32,
     ) -> i32;
     fn RegDeleteKeyValueW(hKey: isize, lpSubKey: *const u16, lpValueName: *const u16) -> i32;
+    fn OpenSCManagerW(
+        lpMachineName: *const u16,
+        lpDatabaseName: *const u16,
+        dwDesiredAccess: u32,
+    ) -> isize;
+    fn OpenServiceW(hSCManager: isize, lpServiceName: *const u16, dwDesiredAccess: u32) -> isize;
+    fn QueryServiceStatus(hService: isize, lpServiceStatus: *mut Win32ServiceStatus) -> i32;
+    fn CloseServiceHandle(hSCObject: isize) -> i32;
 }
 
 #[cfg(windows)]
@@ -2118,5 +2152,206 @@ pub fn verify_system_posture() -> PostureReport {
         write_protect_active,
         autoplay_suppressed,
         linux_authorized_default_zero: linux_auth,
+    }
+}
+
+#[cfg(windows)]
+fn query_w32time_service_running() -> Option<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    const SC_MANAGER_CONNECT: u32 = 0x0001;
+    const SERVICE_QUERY_STATUS: u32 = 0x0004;
+    const SERVICE_RUNNING: u32 = 0x0000_0004;
+
+    let svc_name: Vec<u16> = std::ffi::OsStr::new("W32Time")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let scm = unsafe { OpenSCManagerW(core::ptr::null(), core::ptr::null(), SC_MANAGER_CONNECT) };
+    if scm == 0 {
+        return None;
+    }
+    let svc = unsafe { OpenServiceW(scm, svc_name.as_ptr(), SERVICE_QUERY_STATUS) };
+    if svc == 0 {
+        unsafe {
+            let _ = CloseServiceHandle(scm);
+        }
+        return None;
+    }
+    let mut status = Win32ServiceStatus {
+        dw_service_type: 0,
+        dw_current_state: 0,
+        dw_controls_accepted: 0,
+        dw_win32_exit_code: 0,
+        dw_service_specific_exit_code: 0,
+        dw_check_point: 0,
+        dw_wait_hint: 0,
+    };
+    let ok = unsafe { QueryServiceStatus(svc, &mut status) };
+    unsafe {
+        let _ = CloseServiceHandle(svc);
+        let _ = CloseServiceHandle(scm);
+    }
+    if ok != 0 {
+        Some(status.dw_current_state == SERVICE_RUNNING)
+    } else {
+        None
+    }
+}
+
+/// Queries live OS NTP / ICT clock-synchronization health (`CERT-In Apr 2022` Directions, `Sub-Phase 2.2`, `CSE-14`).
+///
+/// - **Windows:** Inspects `W32Time` service state (`QueryServiceStatus`), `HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Parameters`
+///   (`Type`, `NtpServer`), `NtpClient\Enabled`, `Start` mode, and Win32 `GetSystemTimeAdjustment`.
+/// - **Linux:** Invokes `libc::adjtimex` (`modes = 0` read-only) and checks `(status & STA_UNSYNC) == 0`
+///   plus `maxerror` in microseconds.
+pub fn query_ntp_sync_status() -> NtpSyncStatus {
+    #[cfg(windows)]
+    {
+        let w32_type = read_registry_string(
+            r"SYSTEM\CurrentControlSet\Services\W32Time\Parameters",
+            "Type",
+        )
+        .unwrap_or_default();
+        let raw_server = read_registry_string(
+            r"SYSTEM\CurrentControlSet\Services\W32Time\Parameters",
+            "NtpServer",
+        )
+        .unwrap_or_default();
+        let primary_server = raw_server
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let ntp_client_enabled = read_registry_dword(
+            false,
+            r"SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient",
+            "Enabled",
+        )
+        .unwrap_or(0)
+            != 0;
+        let start_mode =
+            read_registry_dword(false, r"SYSTEM\CurrentControlSet\Services\W32Time", "Start")
+                .unwrap_or(4); // 4 == SERVICE_DISABLED
+        let max_phase_s = read_registry_dword(
+            false,
+            r"SYSTEM\CurrentControlSet\Services\W32Time\Config",
+            "MaxAllowedPhaseOffset",
+        );
+
+        let mut time_adj: u32 = 0;
+        let mut time_inc: u32 = 0;
+        let mut adj_disabled: i32 = 1;
+        let adj_ok =
+            unsafe { GetSystemTimeAdjustment(&mut time_adj, &mut time_inc, &mut adj_disabled) }
+                != 0;
+        let svc_running = query_w32time_service_running();
+
+        let type_norm = w32_type.trim();
+        let is_nosync = type_norm.is_empty() || type_norm.eq_ignore_ascii_case("NoSync");
+        let is_domain_nt5ds = type_norm.eq_ignore_ascii_case("NT5DS");
+        let provider_configured =
+            !is_nosync && start_mode != 4 && (ntp_client_enabled || is_domain_nt5ds);
+
+        let ntp_synchronized = provider_configured
+            && match svc_running {
+                Some(true) => true,
+                Some(false) => adj_ok && adj_disabled == 0,
+                None => adj_ok && adj_disabled == 0,
+            };
+
+        let server_desc = if !primary_server.is_empty() {
+            primary_server
+        } else if is_domain_nt5ds {
+            "AD-DomainHierarchy".to_string()
+        } else {
+            "unconfigured".to_string()
+        };
+
+        let svc_tag = match svc_running {
+            Some(true) => "running",
+            Some(false) => "idle",
+            None => "unknown",
+        };
+        let clock_source = format!(
+            "W32Time({svc_tag}):{}:{server_desc}",
+            if type_norm.is_empty() {
+                "Unknown"
+            } else {
+                type_norm
+            }
+        );
+
+        let max_error_us = if adj_ok && time_inc > 0 {
+            // `time_inc` is in 100-ns ticks; convert tick granularity or configured phase bound to microseconds
+            Some((time_inc as u64) / 10)
+        } else {
+            max_phase_s.map(|s| (s as u64).saturating_mul(1_000_000))
+        };
+
+        let stratum = if ntp_synchronized {
+            if is_domain_nt5ds {
+                Some(3)
+            } else {
+                Some(2)
+            }
+        } else {
+            None
+        };
+
+        NtpSyncStatus {
+            ntp_synchronized,
+            clock_source,
+            stratum,
+            max_error_us,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut tx: libc::timex = unsafe { core::mem::zeroed() };
+        tx.modes = 0; // Read-only kernel clock state query
+        let rc = unsafe { libc::adjtimex(&mut tx) };
+        let synced = rc >= 0 && rc != libc::TIME_ERROR && (tx.status & libc::STA_UNSYNC) == 0;
+        let max_error_us = if rc >= 0 && tx.maxerror >= 0 {
+            Some(tx.maxerror as u64)
+        } else {
+            None
+        };
+        let clock_source = if synced {
+            "linux_adjtimex_STA_SYNC".to_string()
+        } else {
+            "linux_adjtimex_STA_UNSYNC".to_string()
+        };
+        NtpSyncStatus {
+            ntp_synchronized: synced,
+            clock_source,
+            stratum: None,
+            max_error_us,
+        }
+    }
+
+    #[cfg(all(not(windows), not(target_os = "linux")))]
+    {
+        let chrony_active = Path::new("/var/run/chrony/chronyd.pid").exists()
+            || Path::new("/run/chrony/chronyd.pid").exists();
+        let ntpd_active = Path::new("/var/run/ntpd.pid").exists();
+        let synced = chrony_active || ntpd_active;
+        let clock_source = if chrony_active {
+            "unix_chronyd".to_string()
+        } else if ntpd_active {
+            "unix_ntpd".to_string()
+        } else {
+            "unix_unsynchronized".to_string()
+        };
+        NtpSyncStatus {
+            ntp_synchronized: synced,
+            clock_source,
+            stratum: None,
+            max_error_us: None,
+        }
     }
 }

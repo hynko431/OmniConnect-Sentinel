@@ -1,5 +1,5 @@
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
 use chrono::Utc;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -8,13 +8,20 @@ use std::fs;
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{info, warn};
 
-use sentinel_sys::{create_restricted_dir_atomic, create_restricted_file_atomic, sync_directory};
+use sentinel_sys::{
+    create_restricted_dir_atomic, create_restricted_file_atomic,
+    create_restricted_file_handle_atomic, ensure_not_symlink_or_reparse_point, seal_key_bytes,
+    sync_directory, unseal_key_bytes, write_protected_key_file, zeroize_slice, SealedKeyBlob,
+    ZeroizingBytes,
+};
 
-use crate::enterprise::ledger::{AuditLedger, AuditSubsystem, SharedAuditLedger};
+use crate::enterprise::ledger::{
+    tokenize_path_for_ledger, AuditLedger, AuditSubsystem, SharedAuditLedger,
+};
 
 /// Minimum CERT-In and NIST SP 800-53 `AU-9` / `AU-10` retention window (180 days).
 pub const SIEM_RETENTION_DAYS: i64 = 180;
@@ -25,7 +32,8 @@ pub const MAX_CEF_EXT_CHARS: usize = 1023;
 /// Maximum sealed SIEM spool size on disk (128 MiB, `CSE-13`).
 pub const MAX_SPOOL_SIZE_BYTES: u64 = 128 * 1024 * 1024;
 
-const SPOOL_KDF_SALT: &[u8] = b"OmniConnect-Sentinel-Siem-Spool-AES256GCM";
+const SIEM_SPOOL_MAGIC_V2: &[u8; 8] = b"OCSIEM2\0";
+static SIEM_SPOOL_IO_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FalconTelemetryEvent {
@@ -93,8 +101,20 @@ impl CrowdStrikeFalconBridge {
     }
 
     pub fn with_shared_ledger(mut self, shared_ledger: SharedAuditLedger) -> Self {
+        if let Ok(guard) = shared_ledger.lock() {
+            self.ledger_path = guard.path().to_path_buf();
+        }
         self.shared_ledger = Some(shared_ledger);
         self
+    }
+
+    pub fn with_ledger_path(mut self, ledger_path: PathBuf) -> Self {
+        self.ledger_path = ledger_path;
+        self
+    }
+
+    pub fn tokenize_path(&self, raw_path: &Path) -> Result<String, String> {
+        tokenize_path_for_ledger(self.shared_ledger.as_ref(), &self.ledger_path, raw_path)
     }
 
     pub fn with_custom_ca(mut self, ca_pem: Vec<u8>) -> Self {
@@ -242,12 +262,15 @@ impl CrowdStrikeFalconBridge {
         self.append_spool_record(&record)?;
         let _ = self.prune_expired_records(SIEM_RETENTION_DAYS);
 
+        let spool_path_token = self
+            .tokenize_path(&self.spool_path)
+            .unwrap_or_else(|_| "TOKENIZATION_UNAVAILABLE".to_string());
         let alert_data = serde_json::json!({
             "signature_id": event.signature_id,
             "severity": event.severity,
             "action_taken": event.action_taken,
             "delivered_immediately": delivered,
-            "spool_path": self.spool_path.to_string_lossy(),
+            "spool_path_token": spool_path_token,
         });
         self.record_audit_event("SIEM_CEF_ALERT", alert_data);
 
@@ -279,24 +302,105 @@ impl CrowdStrikeFalconBridge {
         let _ = ledger.append_subsystem_event(AuditSubsystem::SiemFalcon, event, data);
     }
 
-    /// Sends a CEF message over RFC 5425 TLS 1.3 octet-counted framing (`CSE-13`, `T33`).
-    pub fn send_rfc5425_syslog(&self, cef_line: &str) -> Result<(), String> {
-        let endpoint = &self.syslog_endpoint;
-        let cleaned = endpoint
-            .strip_prefix("tls://")
-            .or_else(|| endpoint.strip_prefix("syslog+tls://"))
-            .unwrap_or(endpoint);
-
-        let (host, port) = if let Some((h, p)) = cleaned.split_once(':') {
-            let parsed_port: u16 = p
-                .parse()
-                .map_err(|e| format!("Invalid port in endpoint: {e}"))?;
-            (h, parsed_port)
+    /// Validates a SIEM syslog endpoint (`CSE-13`, `T33`), rejecting cleartext schemes, port `514`,
+    /// malformed ports/paths/userinfo, and unbracketed multi-colon hosts, while supporting IPv4,
+    /// DNS names, bracketed IPv6 (`tls://[2001:db8::1]:6514`), and `offline://...`.
+    pub fn validate_syslog_endpoint(endpoint: &str) -> Result<(&str, u16, bool), String> {
+        let trimmed = endpoint.trim();
+        if trimmed.is_empty() {
+            return Err("SIEM syslog endpoint must not be empty".to_string());
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let (is_offline, rest) = if lower.starts_with("tls://") {
+            (false, &trimmed["tls://".len()..])
+        } else if lower.starts_with("syslog+tls://") {
+            (false, &trimmed["syslog+tls://".len()..])
+        } else if lower.starts_with("offline://") {
+            (true, &trimmed["offline://".len()..])
+        } else if trimmed.contains("://") {
+            return Err(format!(
+                "Cleartext or unsupported syslog transport rejected for '{trimmed}': RFC 5425 TLS 1.3 (tls:// or syslog+tls://) or offline:// is required"
+            ));
         } else {
-            (cleaned, 6514)
+            (false, trimmed)
         };
 
-        let target_addrs: Vec<SocketAddr> = format!("{host}:{port}")
+        if rest.is_empty()
+            || rest.contains("://")
+            || rest.chars().any(|c| {
+                c.is_control() || c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '#' | '@')
+            })
+        {
+            return Err(format!(
+                "Malformed SIEM syslog endpoint '{trimmed}': unexpected empty host, path, query, or control character"
+            ));
+        }
+
+        let (host, port) = if rest.starts_with('[') {
+            let close_idx = rest.find(']').ok_or_else(|| {
+                format!("Malformed bracketed IPv6 SIEM endpoint '{trimmed}': missing ']'")
+            })?;
+            let inner_host = &rest[1..close_idx];
+            if inner_host.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(format!(
+                    "Invalid IPv6 address in bracketed SIEM endpoint '{trimmed}'"
+                ));
+            }
+            let after = &rest[close_idx + 1..];
+            if after.is_empty() {
+                (inner_host, 6514u16)
+            } else if let Some(port_str) = after.strip_prefix(':') {
+                let parsed_port: u16 = port_str
+                    .parse()
+                    .map_err(|e| format!("Invalid port in endpoint '{trimmed}': {e}"))?;
+                (inner_host, parsed_port)
+            } else {
+                return Err(format!(
+                    "Invalid suffix after bracketed IPv6 host in SIEM endpoint '{trimmed}'"
+                ));
+            }
+        } else {
+            if rest.contains(']') {
+                return Err(format!(
+                    "Malformed SIEM endpoint '{trimmed}': unmatched ']'"
+                ));
+            }
+            if let Some((h, p)) = rest.rsplit_once(':') {
+                if h.is_empty() || h.contains(':') || p.is_empty() {
+                    return Err(format!(
+                        "Malformed SIEM endpoint '{trimmed}': use '[ipv6]' or '[ipv6]:port' for IPv6 endpoints"
+                    ));
+                }
+                let parsed_port: u16 = p
+                    .parse()
+                    .map_err(|e| format!("Invalid port in endpoint '{trimmed}': {e}"))?;
+                (h, parsed_port)
+            } else {
+                (rest, 6514u16)
+            }
+        };
+
+        if port == 0 {
+            return Err(format!("SIEM port 0 is invalid in endpoint '{trimmed}'"));
+        }
+        if port == 514 {
+            return Err(
+                "Legacy cleartext syslog port 514 is prohibited; RFC 5425 TLS 1.3 requires TLS port 6514"
+                    .to_string(),
+            );
+        }
+
+        Ok((host, port, is_offline))
+    }
+
+    /// Sends a CEF message over RFC 5425 TLS 1.3 octet-counted framing (`CSE-13`, `T33`).
+    pub fn send_rfc5425_syslog(&self, cef_line: &str) -> Result<(), String> {
+        let (host, port, is_offline) = Self::validate_syslog_endpoint(&self.syslog_endpoint)?;
+        if is_offline {
+            return Err("SIEM endpoint configured for offline:// local spooling".to_string());
+        }
+
+        let target_addrs: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
             .map_err(|e| format!("Failed resolving SIEM host '{host}:{port}': {e}"))?
             .collect();
@@ -354,34 +458,146 @@ impl CrowdStrikeFalconBridge {
         Ok(())
     }
 
-    fn derive_spool_cipher() -> Result<Aes256Gcm, String> {
-        let mut hasher = Sha256::new();
-        hasher.update(SPOOL_KDF_SALT);
-        #[cfg(windows)]
-        if let Ok(sn) = std::env::var("COMPUTERNAME") {
-            hasher.update(sn.as_bytes());
+    pub fn spool_key_path(&self) -> PathBuf {
+        let mut os = self.spool_path.as_os_str().to_os_string();
+        os.push(".spool_key.sealed");
+        PathBuf::from(os)
+    }
+
+    fn spool_seal_context(&self) -> String {
+        format!(
+            "OmniConnect-Sentinel-SIEM-Spool-Key:{}",
+            self.spool_path.display()
+        )
+    }
+
+    fn load_or_init_spool_dek(
+        &self,
+        allow_create: bool,
+    ) -> Result<(ZeroizingBytes<32>, String), String> {
+        if let Some(parent) = self.spool_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                create_restricted_dir_atomic(parent).map_err(|e| {
+                    format!(
+                        "Failed creating restricted SIEM spool directory {}: {}",
+                        parent.display(),
+                        e
+                    )
+                })?;
+            }
         }
-        #[cfg(not(windows))]
-        if let Ok(hn) = std::env::var("HOSTNAME") {
-            hasher.update(hn.as_bytes());
+        let key_path = self.spool_key_path();
+        let context = self.spool_seal_context();
+
+        if key_path.exists() {
+            ensure_not_symlink_or_reparse_point(&key_path).map_err(|e| {
+                format!(
+                    "SIEM_SPOOL_KEY_INTEGRITY_FAIL: Refusing symlink/reparse key file {}: {}",
+                    key_path.display(),
+                    e
+                )
+            })?;
+            let raw = fs::read(&key_path).map_err(|e| {
+                format!(
+                    "SIEM_SPOOL_KEY_INTEGRITY_FAIL: Failed reading sealed spool key {}: {}",
+                    key_path.display(),
+                    e
+                )
+            })?;
+            let sealed: SealedKeyBlob = serde_json::from_slice(&raw).map_err(|e| {
+                format!(
+                    "SIEM_SPOOL_KEY_INTEGRITY_FAIL: Corrupted JSON in {}: {}",
+                    key_path.display(),
+                    e
+                )
+            })?;
+            let mut unsealed = unseal_key_bytes(&sealed, context.as_bytes()).map_err(|e| {
+                format!(
+                    "SIEM_SPOOL_KEY_INTEGRITY_FAIL: Failed unsealing {}: {}",
+                    key_path.display(),
+                    e
+                )
+            })?;
+            if unsealed.len() != 32 {
+                zeroize_slice(&mut unsealed);
+                return Err(format!(
+                    "SIEM_SPOOL_KEY_INTEGRITY_FAIL: Unexpected spool DEK length {}",
+                    unsealed.len()
+                ));
+            }
+            let mut key_arr = [0u8; 32];
+            key_arr.copy_from_slice(&unsealed);
+            zeroize_slice(&mut unsealed);
+            let dek = ZeroizingBytes::new(key_arr);
+            zeroize_slice(&mut key_arr);
+            return Ok((dek, sealed.kek_id));
         }
-        let key = hasher.finalize();
-        Aes256Gcm::new_from_slice(&key)
-            .map_err(|e| format!("Failed initializing AES-256-GCM cipher: {e}"))
+
+        if !allow_create
+            || (self.spool_path.exists()
+                && fs::metadata(&self.spool_path)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(true))
+        {
+            return Err(format!(
+                "SIEM_SPOOL_KEY_INTEGRITY_FAIL: Sealed SIEM spool key '{}' is missing for existing/requested spool '{}'",
+                key_path.display(),
+                self.spool_path.display()
+            ));
+        }
+
+        let mut fresh_key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut fresh_key);
+        let dek = ZeroizingBytes::new(fresh_key);
+        zeroize_slice(&mut fresh_key);
+
+        let key_id = format!(
+            "SIEM-SPOOL-DEK-{}",
+            hex::encode(&Sha256::digest(dek.as_slice())[..8]).to_ascii_uppercase()
+        );
+        let sealed = seal_key_bytes(dek.as_slice(), context.as_bytes(), &key_id)
+            .map_err(|e| format!("Failed sealing SIEM spool DEK: {e}"))?;
+        let json = serde_json::to_vec_pretty(&sealed)
+            .map_err(|e| format!("Failed serializing sealed SIEM spool DEK: {e}"))?;
+        write_protected_key_file(&key_path, &json).map_err(|e| {
+            format!(
+                "Failed writing protected SIEM spool key '{}': {}",
+                key_path.display(),
+                e
+            )
+        })?;
+        Ok((dek, key_id))
     }
 
     /// Appends a single `SiemSpoolRecord` to the AEAD-encrypted on-disk SIEM spool (`Row 169`, `CSE-13`).
     pub fn append_spool_record(&self, record: &SiemSpoolRecord) -> Result<(), String> {
-        let mut records = self.read_spool_records().unwrap_or_default();
+        let _guard = SIEM_SPOOL_IO_LOCK
+            .lock()
+            .map_err(|e| format!("SIEM spool lock poisoned: {e}"))?;
+        let mut records = self.read_spool_records_locked()?;
         records.push(record.clone());
-        self.write_spool_records(&records)
+        self.write_spool_records_locked(&records)
     }
 
     /// Reads all records currently stored in the AEAD-encrypted on-disk SIEM spool.
     pub fn read_spool_records(&self) -> Result<Vec<SiemSpoolRecord>, String> {
+        let _guard = SIEM_SPOOL_IO_LOCK
+            .lock()
+            .map_err(|e| format!("SIEM spool lock poisoned: {e}"))?;
+        self.read_spool_records_locked()
+    }
+
+    fn read_spool_records_locked(&self) -> Result<Vec<SiemSpoolRecord>, String> {
         if !self.spool_path.exists() {
             return Ok(Vec::new());
         }
+        ensure_not_symlink_or_reparse_point(&self.spool_path).map_err(|e| {
+            format!(
+                "SIEM_SPOOL_INTEGRITY_FAIL: Refusing symlink/reparse spool {}: {}",
+                self.spool_path.display(),
+                e
+            )
+        })?;
         let raw = fs::read(&self.spool_path).map_err(|e| {
             format!(
                 "Failed reading SIEM spool '{}': {}",
@@ -392,26 +608,41 @@ impl CrowdStrikeFalconBridge {
         if raw.is_empty() {
             return Ok(Vec::new());
         }
-        if raw.len() < 12 {
-            return Err("Corrupted SIEM spool: header truncated".to_string());
+        if raw.len() < SIEM_SPOOL_MAGIC_V2.len() + 12 + 16 || !raw.starts_with(SIEM_SPOOL_MAGIC_V2)
+        {
+            return Err("Corrupted or legacy-unauthenticated SIEM spool header".to_string());
         }
-        let (nonce_bytes, ciphertext) = raw.split_at(12);
+        let (dek, key_id) = self.load_or_init_spool_dek(false)?;
+        let payload = &raw[SIEM_SPOOL_MAGIC_V2.len()..];
+        let (nonce_bytes, ciphertext) = payload.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
-        let cipher = Self::derive_spool_cipher()?;
-        let decrypted = cipher
-            .decrypt(nonce, ciphertext)
+        let aad = format!("SENTINEL-SIEM-SPOOL-V2|{key_id}");
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek.as_slice()));
+        let mut decrypted = cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: aad.as_bytes(),
+                },
+            )
             .map_err(|e| format!("SIEM spool AEAD authentication failed: {e}"))?;
-        serde_json::from_slice(&decrypted)
-            .map_err(|e| format!("Corrupt SIEM spool JSON after decryption: {e}"))
+        let parsed = serde_json::from_slice(&decrypted)
+            .map_err(|e| format!("Corrupt SIEM spool JSON after decryption: {e}"));
+        zeroize_slice(&mut decrypted);
+        parsed
     }
 
     /// Flushes undelivered (`delivered == false`) SIEM records over RFC 5425 TLS 1.3
     /// and updates the encrypted spool on disk (`Row 169`, `CSE-13`).
     pub fn flush_spool(&self) -> Result<usize, String> {
+        let _guard = SIEM_SPOOL_IO_LOCK
+            .lock()
+            .map_err(|e| format!("SIEM spool lock poisoned: {e}"))?;
         if !self.spool_path.exists() {
             return Ok(0);
         }
-        let mut records = self.read_spool_records()?;
+        let mut records = self.read_spool_records_locked()?;
         let mut newly_delivered = 0usize;
 
         if !self.syslog_endpoint.trim().is_empty()
@@ -425,17 +656,20 @@ impl CrowdStrikeFalconBridge {
             }
         }
 
-        self.write_spool_records(&records)?;
+        self.write_spool_records_locked(&records)?;
         Ok(newly_delivered)
     }
 
     /// Prunes SIEM spool records older than `retention_days` (default 180 days per CERT-In / NIST `AU-9`/`AU-10`) (`Row 169`).
     pub fn prune_expired_records(&self, retention_days: i64) -> Result<usize, String> {
+        let _guard = SIEM_SPOOL_IO_LOCK
+            .lock()
+            .map_err(|e| format!("SIEM spool lock poisoned: {e}"))?;
         if !self.spool_path.exists() {
             return Ok(0);
         }
         let cutoff_unix = Utc::now().timestamp() - (retention_days.max(1) * 86_400);
-        let records = self.read_spool_records()?;
+        let records = self.read_spool_records_locked()?;
         let initial_len = records.len();
         let retained: Vec<SiemSpoolRecord> = records
             .into_iter()
@@ -443,12 +677,21 @@ impl CrowdStrikeFalconBridge {
             .collect();
         let pruned_count = initial_len.saturating_sub(retained.len());
         if pruned_count > 0 {
-            self.write_spool_records(&retained)?;
+            self.write_spool_records_locked(&retained)?;
         }
         Ok(pruned_count)
     }
 
-    fn write_spool_records(&self, records: &[SiemSpoolRecord]) -> Result<(), String> {
+    fn write_spool_records_locked(&self, records: &[SiemSpoolRecord]) -> Result<(), String> {
+        if self.spool_path.exists() {
+            ensure_not_symlink_or_reparse_point(&self.spool_path).map_err(|e| {
+                format!(
+                    "SIEM_SPOOL_INTEGRITY_FAIL: Refusing symlink/reparse spool {}: {}",
+                    self.spool_path.display(),
+                    e
+                )
+            })?;
+        }
         // Enforce 128 MiB bounding: drop oldest records if serialized payload exceeds capacity
         let mut retained = records.to_vec();
         let mut serialized = serde_json::to_vec(&retained)
@@ -456,19 +699,30 @@ impl CrowdStrikeFalconBridge {
 
         while serialized.len() as u64 > MAX_SPOOL_SIZE_BYTES && retained.len() > 1 {
             retained.remove(0);
+            zeroize_slice(&mut serialized);
             serialized = serde_json::to_vec(&retained)
                 .map_err(|e| format!("Failed serializing pruned SIEM spool records: {e}"))?;
         }
 
+        let (dek, key_id) = self.load_or_init_spool_dek(true)?;
         let mut nonce_bytes = [0u8; 12];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let cipher = Self::derive_spool_cipher()?;
-        let ciphertext = cipher
-            .encrypt(nonce, serialized.as_slice())
-            .map_err(|e| format!("Failed AEAD-encrypting SIEM spool: {e}"))?;
+        let aad = format!("SENTINEL-SIEM-SPOOL-V2|{key_id}");
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek.as_slice()));
+        let ciphertext_res = cipher.encrypt(
+            nonce,
+            Payload {
+                msg: serialized.as_slice(),
+                aad: aad.as_bytes(),
+            },
+        );
+        zeroize_slice(&mut serialized);
+        let ciphertext =
+            ciphertext_res.map_err(|e| format!("Failed AEAD-encrypting SIEM spool: {e}"))?;
 
-        let mut output = Vec::with_capacity(12 + ciphertext.len());
+        let mut output = Vec::with_capacity(SIEM_SPOOL_MAGIC_V2.len() + 12 + ciphertext.len());
+        output.extend_from_slice(SIEM_SPOOL_MAGIC_V2);
         output.extend_from_slice(&nonce_bytes);
         output.extend_from_slice(&ciphertext);
 
@@ -488,6 +742,39 @@ impl CrowdStrikeFalconBridge {
     }
 }
 
+fn is_siem_spool_dir_writable(dir: &Path) -> bool {
+    if create_restricted_dir_atomic(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(
+        ".sentinel_spool_probe_{}_{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    match create_restricted_file_handle_atomic(&probe) {
+        Ok(f) => {
+            drop(f);
+            let _ = fs::remove_file(&probe);
+        }
+        Err(_) => return false,
+    }
+    let spool_file = dir.join("siem_spool.sealed");
+    if spool_file.exists()
+        && fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&spool_file)
+            .is_err()
+    {
+        return false;
+    }
+    let key_file = dir.join("siem_spool.sealed.spool_key.sealed");
+    if key_file.exists() && fs::read(&key_file).is_err() {
+        return false;
+    }
+    true
+}
+
 fn default_siem_spool_dir() -> PathBuf {
     #[cfg(windows)]
     {
@@ -496,7 +783,7 @@ fn default_siem_spool_dir() -> PathBuf {
                 .join("OmniConnect")
                 .join("Sentinel")
                 .join("SiemSpool");
-            if create_restricted_dir_atomic(&candidate).is_ok() {
+            if is_siem_spool_dir_writable(&candidate) {
                 return candidate;
             }
         }
@@ -505,7 +792,7 @@ fn default_siem_spool_dir() -> PathBuf {
                 .join("OmniConnect")
                 .join("Sentinel")
                 .join("SiemSpool");
-            if create_restricted_dir_atomic(&candidate).is_ok() {
+            if is_siem_spool_dir_writable(&candidate) {
                 return candidate;
             }
         }
@@ -513,7 +800,7 @@ fn default_siem_spool_dir() -> PathBuf {
     #[cfg(not(windows))]
     {
         let candidate = PathBuf::from("/var/lib/omniconnect/siem_spool");
-        if create_restricted_dir_atomic(&candidate).is_ok() {
+        if is_siem_spool_dir_writable(&candidate) {
             return candidate;
         }
         if let Ok(home) = std::env::var("HOME") {
@@ -522,7 +809,7 @@ fn default_siem_spool_dir() -> PathBuf {
                 .join("share")
                 .join("omniconnect")
                 .join("siem_spool");
-            if create_restricted_dir_atomic(&candidate).is_ok() {
+            if is_siem_spool_dir_writable(&candidate) {
                 return candidate;
             }
         }
@@ -535,7 +822,7 @@ fn default_siem_spool_dir() -> PathBuf {
     {
         if let Ok(cwd) = std::env::current_dir() {
             let dir = cwd.join(".sentinel_audit");
-            if create_restricted_dir_atomic(&dir).is_ok() {
+            if is_siem_spool_dir_writable(&dir) {
                 return dir;
             }
         }

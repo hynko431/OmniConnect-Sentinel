@@ -13,15 +13,13 @@ use sentinel_sys::crypto_seal::{
     unix_authenticated_seal_with_secret, unix_authenticated_unseal_with_secret,
 };
 use sentinel_sys::{
-    decrypt_kek_from_soc_escrow, default_soc_rsa_private_blob, default_soc_rsa_public_blob,
-    encrypt_kek_for_soc_escrow, generate_raw_ecdsa_p256_keypair, generate_soc_rsa_keypair,
-    parse_rsa_private_key, parse_rsa_public_key, verify_ecdsa_p256_digest, KeyProtectionPosture,
-    SealedKeyBlob, SocEscrowBlob,
+    decrypt_kek_from_soc_escrow, encrypt_kek_for_soc_escrow, generate_raw_ecdsa_p256_keypair,
+    generate_soc_rsa_keypair, parse_rsa_private_key, parse_rsa_public_key,
+    verify_ecdsa_p256_digest, KeyProtectionPosture, SealedKeyBlob, SocEscrowBlob,
 };
 
 use sentinel_core::enterprise::intune::{
-    backup_enterprise_root_keypair, default_enterprise_root_public_keys,
-    primary_enterprise_root_keypair, IntuneMdmPolicy, IntunePolicyManager, SignedPolicyBundle,
+    default_enterprise_root_public_keys, IntuneMdmPolicy, IntunePolicyManager, SignedPolicyBundle,
 };
 use sentinel_core::error::{DegradationEvent, SentinelError};
 use sentinel_core::scanner::quarantine::QuarantineVault;
@@ -111,8 +109,8 @@ fn probe_adversarial_cse04_soc_escrow_semiprime_and_vault_fail_closed() {
     let dir = tempdir().expect("tempdir");
     let vault_dir = dir.path().join(".sentinel_vault");
 
-    // 1. Generate genuine RSA-2048 keypair
-    let (soc_pub, soc_priv) = generate_soc_rsa_keypair().expect("genuine RSA keypair");
+    // 1. Generate genuine RSA-3072+ keypair
+    let (soc_pub, soc_priv) = generate_soc_rsa_keypair().expect("genuine RSA-3072 keypair");
     let _parsed_pub = parse_rsa_public_key(&soc_pub).expect("parse public key");
 
     // 2. Open vault with SOC public key
@@ -129,7 +127,7 @@ fn probe_adversarial_cse04_soc_escrow_semiprime_and_vault_fail_closed() {
     let escrow_data = fs::read(&escrow_path).expect("read escrow");
     let escrow_blob: SocEscrowBlob =
         serde_json::from_slice(&escrow_data).expect("parse escrow JSON");
-    assert_eq!(escrow_blob.algorithm, "RSA-2048-OAEP-SHA256");
+    assert_eq!(escrow_blob.algorithm, "RSA-3072-OAEP-SHA256");
 
     let recovered_kek =
         decrypt_kek_from_soc_escrow(&escrow_blob, &soc_priv).expect("decrypt escrow");
@@ -185,12 +183,13 @@ fn probe_adversarial_cse03_intune_policy_rollback_and_untrusted_keys() {
     let vault_dir = dir.path().join(".sentinel_vault");
     let ledger_path = vault_dir.join("policy_audit_ledger_v2.jsonl");
 
-    let (pub1, priv1) = primary_enterprise_root_keypair();
-    let (pub2, priv2) = backup_enterprise_root_keypair();
+    let (pub1, priv1) = generate_raw_ecdsa_p256_keypair().expect("primary test root");
+    let (pub2, priv2) = generate_raw_ecdsa_p256_keypair().expect("backup test root");
 
     let mut mgr = IntunePolicyManager::new()
         .with_vault_dir(vault_dir.clone())
-        .with_ledger_path(ledger_path);
+        .with_ledger_path(ledger_path)
+        .with_pinned_root_public_keys(vec![pub1.clone(), pub2.clone()]);
 
     // Baseline: version 2
     assert_eq!(mgr.policy().version, 2);
