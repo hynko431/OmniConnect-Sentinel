@@ -121,11 +121,16 @@ impl Ole2Sanitizer {
                 .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
-            if utf16_chars.iter().any(|&c| c == 0 || c < 0x20) {
+            // MS-CFB COM streams legally start with control prefix 0x0001..=0x0005 (e.g., `\x01Ole10Native`).
+            if utf16_chars
+                .iter()
+                .enumerate()
+                .any(|(idx, &c)| c == 0 || (c < 0x20 && !(idx == 0 && (1..=5).contains(&c))))
+            {
                 continue;
             }
             let name = String::from_utf16_lossy(&utf16_chars);
-            let name_lower = name.to_ascii_lowercase();
+            let name_lower = name.trim().to_ascii_lowercase();
 
             let is_macro_entry = Self::is_macro_entry_name(&name_lower);
             let is_ole_package = Self::is_ole_package_name(&name_lower);
@@ -184,6 +189,8 @@ impl Ole2Sanitizer {
                 reports.push(DisarmReportItem::new(
                     if is_macro_entry {
                         "OLE2_VBA_STORAGE"
+                    } else if Self::is_equation_native_name(&name_lower) {
+                        "OLE2_EQUATION_NATIVE_EXPLOIT"
                     } else {
                         "OLE2_EMBEDDED_PACKAGE"
                     },
@@ -197,8 +204,9 @@ impl Ole2Sanitizer {
     }
 
     pub fn is_macro_entry_name(name_lower: &str) -> bool {
+        let trimmed = name_lower.trim();
         matches!(
-            name_lower,
+            trimmed,
             "macros"
                 | "vba"
                 | "_vba_project"
@@ -210,15 +218,35 @@ impl Ole2Sanitizer {
         )
     }
 
+    pub fn is_equation_native_name(name_lower: &str) -> bool {
+        let trimmed = name_lower.trim();
+        let without_com_prefix = trimmed
+            .trim_start_matches(|c: char| ('\u{0001}'..='\u{0005}').contains(&c))
+            .trim();
+        trimmed == "equation native" || without_com_prefix == "equation native"
+    }
+
     pub fn is_ole_package_name(name_lower: &str) -> bool {
+        let trimmed = name_lower.trim();
+        let without_com_prefix = trimmed
+            .trim_start_matches(|c: char| ('\u{0001}'..='\u{0005}').contains(&c))
+            .trim();
         matches!(
-            name_lower,
-            "objpool" | "package" | "ole10native" | "\u{0001}ole10native" | "contents"
+            trimmed,
+            "equation native"
+                | "objpool"
+                | "package"
+                | "ole10native"
+                | "\u{0001}ole10native"
+                | "contents"
+        ) || matches!(
+            without_com_prefix,
+            "equation native" | "objpool" | "package" | "ole10native" | "contents"
         )
     }
 
     /// Used by `CdrEngine::verify_sanitized_output` to confirm no active macro or OLE package directory
-    /// entries remain in the sanitized CFB output (`Row 110, Row 134`).
+    /// entries (including CVE-2017-11882 `Equation Native` and `\x01Ole10Native`) remain (`Row 110, 134, CSE-20`).
     pub fn has_residual_active_streams(bytes: &[u8], policy: &SanitizationPolicy) -> bool {
         if bytes.len() < 512 || bytes[..8] != OLE2_MAGIC {
             return true;
@@ -242,10 +270,16 @@ impl Ole2Sanitizer {
                 .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
-            if utf16_chars.iter().any(|&c| c == 0 || c < 0x20) {
+            if utf16_chars
+                .iter()
+                .enumerate()
+                .any(|(idx, &c)| c == 0 || (c < 0x20 && !(idx == 0 && (1..=5).contains(&c))))
+            {
                 continue;
             }
-            let name_lower = String::from_utf16_lossy(&utf16_chars).to_ascii_lowercase();
+            let name_lower = String::from_utf16_lossy(&utf16_chars)
+                .trim()
+                .to_ascii_lowercase();
             if (policy.strip_office_macros && Self::is_macro_entry_name(&name_lower))
                 || (policy.strip_office_ole_objects && Self::is_ole_package_name(&name_lower))
             {

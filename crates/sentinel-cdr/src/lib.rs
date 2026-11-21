@@ -10,6 +10,8 @@ pub mod worker;
 
 pub use engine::{CdrEngine, DetectedFormat, InspectionAssessment, SanitizationReport};
 pub use error::{CdrError, Result};
-pub use policy::{ResourceBudget, SanitizationPolicy};
+pub use policy::{
+    ResourceBudget, SanitizationPolicy, SignedPdfPolicy, DEFAULT_JPEG_REENCODE_QUALITY,
+};
 pub use service::CdrGrpcService;
 pub use worker::{WorkerLauncher, WorkerRequest, WorkerResponse};

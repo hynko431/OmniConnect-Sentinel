@@ -1214,9 +1214,12 @@ fn proptest_forward_parsers_and_cdr_sanitizers_never_panic() {
             "Forward PNG parser must locate exact IEND chunk boundary for arbitrary trailing payload (seed={seed})"
         );
 
-        // Exercise all 6 sanitizers on structured mutated inputs (`Row 201`)
+        // Exercise all 6 sanitizers + CSE-19/20/21 pre-parsers on structured mutated inputs (`Row 201`, Phase 1)
         let _ = PdfSanitizer::sanitize(&raw_entropy, &policy);
         let _ = OpenXmlSanitizer::sanitize(&raw_entropy, &policy);
+        let _ = ImageSanitizer::parse_tiff_exif_orientation(&raw_entropy);
+        let _ = ImageSanitizer::is_valid_srgb_icc_profile(&raw_entropy);
+        let _ = ImageSanitizer::extract_jpeg_color_and_exif(&raw_entropy);
         let _ = ImageSanitizer::sanitize_png(&raw_entropy, &policy);
         let _ = ImageSanitizer::sanitize_jpeg(&raw_entropy, &policy);
         let _ = ImageSanitizer::sanitize_webp(&raw_entropy, &policy);
@@ -1224,6 +1227,76 @@ fn proptest_forward_parsers_and_cdr_sanitizers_never_panic() {
         let _ = Ole2Sanitizer::sanitize(&raw_entropy, &policy);
         let _ = TextCsvSanitizer::sanitize(&raw_entropy, &policy, true);
         let _ = TextCsvSanitizer::sanitize(&raw_entropy, &policy, false);
+
+        // Structured magic/UTF-8-penetrating mutations so every Phase 1 parser runs deep on all 500 seeds:
+        // (a) Valid UTF-8 CSV alphabet with quotes, delimiters, BOM, and formula triggers
+        const CSV_ALPHABET: &[u8] = b",\"\r\n=+-@\t'0123456789.eE abcXYZ";
+        let mut structured_csv = String::with_capacity(140);
+        if seed % 3 == 0 {
+            structured_csv.push('\u{FEFF}');
+        }
+        for &b in &raw_entropy[..96] {
+            structured_csv.push(CSV_ALPHABET[(b as usize) % CSV_ALPHABET.len()] as char);
+        }
+        if let Ok((clean_csv, _)) =
+            TextCsvSanitizer::sanitize(structured_csv.as_bytes(), &policy, true)
+        {
+            let clean_csv_str =
+                std::str::from_utf8(&clean_csv).expect("Sanitized CSV must always be valid UTF-8");
+            TextCsvSanitizer::verify_csv_fields_clean(clean_csv_str)
+                .expect("Sanitized CSV must always pass post-CDR RFC 4180 verification");
+        }
+
+        // (b) Structured OOXML `<w:instrText>` + `CDATA` + relationship target fuzzing
+        let ascii_frag: String = raw_entropy[..48]
+            .iter()
+            .map(|b| (0x20 + (b % 94)) as char)
+            .filter(|c| !matches!(c, '<' | '>' | '&' | ']' | '"'))
+            .collect();
+        let xml_doc = format!(
+            "<w:document><w:p><w:instrText>{ascii_frag}</w:instrText><w:instrText><![CDATA[{ascii_frag}]]></w:instrText></w:p></w:document>"
+        );
+        let _ = OpenXmlSanitizer::has_residual_dde_or_field_code(xml_doc.as_bytes());
+        let _ = OpenXmlSanitizer::is_allowed_ooxml_relationship_target(&ascii_frag, seed % 2 == 0);
+
+        // (c) Structured `%PDF-1.7` stream-aware depth lexer fuzzing
+        let mut pdf_mut = b"%PDF-1.7\n1 0 obj << /Length ".to_vec();
+        pdf_mut.extend_from_slice((raw_entropy[0] % 32).to_string().as_bytes());
+        pdf_mut.extend_from_slice(b" >> stream\n");
+        pdf_mut.extend_from_slice(&raw_entropy[..64]);
+        pdf_mut.extend_from_slice(b"\nendstream\nendobj\n");
+        let _ = PdfSanitizer::validate_pdf_token_nesting_depth(&pdf_mut, 64);
+
+        // (d) Magic-prefixed OLE2 CFB buffer
+        let mut ole_mut = vec![0u8; 1024];
+        ole_mut[..8].copy_from_slice(&sentinel_cdr::sanitizers::ole2::OLE2_MAGIC);
+        ole_mut[8..264].copy_from_slice(&raw_entropy);
+        let _ = Ole2Sanitizer::sanitize(&ole_mut, &policy);
+
+        // (e) Magic-prefixed TIFF (`II`/`MM`), length-matched `acsp` ICC, and `FF D8` JPEG segment fuzzing
+        let mut tiff_mut = Vec::with_capacity(raw_entropy.len() + 4);
+        tiff_mut.extend_from_slice(if seed % 2 == 0 {
+            b"II\x2A\x00"
+        } else {
+            b"MM\x00\x2A"
+        });
+        tiff_mut.extend_from_slice(&raw_entropy);
+        let _ = ImageSanitizer::parse_tiff_exif_orientation(&tiff_mut);
+
+        let mut icc_mut = vec![0u8; 256];
+        icc_mut.copy_from_slice(&raw_entropy);
+        icc_mut[0..4].copy_from_slice(&256u32.to_be_bytes());
+        icc_mut[8] = 2;
+        icc_mut[12..16].copy_from_slice(b"mntr");
+        icc_mut[16..20].copy_from_slice(b"RGB ");
+        icc_mut[20..24].copy_from_slice(b"XYZ ");
+        icc_mut[36..40].copy_from_slice(b"acsp");
+        let _ = ImageSanitizer::is_valid_srgb_icc_profile(&icc_mut);
+
+        let mut jpeg_mut = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg_mut.extend_from_slice(&raw_entropy);
+        let _ = ImageSanitizer::extract_jpeg_color_and_exif(&jpeg_mut);
+        let _ = ImageSanitizer::scan_jpeg_structure(&jpeg_mut);
     }
 }
 
@@ -2074,16 +2147,17 @@ fn test_cdr_daemon_fails_closed_without_adjacent_worker_ignoring_env_vars() {
         "Unexpected daemon stderr: {stderr}"
     );
 
-    // 3. Staging sentinel-cdr-worker adjacent to sentinel-cdr-daemon allows startup and clean EOF shutdown
+    // 3. Staging sentinel-cdr-worker adjacent to sentinel-cdr-daemon allows `--stdio` startup and clean EOF shutdown (`CSE-22`)
     let worker_isolated = tmp_dir.join(worker_name);
     std::fs::copy(worker_src, &worker_isolated).unwrap();
     let ok_out = std::process::Command::new(&daemon_isolated)
+        .arg("--stdio")
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
     assert!(
         ok_out.status.success(),
-        "sentinel-cdr-daemon with adjacent worker and EOF stdin should exit 0, stderr: {}",
+        "sentinel-cdr-daemon --stdio with adjacent worker and EOF stdin should exit 0, stderr: {}",
         String::from_utf8_lossy(&ok_out.stderr)
     );
 
