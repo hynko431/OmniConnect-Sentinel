@@ -1051,16 +1051,31 @@ async fn test_interceptor_retains_channel_sender_and_vfs_shadow_cache() {
     .unwrap();
     fs::write(raw_usb.join("dropper.exe"), b"MZ_UNAPPROVED_BINARY").unwrap();
 
-    let vfs = ProjFsProvider::new();
+    let vfs = ProjFsProvider::with_shadow_cache(
+        sentinel_core::vfs::ShadowCacheManager::with_cache_root_and_quota(
+            dir.path().join("shadow_cache"),
+            64 * 1024 * 1024,
+        ),
+    );
     vfs.mount_sanitized_volume(&raw_usb, &virt_mount)
         .await
         .expect("VFS shadow cache projection must succeed");
 
-    // Verify encrypted-only at-rest posture: before `on_file_first_open`, no plaintext copy exists in `virt_mount` (`Rows 147, 223`)
-    assert!(
-        !virt_mount.join("notes.txt").exists(),
-        "Plaintext must NOT be pre-written to virtual_mount_point before on_file_first_open (`Row 147`)"
-    );
+    // Verify encrypted-only at-rest posture: before `on_file_first_open`, no plaintext copy exists
+    // on disk in `virt_mount` (`Rows 147, 223`). When native Windows ProjFS (`prjflt.sys`) is
+    // active, querying `virt_mount.join("notes.txt").exists()` triggers `prj_get_placeholder_info_cb`,
+    // so assert the active ProjFS virtualization root tag instead.
+    if vfs.is_degraded_no_projfs() {
+        assert!(
+            !virt_mount.join("notes.txt").exists(),
+            "Plaintext must NOT be pre-written to virtual_mount_point before on_file_first_open (`Row 147`)"
+        );
+    } else {
+        assert!(
+            sentinel_sys::is_projfs_reparse_point(&virt_mount),
+            "Active native ProjFS root must carry IO_REPARSE_TAG_PROJFS (`Row 148`)"
+        );
+    }
 
     // Verify `read_projected_file` decrypts from `.enc` and verifies `sanitized_sha256` (`Row 148`)
     let decrypted_bytes = vfs

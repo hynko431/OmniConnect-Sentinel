@@ -1186,8 +1186,10 @@ fn load_or_create_linux_kernel_keyring_key(create_if_missing: bool) -> io::Resul
     const KEY_SPEC_PROCESS_KEYRING: libc::c_long = -2;
     const KEY_SPEC_SESSION_KEYRING: libc::c_long = -3;
     const KEY_SPEC_USER_KEYRING: libc::c_long = -4;
+    const KEYCTL_JOIN_SESSION_KEYRING: libc::c_long = 1;
     const KEYCTL_REVOKE: libc::c_long = 3;
     const KEYCTL_SETPERM: libc::c_long = 5;
+    const KEYCTL_UNLINK: libc::c_long = 9;
     const KEYCTL_SEARCH: libc::c_long = 10;
     const KEYCTL_READ: libc::c_long = 11;
     // Possessor all (0x3f) + User view/read/search (0x0b), zero group/other permissions
@@ -1202,15 +1204,20 @@ fn load_or_create_linux_kernel_keyring_key(create_if_missing: bool) -> io::Resul
         )
     })?;
 
+    // Prefer `KEY_SPEC_SESSION_KEYRING` first: it is always possessed by the process and
+    // inherited by child processes (including systemd `KeyringMode=private` and CI runners
+    // where `KEY_SPEC_USER_KEYRING` is not linked into the session keyring). Fall back to
+    // `KEY_SPEC_USER_KEYRING` and `KEY_SPEC_PROCESS_KEYRING`.
     let candidate_keyrings = [
-        KEY_SPEC_USER_KEYRING,
         KEY_SPEC_SESSION_KEYRING,
+        KEY_SPEC_USER_KEYRING,
         KEY_SPEC_PROCESS_KEYRING,
     ];
 
     // Explicitly search each candidate keyring via `KEYCTL_SEARCH` (unlike `request_key(2)`,
     // which does not directly search `KEY_SPEC_USER_KEYRING` when a systemd service uses
     // `KeyringMode=private`).
+    let mut last_search_read_err: Option<io::Error> = None;
     for keyring in candidate_keyrings {
         let key_serial = unsafe {
             libc::syscall(
@@ -1236,7 +1243,19 @@ fn load_or_create_linux_kernel_keyring_key(create_if_missing: bool) -> io::Resul
             if read_len == 32 {
                 return Ok(secret);
             }
+            let read_err = io::Error::last_os_error();
             zeroize_slice(&mut secret);
+            if read_len < 0 {
+                // Key exists in this keyring but is unreadable/revoked (e.g. an unpossessed
+                // entry in `KEY_SPEC_USER_KEYRING`); continue checking remaining keyrings.
+                last_search_read_err = Some(io::Error::new(
+                    read_err.kind(),
+                    format!(
+                        "Linux kernel keyring KEYCTL_READ failed on keyring {keyring}: {read_err}"
+                    ),
+                ));
+                continue;
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -1247,10 +1266,12 @@ fn load_or_create_linux_kernel_keyring_key(create_if_missing: bool) -> io::Resul
     }
 
     if !create_if_missing {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "Linux kernel keyring key 'omniconnect-sentinel:master-kek-v2' not found for unseal",
-        ));
+        return Err(last_search_read_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Linux kernel keyring key 'omniconnect-sentinel:master-kek-v2' not found for unseal",
+            )
+        }));
     }
 
     let mut secret = [0u8; 32];
@@ -1261,7 +1282,7 @@ fn load_or_create_linux_kernel_keyring_key(create_if_missing: bool) -> io::Resul
     );
 
     for keyring in candidate_keyrings {
-        let key_serial = unsafe {
+        let mut key_serial = unsafe {
             libc::syscall(
                 libc::SYS_add_key,
                 key_type.as_ptr(),
@@ -1271,6 +1292,34 @@ fn load_or_create_linux_kernel_keyring_key(create_if_missing: bool) -> io::Resul
                 keyring,
             )
         };
+        // Under systemd services running with `User=<non-root>` and `KeyringMode=inherit`,
+        // `KEY_SPEC_SESSION_KEYRING` may point to root's read-only session keyring (`EACCES`).
+        // Joining a fresh anonymous session keyring owned by the current UID gives this process
+        // (and all child processes) a possessed, writable kernel keyring.
+        if key_serial <= 0 && keyring == KEY_SPEC_SESSION_KEYRING {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EACCES) || err.raw_os_error() == Some(libc::EPERM) {
+                let joined = unsafe {
+                    libc::syscall(
+                        libc::SYS_keyctl,
+                        KEYCTL_JOIN_SESSION_KEYRING,
+                        core::ptr::null::<libc::c_char>(),
+                    )
+                };
+                if joined > 0 {
+                    key_serial = unsafe {
+                        libc::syscall(
+                            libc::SYS_add_key,
+                            key_type.as_ptr(),
+                            description.as_ptr(),
+                            secret.as_ptr(),
+                            secret.len() as libc::c_ulong,
+                            KEY_SPEC_SESSION_KEYRING,
+                        )
+                    };
+                }
+            }
+        }
         if key_serial > 0 {
             let setperm_rc = unsafe {
                 libc::syscall(
@@ -1283,9 +1332,13 @@ fn load_or_create_linux_kernel_keyring_key(create_if_missing: bool) -> io::Resul
             if setperm_rc != 0 {
                 let perm_err = io::Error::last_os_error();
                 let _ = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_REVOKE, key_serial) };
+                let _ =
+                    unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_UNLINK, key_serial, keyring) };
                 last_err = io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    format!("Linux kernel keyring KEYCTL_SETPERM failed ({perm_err}); revoked key"),
+                    format!(
+                        "Linux kernel keyring KEYCTL_SETPERM failed ({perm_err}); unlinked key"
+                    ),
                 );
                 continue;
             }
@@ -1305,6 +1358,7 @@ fn load_or_create_linux_kernel_keyring_key(create_if_missing: bool) -> io::Resul
                 return Ok(secret);
             }
             let _ = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_REVOKE, key_serial) };
+            let _ = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_UNLINK, key_serial, keyring) };
             last_err = io::Error::other("Linux kernel keyring read-back verification failed");
         } else {
             last_err = io::Error::last_os_error();

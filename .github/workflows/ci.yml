@@ -101,14 +101,13 @@ jobs:
           blocks = []
           i = 0
           while i < len(lines):
-              if lines[i].startswith("---- ") and lines[i].endswith(" stdout ----"):
-                  hdr = lines[i]
-                  buf = [hdr]
+              if (lines[i].startswith("---- ") and lines[i].endswith(" stdout ----")) or ("panicked at" in lines[i]):
+                  buf = [lines[i]]
                   i += 1
-                  while i < len(lines) and not (lines[i].startswith("---- ") and lines[i].endswith(" stdout ----")) and lines[i] != "failures:":
+                  while i < len(lines) and not (lines[i].startswith("---- ") and lines[i].endswith(" stdout ----")) and lines[i] != "failures:" and "panicked at" not in lines[i]:
                       if lines[i].strip():
                           buf.append(lines[i])
-                      if len(buf) >= 12:
+                      if len(buf) >= 8:
                           break
                       i += 1
                   blocks.append("\n".join(buf))
