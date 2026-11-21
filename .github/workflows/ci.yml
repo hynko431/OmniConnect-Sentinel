@@ -52,6 +52,14 @@ jobs:
             exit 1
           fi
 
+      - name: Strict Invariant Gate - Verify .dep-v0 parser self-test
+        run: python3 tests/verify_auditable_dep_v0.py --self-test
+        if: runner.os == 'Linux'
+
+      - name: Strict Invariant Gate - Verify .dep-v0 parser self-test (Windows)
+        run: python tests/verify_auditable_dep_v0.py --self-test
+        if: runner.os == 'Windows'
+
       - name: Clippy strict lint gate (no unwrap/expect in production crates)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -59,7 +67,7 @@ jobs:
         run: cargo test --workspace --locked -- --nocapture
 
   supply-chain-and-sbom:
-    name: Supply-Chain Gate (cargo-deny, cargo-audit, cargo-machete, Trivy, CycloneDX SBOM, SLSA)
+    name: Linux Supply-Chain Gate (cargo-deny, cargo-audit, cargo-machete, Trivy, CycloneDX SBOM, Auditable ELF .dep-v0, SLSA)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -73,7 +81,7 @@ jobs:
         uses: dtolnay/rust-toolchain@a54c7fe936446702c2e813137976e5d8ecf4e43e # stable
 
       - name: Install Linux build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y pkg-config protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y pkg-config protobuf-compiler binutils
 
       - name: Run cargo-deny (advisories, licenses, bans, sources)
         uses: EmbarkStudios/cargo-deny-action@3f4a782664881cfac704d5e94b2cb5ae7f5efca0 # v2.0.8
@@ -122,15 +130,20 @@ jobs:
           exit-code: '1'
           severity: 'CRITICAL,HIGH'
 
-      - name: Build auditable release binaries (.dep-v0) for SLSA provenance & signing
+      - name: Build auditable Linux ELF release binaries and verify .dep-v0 section (CSE-29)
         run: |
           cargo auditable build --workspace --release --locked
           for bin in target/release/sentinel target/release/sentinel-agent target/release/sentinel-cdr-daemon target/release/sentinel-cdr-worker; do
             test -f "$bin"
             readelf -S "$bin" | grep -q '\.dep-v0'
           done
+          python3 tests/verify_auditable_dep_v0.py \
+            target/release/sentinel \
+            target/release/sentinel-agent \
+            target/release/sentinel-cdr-daemon \
+            target/release/sentinel-cdr-worker
 
-      - name: Attest SLSA Build Provenance & CycloneDX SBOM
+      - name: Attest SLSA Build Provenance & CycloneDX SBOM (Linux)
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
         uses: actions/attest-build-provenance@efb9909247d86f78f8cb0a62abf717cf7b0e45c4 # v1.4.3
         with:
@@ -141,3 +154,69 @@ jobs:
             target/release/sentinel-cdr-worker
             sbom.cdx.json
             sentinel-cbom.cdx.json
+
+  windows-auditable-release:
+    name: Windows Auditable PE Release Gate (.dep-v0 Verification & SLSA Provenance)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@a54c7fe936446702c2e813137976e5d8ecf4e43e # stable
+
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@b735db4db54b41300994fbc266fdbd42ea04652c # v2.49.20
+        with:
+          tool: cargo-auditable
+
+      - name: Build auditable Windows PE release binaries and verify .dep-v0 section (CSE-29)
+        shell: pwsh
+        run: |
+          cargo auditable build --workspace --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bins = @(
+            "target/release/sentinel.exe",
+            "target/release/sentinel-agent.exe",
+            "target/release/sentinel-cdr-daemon.exe",
+            "target/release/sentinel-cdr-worker.exe"
+          )
+          foreach ($bin in $bins) {
+            if (-not (Test-Path $bin)) { throw "Missing Windows release binary: $bin" }
+          }
+          python tests/verify_auditable_dep_v0.py @bins
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Attest SLSA Build Provenance (Windows PE Release Binaries)
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: actions/attest-build-provenance@efb9909247d86f78f8cb0a62abf717cf7b0e45c4 # v1.4.3
+        with:
+          subject-path: |
+            target/release/sentinel.exe
+            target/release/sentinel-agent.exe
+            target/release/sentinel-cdr-daemon.exe
+            target/release/sentinel-cdr-worker.exe
+            sentinel-cbom.cdx.json
+
+  anti-forensic-shred-oracle:
+    name: Out-of-Band Anti-Forensic Loopback Shred Oracle (ext4 16 MiB & FAT32 36 MiB)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@a54c7fe936446702c2e813137976e5d8ecf4e43e # stable
+
+      - name: Install loopback filesystem oracle prerequisites (dosfstools, e2fsprogs, binutils)
+        run: sudo apt-get update && sudo apt-get install -y dosfstools e2fsprogs binutils pkg-config protobuf-compiler libfuse3-dev
+
+      - name: Build release sentinel CLI binary
+        run: cargo build -p sentinel-cli --bin sentinel --release --locked
+
+      - name: Execute CI-only loopback shred verification oracle (0 residual canary matches)
+        run: bash tests/ci_shred_verify_oracle.sh --bin target/release/sentinel

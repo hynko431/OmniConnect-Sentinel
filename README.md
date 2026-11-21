@@ -2,7 +2,7 @@
 ### Enterprise-Grade Zero-Trust Peripheral Interceptor, Read-Once ShadowCache VFS, Sandboxed CDR Engine & NIST SP 800-88 Anti-Forensic Sanitizer
 
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B%20%7C%202021%20Edition-orange.svg?logo=rust)](https://www.rust-lang.org)
-[![Security Standard](https://img.shields.io/badge/Sanitization-NIST%20SP%20800--88%20Rev%201-blue.svg)](https://csrc.nist.gov/publications/detail/sp/800-88/rev-1/final)
+[![Security Standard](https://img.shields.io/badge/Sanitization-NIST%20SP%20800--88%20Rev.%202-blue.svg)](https://csrc.nist.gov/pubs/sp/800/88/r2/final)
 [![Zero Trust](https://img.shields.io/badge/Zero%20Trust-NIST%20SP%20800--207-0052CC.svg)](https://csrc.nist.gov/publications/detail/sp/800-207/final)
 [![Industrial Compliance](https://img.shields.io/badge/OT%20%2F%20ICS-IEC%2062443--3--3%20SL--3-brightgreen.svg)](https://www.isa.org/standards-and-publications/isa-standards/isa-iec-62443-series)
 [![Supply Chain](https://img.shields.io/badge/Supply%20Chain-SLSA%20v1.0%20%7C%20CycloneDX%20%7C%20Zero--Ignore-success.svg)](#10-supply-chain-security--vex-defense-in-depth-ledger)
@@ -10,7 +10,7 @@
 [![MITRE ATT&CK](https://img.shields.io/badge/MITRE%20ATT%26CK-T1091%20%7C%20T1027%20%7C%20T1564%20%7C%20T1036-red.svg)](https://attack.mitre.org)
 [![License](https://img.shields.io/badge/License-Apache%202.0%20OR%20MIT-blue.svg)](Cargo.toml)
 
-**OmniConnect Sentinel** is an enterprise-grade, memory-safe endpoint and OT/ICS peripheral security platform written in **Rust**. It replaces reactive post-mount antivirus scanning with **fail-closed pre-mount hardware hold**, **read-once encrypted host shadow caching (eliminating USB Flash TOCTOU attacks)**, **OS-sandboxed out-of-process Content Disarm & Reconstruction (CDR)**, **hardware-sealed AES-256-GCM quarantine vaults (TPM 2.0 / DPAPI + SOC RSA-2048-OAEP escrow)**, **FIPS 186-5 ECDSA P-256 tamper-evident audit ledgers**, and **NIST SP 800-88 Rev 1 Clear & Cryptographic Erase sanitization**.
+**OmniConnect Sentinel (`0.1.0`)** is an enterprise-grade, memory-safe endpoint and OT/ICS peripheral security platform written in **Rust**. It replaces reactive post-mount antivirus scanning with **fail-closed pre-mount hardware hold**, **read-once encrypted host shadow caching (eliminating USB Flash TOCTOU attacks)**, **OS-sandboxed out-of-process Content Disarm & Reconstruction (CDR)**, **hardware-sealed AES-256-GCM quarantine vaults (TPM 2.0 / DPAPI / Linux kernel keyring + RSA-3072+-OAEP & Hybrid Post-Quantum `OCESCROW3` ML-KEM-768 escrow)**, **FIPS 186-5 ECDSA P-256 tamper-evident audit ledgers**, and **NIST SP 800-88 Rev. 2 Clear & Cryptographic Erase sanitization**.
 
 ---
 
@@ -23,7 +23,7 @@
 6. [Universal Hidden Threat Carrier Detection & Sandboxed CDR](#6-universal-hidden-threat-carrier-detection--sandboxed-cdr)
 7. [OS-Enforced Untrusted Parser Sandboxing (`sentinel-cdr-worker`)](#7-os-enforced-untrusted-parser-sandboxing-sentinel-cdr-worker)
 8. [Hardware-Backed Cryptographic Custody & Audit Ledger](#8-hardware-backed-cryptographic-custody--audit-ledger)
-9. [NIST SP 800-88 Rev 1 Anti-Forensic Shredder](#9-nist-sp-800-88-rev-1-anti-forensic-shredder)
+9. [NIST SP 800-88 Rev. 2 Anti-Forensic Shredder](#9-nist-sp-800-88-rev-2-anti-forensic-shredder)
 10. [Supply-Chain Security & VEX Defense-in-Depth Ledger](#10-supply-chain-security--vex-defense-in-depth-ledger)
 11. [Enterprise Fleet Management, SIEM/XDR & Compliance Mapping](#11-enterprise-fleet-management-siemxdr--compliance-mapping)
 12. [Structured Degradation & Error Event Taxonomy](#12-structured-degradation--error-event-taxonomy)
@@ -39,14 +39,14 @@ Conventional endpoint security agents allow the operating system to auto-mount u
 
 OmniConnect Sentinel closes these gaps in **100% Ring 3 userspace** (zero custom `.sys` or `.ko` kernel drivers required):
 
-| Capability Pillar | Legacy Endpoint AV / EDR | Dedicated Hardware Kiosk (\$50k+ `[Typical]`) | **OmniConnect Sentinel (v3)** |
+| Capability Pillar | Legacy Endpoint AV / EDR | Dedicated Hardware Kiosk (\$50k+ `[Typical]`) | **OmniConnect Sentinel (`0.1.0`)** |
 | :--- | :--- | :--- | :--- |
 | **Pre-Mount Volume Hold** | Post-mount reactive scan (Explorer races scanner) | Physical bay isolation | **Pre-mount hold** via Windows `MountMgr` (`IOCTL_MOUNTMGR_AUTO_MOUNT` + `IOCTL_VOLUME_OFFLINE`) & Linux `udev` / `usb_authorized_default` |
 | **USB Flash TOCTOU Defense** | Vulnerable (reads file for scan, re-reads from USB on open) | Copy-to-internal SSD | **Read-Once Encrypted ShadowCache (`I2`)**: single read from USB -> `SHA-256` -> `AES-256-GCM` `<sha256_prefix>.enc` on host disk via `ShadowCacheManager` |
-| **Userspace VFS Projection** | Third-party kernel driver (`WinFsp` / `Dokan` BSOD risk) | Network file share / physical copy | **Inbox OS Virtualization**: Windows **ProjFS** (`ProjectedFSLib.dll`) with read-only staging fallback + Linux **FUSE3** |
+| **Userspace VFS Projection** | Third-party kernel driver (`WinFsp` / `Dokan` BSOD risk) | Network file share / physical copy | **Inbox OS Virtualization**: Windows **ProjFS** (`ProjectedFSLib.dll`) with read-only staging fallback + Linux Read-Only Staging (`POSTURE_REDUCED_NO_FUSE`, zero `bindfs` shell-outs) |
 | **CDR Parser Isolation** | In-process C/C++ parsers running as `SYSTEM` | Separate VM / appliance | **Out-of-process `sentinel-cdr-worker`** locked in Win32 Zero-Capability AppContainer + Job Object (`256 MiB`) or Linux `seccomp-bpf` + namespaces |
-| **Key & Audit Custody** | Plaintext local key files & unsigned JSON logs | Hardware HSM (appliance-only) | **TPM 2.0 (`NCrypt`) & Machine DPAPI** (Windows) / **`UnixLocalKeyring` (`0600`->`0400` root-only)** (Linux) KEK sealing + **FIPS 186-5 ECDSA P-256** signed hash-chained audit ledger |
-| **Media Sanitization** | Standard `unlink` / `DeleteFileW` (trivial carving recovery) | Physical degaussing / station wipe | **NIST SP 800-88 Rev 1 Clear** (3-pass write-through + read-back `SHA-256` verify + MFT scrambling) + **Cryptographic Erase** |
+| **Key & Audit Custody** | Plaintext local key files & unsigned JSON logs | Hardware HSM (appliance-only) | **TPM 2.0 (`NCrypt` RSA-OAEP-SHA256) & Machine DPAPI** (Windows) / **Linux Kernel Keyring (`LinuxKernelKeyring`)** with strict kiosk refusal on file-backed `UnixLocalKeyring` (`master.seed`) + **FIPS 186-5 ECDSA P-256** signed hash-chained audit ledger |
+| **Media Sanitization** | Standard `unlink` / `DeleteFileW` (trivial carving recovery) | Physical degaussing / station wipe | **NIST SP 800-88 Rev. 2 Clear** (3-pass write-through + read-back `SHA-256` verify + MFT scrambling) + **Cryptographic Erase (Purge)** |
 
 ### 1.1 Target Personas & Jobs-To-Be-Done (JTBD)
 
@@ -63,8 +63,8 @@ OmniConnect Sentinel closes these gaps in **100% Ring 3 userspace** (zero custom
 | :--- | :--- | :--- |
 | **Target Environment** | Substations, SCADA/ICS control rooms, defense SCIFs, manufacturing floors (IEC 62443-3-3 SL-3) | Corporate Windows 11 & Ubuntu/RHEL developer and executive laptops |
 | **Runtime Entrypoint** | `sentinel kiosk --media <ID>` ([`kiosk.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/enterprise/kiosk.rs)) | `sentinel-agent` + `sentinel-cdr-daemon` + `sentinel watch` |
-| **Hardware Hold & Presence** | Enforces `KioskEnforcer::verify_posture` ([`kiosk.rs:89-150`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/enterprise/kiosk.rs#L89-L150)) via `PostureReport::is_compliant()` ([`mount_control.rs:47-84`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/mount_control.rs#L47-L84), 6 checks: `automount_disabled`, `removable_volumes_offline`, `user_deny_policy_present`, `install_restrictions_active`, `write_protect_active`, and `autoplay_suppressed` / `linux_authorized_default_zero`) before starting session | Holds `BusTypeUsb` (`0x07`) offline until challenge-response (`sentinel confirm-device`) or ECDSA P-256 `--break-glass-token` |
-| **Session Data Lifecycle** | Encrypts session staging under ephemeral `ZeroizingBytes<32>` `AES-256-GCM` key and shreds all session artifacts bottom-up via `SecureShredder` on exit | Ingests USB files once into `<sha256_prefix>.enc` via `ShadowCacheManager` and projects clean files via Windows ProjFS or Linux FUSE3 |
+| **Hardware Hold & Presence** | Enforces `KioskEnforcer::verify_posture` ([`kiosk.rs:89-150`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/enterprise/kiosk.rs#L89-L150)) via `PostureReport::is_compliant()` ([`mount_control.rs:47-84`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/mount_control.rs#L47-L84), 6 checks: `automount_disabled`, `removable_volumes_offline`, `user_deny_policy_present`, `install_restrictions_active`, `write_protect_active`, and `autoplay_suppressed` / `linux_authorized_default_zero`) before starting session | Holds `BusTypeUsb` (`0x07`) offline until challenge-response (`sentinel confirm-device`) or signed ECDSA P-256 break-glass activation (`sentinel break-glass --token <PATH>`) |
+| **Session Data Lifecycle** | Encrypts session staging under ephemeral `ZeroizingBytes<32>` `AES-256-GCM` key and shreds all session artifacts bottom-up via `SecureShredder` on exit | Ingests USB files once into `<sha256_prefix>.enc` via `ShadowCacheManager` and projects clean files via Windows ProjFS or hardened Read-Only Staging (`POSTURE_REDUCED_NO_FUSE` on Linux) |
 | **Policy & Telemetry Sink** | Local offline ECDSA P-256 `SignedPolicyBundle` + local `AuditLedger` (`<ledger>.head.sig`) | Intune OMA-URI SyncML policy distribution + CrowdStrike Falcon FDR NDJSON & ArcSight CEF streaming |
 
 ---
@@ -87,13 +87,13 @@ flowchart TD
     subgraph T1["Tier 1: Out-of-Process Sandboxed CDR & Encrypted ShadowCache (sentinel-cdr + sentinel-core)"]
         WORKER["3. Ephemeral sentinel-cdr-worker Process<br/>Windows: Zero-Capability AppContainer + Job Object (256 MiB, ActiveProc=1, 30s) + ACG/CIG<br/>Linux: setrlimit + PR_SET_NO_NEW_PRIVS + CLONE_NEWNET/IPC + seccomp-bpf"]
         SCACHE["4. Encrypted Host ShadowCacheManager (.enc)<br/>Per-session CSPRNG AES-256-GCM key in pinned ZeroizingBytes<32><br/>Strict 512 MiB / 10,000-file quota + SYSTEM/Admin DACL (0700)"]
-        VFS["5. Inbox OS Virtual Projection<br/>Windows: ProjFS (ProjectedFSLib.dll) or Read-Only Staging + MoTW (ZoneId=3)<br/>Linux: FUSE3 (ro,nosuid,nodev,noexec)"]
+        VFS["5. Inbox OS Virtual Projection<br/>Windows: ProjFS (ProjectedFSLib.dll) or Read-Only Staging + MoTW (ZoneId=3)<br/>Linux: Hardened Read-Only Staging (0500/0444, POSTURE_REDUCED_NO_FUSE)"]
         WORKER --> SCACHE --> VFS
     end
 
     subgraph REM["Tier 2: Quarantine Vault, Anti-Forensic Shredder & MicroVM Detonation"]
-        VAULT["AES-256-GCM Envelope Quarantine Vault (.quar / SNTLQV02)<br/>Per-file DEK wrapped via HKDF-SHA256 + TPM 2.0 / DPAPI KEK + RSA-2048 Escrow"]
-        SHRED["NIST SP 800-88 Rev 1 Clear + Crypto-Erase<br/>0x00 -> 0xFF -> CSPRNG + Read-Back SHA-256 Verify + TRIM"]
+        VAULT["AES-256-GCM Envelope Quarantine Vault (.quar / SNTLQV03)<br/>Per-file DEK wrapped via audited HKDF-SHA256 + TPM 2.0 / DPAPI / Kernel Keyring KEK + RSA-3072+ / OCESCROW3 ML-KEM-768 Escrow"]
+        SHRED["NIST SP 800-88 Rev. 2 Clear + Crypto-Erase (Purge)<br/>0x00 -> 0xFF -> CSPRNG + Read-Back SHA-256 Verify + TRIM"]
         LEDGER["Tamper-Evident Audit Ledger<br/>SHA-256 Hash Chain + FIPS 186-5 ECDSA P-256 Chain-Head Signature"]
         VAULT --> SHRED --> LEDGER
     end
@@ -133,7 +133,7 @@ Every subsystem in OmniConnect Sentinel is engineered and tested against five no
 | :--- | :--- | :--- | :--- |
 | **TB-1: Physical USB Bus -> Tier 0 Interceptor** | **Spoofing (`S`) & Tampering (`T`)** | BadUSB / custom microcontroller presenting a fixed-disk USB SSD (`BusTypeUsb = 0x07`) or switching flash blocks between scan read #1 and execution read #2 (USB TOCTOU). | Pre-mount hold (`IOCTL_MOUNTMGR_AUTO_MOUNT` + `IOCTL_VOLUME_OFFLINE`, [`mount_control.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/mount_control.rs)) + Read-Once ingestion into host `AES-256-GCM` `<sha256_prefix>.enc` ([`vfs/mod.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/vfs/mod.rs), `I1`/`I2`). |
 | **TB-2: Untrusted File Stream -> Tier 1 CDR Worker** | **Elevation of Privilege (`E`) & DoS (`D`)** | Weaponized PDF/ZIP/XML/OLE2/Image triggering parser memory corruption, stack overflow (`RUSTSEC-2026-0187`), quadratic attribute stall (`RUSTSEC-2026-0194`), or decompression bomb. | `#![forbid(unsafe_code)]` parsers + pre-parse token/attribute/ratio ceilings (`I4`) + ephemeral `sentinel-cdr-worker` in Zero-Capability AppContainer / `seccomp-bpf` (`256 MiB` RAM, `30 s` wall-clock cap, [`sandbox_worker.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/sandbox_worker.rs)). |
-| **TB-3: Host Filesystem -> Quarantine & Shredder** | **Information Disclosure (`I`) & Tampering (`T`)** | Symlink/junction race redirecting shredder to host OS files, forensic carving of deleted malware, or offline tampering with `.quar` headers. | Verbatim `\\?\` + `FILE_FLAG_OPEN_REPARSE_POINT` / `O_NOFOLLOW` ([`secure_shredder.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/secure_shredder.rs)), 3-pass write-through + read-back `SHA-256` verify, and `SNTLQV02` `.quar` AAD header binding ([`quarantine.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/quarantine.rs)). |
+| **TB-3: Host Filesystem -> Quarantine & Shredder** | **Information Disclosure (`I`) & Tampering (`T`)** | Symlink/junction race redirecting shredder to host OS files, forensic carving of deleted malware, or offline tampering with `.quar` headers. | Verbatim `\\?\` + `FILE_FLAG_OPEN_REPARSE_POINT` / `O_NOFOLLOW` ([`secure_shredder.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/secure_shredder.rs)), 3-pass write-through + read-back `SHA-256` verify, and `SNTLQV03` encrypted-header `.quar` AAD binding (with `SNTLQV02` legacy read compatibility, [`quarantine.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/quarantine.rs)). |
 | **TB-4: Policy / Audit Storage -> Local Admin / SIEM** | **Repudiation (`R`) & Tampering (`T`)** | Attacker deleting tail entries from the audit log, forging SIEM syslog lines via embedded newlines/pipes (`CWE-117`), or downgrading security policy (`SignedPolicyBundle`). | `SHA-256` hash-chained JSONL + FIPS 186-5 ECDSA P-256 `<ledger>.head.sig` ([`ledger.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/enterprise/ledger.rs)), CEF/SyncML escaping ([`falcon.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/enterprise/falcon.rs), [`intune.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/enterprise/intune.rs)), and monotonic `version` anti-rollback. |
 | **TB-5: Browser / Network -> Localhost UI (`127.0.0.1:8088`)** | **Spoofing (`S`) & Elevation (`E`)** | Malicious website performing DNS rebinding or cross-origin `POST /api/v1/shred` against localhost UI. | Strict `127.0.0.1` loopback bind, `Host`/`Origin` allowlist, 256-bit CSPRNG bearer token (`subtle::ConstantTimeEq`), and constant-time `X-Sentinel-CSRF` verification ([`main.rs:1485-1507`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-cli/src/main.rs#L1485-L1507)). |
 
@@ -187,13 +187,13 @@ Because file format parsers process untrusted bytes from unknown external media,
 ## 8. Hardware-Backed Cryptographic Custody & Audit Ledger
 
 ### 8.1 Envelope-Encrypted Quarantine Vault ([`quarantine.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/quarantine.rs) & [`crypto_seal.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/crypto_seal.rs))
-- **Envelope Format (`.quar` / `SNTLQV02`)**: Every quarantined payload is encrypted with a fresh CSPRNG 256-bit Data Encryption Key (**DEK**) using **AES-256-GCM** (`96-bit` random nonce) via [`QuarantineVault::seal_bytes_into_vault`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/quarantine.rs#L753-L868) (writing the envelope at [`quarantine.rs:818-833`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/quarantine.rs#L818-L833)) into the binary wire layout `[header_len: u32 LE][QuarantineEnvelopeHeader JSON][ciphertext]`, where `magic: [u8; 8]` (`ENVELOPE_MAGIC_V2_FULL = b"SNTLQV02"`, [`quarantine.rs:26, 88, 784`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/quarantine.rs#L26-L88)) is serialized inside `QuarantineEnvelopeHeader` and the 16-byte AES-256-GCM authentication tag is appended at the end of `ciphertext` (`Aes256Gcm::new(...).encrypt(Nonce::from_slice(&nonce), Payload { msg: raw_bytes, aad: &header_json })` at [`quarantine.rs:803-812`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/quarantine.rs#L803-L812)).
-- **Authenticated Metadata Binding (AAD)**: The serialized `QuarantineEnvelopeHeader` JSON (`magic`, `version`, `kek_id`, `file_salt`, `nonce`, `original_path`, `original_size`, `sha256_plaintext`, `threat_name`, `threat_score`, `quarantined_at_unix`, `entry_id`, `quarantined_at_utc`, `recovery_status` — [`quarantine.rs:62-85`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/quarantine.rs#L62-L85)) is passed as **Additional Authenticated Data (AAD)** into `Aes256Gcm::encrypt`. Modifying any metadata byte in the `.quar` header causes AEAD tag verification to fail immediately.
-- **HKDF-SHA256 DEK Wrapping, Hardware KEK Sealing & Offline SOC Escrow**:
-  1. Each per-entry `<entry_id>.dek` is wrapped under a Key Encryption Key (**KEK**) derived via `HKDF-SHA256(KEK, file_salt, "OMNICONNECT_SENTINEL_QUARANTINE_V2")`.
-  2. **Windows KEK Custody (`vault_kek.sealed`)**: Sealed to the **TPM 2.0 Platform Crypto Provider** (`MS_PLATFORM_CRYPTO_PROVIDER` RSA-2048 OAEP via `NCrypt`) with automatic fallback to Machine-scope **DPAPI** (`CryptProtectData` with `CRYPTPROTECT_LOCAL_MACHINE` + explicit `SYSTEM`/Administrators DACL).
-  3. **Linux KEK Custody (`vault_kek.sealed`)**: Sealed via [`KeyProtectionPosture::UnixLocalKeyring`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/crypto_seal.rs#L13-L20) and [`load_or_create_unix_root_wrapping_key`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/crypto_seal.rs#L826-L864) (`0600` creation tightened to `0400` root-only read), emitting `POSTURE_REDUCED_NO_TPM` degradation telemetry on non-TPM Linux hosts ([`crypto_seal.rs:13-20, 750-864, 1364-1407`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/crypto_seal.rs#L750-L864)).
-  4. **Offline SOC Escrow (`vault_kek.escrow`)**: Also wraps the KEK under an offline SOC RSA-2048-OAEP public key for disaster-recovery forensics if the endpoint motherboard/TPM fails.
+- **Envelope Format (`.quar` / `SNTLQV03` with `SNTLQV02` legacy read compatibility)**: Every quarantined payload is encrypted with a fresh CSPRNG 256-bit Data Encryption Key (**DEK**) using **AES-256-GCM** (`96-bit` random nonce) into `SNTLQV03` (`ENVELOPE_MAGIC_V3_FULL = b"SNTLQV03"`), encrypting personal file paths inside the AEAD-protected `encrypted_original_path_hex` field while storing only an opaque HMAC-pseudonymized token in `original_path` (DPDP §8 / GDPR Art. 17). Legacy `SNTLQV02` envelopes remain readable for backward-compatible vault migration.
+- **Authenticated Metadata Binding (AAD)**: The serialized envelope header JSON is passed as **Additional Authenticated Data (AAD)** into `Aes256Gcm::encrypt`. Modifying any metadata byte in the `.quar` header causes AEAD tag verification to fail immediately.
+- **Audited HKDF-SHA256 DEK Wrapping, Hardware KEK Sealing & Offline SOC Escrow**:
+  1. Each per-entry `<entry_id>.dek` is wrapped under a Key Encryption Key (**KEK**) derived via audited `hkdf::Hkdf::<Sha256>` (`HKDF-SHA256(KEK, file_salt, "OMNICONNECT_SENTINEL_QUARANTINE_V2")`).
+  2. **Windows KEK Custody (`vault_kek.sealed`)**: Sealed to the **TPM 2.0 Platform Crypto Provider** (`MS_PLATFORM_CRYPTO_PROVIDER` RSA-2048 OAEP-SHA256 exclusively — SHA-1 OAEP fallback retired) with automatic fallback to Machine-scope **DPAPI** (`CryptProtectData` with `CRYPTPROTECT_LOCAL_MACHINE` + explicit `SYSTEM`/Administrators DACL).
+  3. **Linux KEK Custody (`vault_kek.sealed`)**: Prefers feature-gated Linux TPM 2.0 (`/dev/tpmrm0`, `linux-tpm2`) and non-swappable **Linux Kernel Keyring** ([`KeyProtectionPosture::LinuxKernelKeyring`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/crypto_seal.rs#L12-L22) via `SYS_keyctl` (`KEYCTL_SEARCH`/`KEYCTL_SETPERM`/`KEYCTL_REVOKE`/`KEYCTL_READ`) and `SYS_add_key`) ahead of file-backed [`KeyProtectionPosture::UnixLocalKeyring`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/crypto_seal.rs#L12-L22) (`0600`->`0400` root-only `master.seed`), emitting `POSTURE_REDUCED_NO_TPM` and refusing strict kiosk startup fail-closed if file-backed `UnixLocalKeyring` fallback is active.
+  4. **Offline SOC Escrow (`vault_kek.escrow` & `OCESCROW3`)**: Wraps the Master KEK under an offline SOC **RSA-3072+-OAEP-SHA256** public key (`vault_kek.escrow`) and **Hybrid Post-Quantum `OCESCROW3`** (`RSA-3072-OAEP-SHA256` + NIST FIPS 203 **ML-KEM-768** via `HKDF-SHA256` + `AES-256-GCM`) for disaster-recovery forensics via `sentinel vault recover-escrow` / `recover-hybrid-escrow-v3`.
 - **Pinned Memory Zeroization ([`mem_guard.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/mem_guard.rs))**: Secret keys reside in `ZeroizingBytes<N>` backed by heap-pinned `Pin<Box<[u8; N]>>` locked into physical RAM (`VirtualLock` on Windows, `mlock` + `MADV_DONTDUMP` on Linux) and scrubbed via `std::ptr::write_volatile` + compiler fences on `Drop`.
 
 ### 8.2 Tamper-Evident ECDSA P-256 Audit Ledger ([`ledger.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/enterprise/ledger.rs))
@@ -203,9 +203,9 @@ Because file format parsers process untrusted bytes from unknown external media,
 
 ---
 
-## 9. NIST SP 800-88 Rev 1 Anti-Forensic Shredder
+## 9. NIST SP 800-88 Rev. 2 Anti-Forensic Shredder
 
-Standard file deletion (`DeleteFileW` / `unlink`) only removes the directory pointer while leaving file contents recoverable via forensic block carving. [`SecureShredder`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/secure_shredder.rs) implements **NIST SP 800-88 Rev 1** with strict media-honesty distinctions between magnetic/block storage and Wear-Leveled Flash (FTL/SSD/USB):
+Standard file deletion (`DeleteFileW` / `unlink`) only removes the directory pointer while leaving file contents recoverable via forensic block carving. [`SecureShredder`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/secure_shredder.rs) implements **NIST SP 800-88 Rev. 2** with strict media-honesty distinctions between magnetic/block storage and Wear-Leveled Flash (FTL/SSD/USB):
 
 1. **Symlink & Reparse-Point Guard**: Opens the target via canonical verbatim path (`\\?\`) with `FILE_FLAG_OPEN_REPARSE_POINT` (Windows) or `O_NOFOLLOW` (Linux) and aborts if the target is a symlink or NTFS junction, preventing arbitrary host file destruction.
 2. **Attribute Normalization**: Clears `FILE_ATTRIBUTE_READONLY`, `HIDDEN`, and `SYSTEM` flags.
@@ -216,12 +216,12 @@ Standard file deletion (`DeleteFileW` / `unlink`) only removes the directory poi
    - **Pass 3**: Cryptographic CSPRNG stream (`OsRng`), computing the expected `SHA-256` digest of the random stream during write.
 4. **Hardware Flush, Read-Back Verification & TRIM**:
    - Invokes `FlushFileBuffers()` / `sync_all()`.
-   - Rewinds the descriptor to offset `0`, reads the entire physical file back from storage, and verifies that the read-back `SHA-256` matches the Pass 3 CSPRNG `SHA-256`.
+   - Rewinds the descriptor to offset `0`, reads the entire physical file back from storage, and verifies that the read-back `SHA-256` matches the Pass 3 CSPRNG `SHA-256` (failing closed with `SHRED_VERIFICATION_FAILED` if verification or hardware flush fails).
    - Issues `FSCTL_FILE_LEVEL_TRIM` (Windows) to notify flash controllers that underlying blocks are discarded.
 5. **MFT / Directory Entry Scrambling**: Renames the file across 3 measured cycles using random hex filenames of equal length to scrub residual filename characters in NTFS `$MFT` / FAT directory slots, truncates the file to `0` bytes, and unlinks it.
-6. **NIST SP 800-88 Rev 1 Media Classification Honesty**:
-   - Because USB flash drives and SSDs use Flash Translation Layers (FTL) with out-of-place wear leveling, multi-pass file overwrites are classified strictly as **NIST SP 800-88 Rev 1 `Clear (logical)`**, never falsely claimed as `Purge (physical)` on raw flash files.
-   - For ephemeral `.enc` ShadowCache and `.quar` Quarantine Vault artifacts that are encrypted from birth with `AES-256-GCM`, zeroizing the `ZeroizingBytes<32>` key material executes a **NIST SP 800-88 Rev 1 `Cryptographic Erase`**.
+6. **NIST SP 800-88 Rev. 2 Media Classification Honesty**:
+   - Because USB flash drives and SSDs use Flash Translation Layers (FTL) with out-of-place wear leveling, multi-pass file overwrites are classified strictly as **NIST SP 800-88 Rev. 2 `Clear (logical)`**, never falsely claimed as `Purge (physical)` on raw flash files.
+   - For ephemeral `.enc` ShadowCache and `.quar` Quarantine Vault artifacts that are encrypted from inception with `AES-256-GCM`, zeroizing the `ZeroizingBytes<32>` key material executes a **NIST SP 800-88 Rev. 2 `Cryptographic Erase (Purge)`**.
 
 ---
 
@@ -231,8 +231,8 @@ OmniConnect Sentinel enforces a **zero-ignore, zero-suppression** software suppl
 
 - **Zero Advisory or Yanked Ignores**: `ignore = []` and `yanked = "deny"` in both `deny.toml` and `.cargo/audit.toml`.
 - **Zero Unused Dependencies**: Verified on every commit by `cargo-machete` with zero `[package.metadata.cargo-machete]` suppressions.
-- **Strict SPDX License Allowlist**: Only `MIT`, `Apache-2.0`, `Apache-2.0 WITH LLVM-exception`, `BSD-2-Clause`, `BSD-3-Clause`, `Unicode-3.0`, and `Zlib` are permitted (`unused-allowed-license` warnings denied).
-- **SBOM & SLSA v1.0 Provenance**: Every CI run generates a **CycloneDX JSON SBOM** (`sbom.cdx.json`) via `cargo-cyclonedx` and attests release binaries (`sentinel`, `sentinel-agent`, `sentinel-cdr-daemon`, `sentinel-cdr-worker`) via `actions/attest-build-provenance`.
+- **Strict SPDX License Allowlist (All 9 Permitted Licenses in `deny.toml`)**: Only `MIT`, `Apache-2.0`, `Apache-2.0 WITH LLVM-exception`, `BSD-2-Clause`, `BSD-3-Clause`, `Unicode-3.0`, `Zlib`, `ISC`, and `CDLA-Permissive-2.0` are permitted (`unused-allowed-license` warnings denied).
+- **SBOM, CBOM & SLSA v1.0 Provenance**: Every CI run generates a **CycloneDX JSON SBOM** (`sbom.cdx.json`) via `cargo-cyclonedx`, ships an audited **CycloneDX 1.6 CBOM** (`sentinel-cbom.cdx.json` with explicit `certificationLevel: ["none"]` for pure-Rust software crates), embeds and verifies `.dep-v0` dependency provenance via `cargo-auditable` + [`verify_auditable_dep_v0.py`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/tests/verify_auditable_dep_v0.py) on **both Windows PE and Linux ELF** release builds, runs an out-of-band loopback anti-forensic shred oracle ([`ci_shred_verify_oracle.sh`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/tests/ci_shred_verify_oracle.sh)) with zero shipped carving code, documents offline REA release artifact sign-off ([`rea_release_binary_verification_playbook.md`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/Docs/rea_release_binary_verification_playbook.md)), and attests release binaries (`sentinel`, `sentinel-agent`, `sentinel-cdr-daemon`, `sentinel-cdr-worker`) via `actions/attest-build-provenance`.
 
 ### VEX & Defense-in-Depth Mitigation Ledger
 
@@ -273,7 +273,7 @@ sentinel kiosk --media USB-SCADA-TURBINE-04
 
 | Framework / Standard | Control / Clause IDs | OmniConnect Sentinel Technical Enforcement |
 | :--- | :--- | :--- |
-| **NIST SP 800-88 Rev 1** | Section 2.5 (`Clear` & `Cryptographic Erase`) | 3-pass write-through overwrite (`0x00`, `0xFF`, CSPRNG) with read-back `SHA-256` verification + `FSCTL_FILE_LEVEL_TRIM` for `Clear (logical)`; `ZeroizingBytes<32>` key destruction for `Cryptographic Erase`. |
+| **NIST SP 800-88 Rev. 2** | Section 2.5 (`Clear` & `Cryptographic Erase`) | 3-pass write-through overwrite (`0x00`, `0xFF`, CSPRNG) with fail-closed read-back `SHA-256` verification + `FSCTL_FILE_LEVEL_TRIM` for `Clear (logical)`; `ZeroizingBytes<32>` key destruction for `Cryptographic Erase (Purge)`. |
 | **NIST SP 800-53 Rev 5** | `MP-7` (Media Use), `SC-7` (Boundary Protection), `SC-12` (Cryptographic Key Establishment), `SC-28` (Protection of Information at Rest), `SI-3` (Malicious Code Protection), `SI-7` (Software/Information Integrity), `AU-9` / `AU-10` (Audit Protection & Non-Repudiation) | Pre-mount `BusTypeUsb` hardware hold (`MP-7`), out-of-process AppContainer/`seccomp-bpf` CDR (`SC-7`/`SI-3`), TPM 2.0 / DPAPI KEK sealing (`SC-12`/`SC-28`), and ECDSA P-256 signed hash-chained audit ledger (`AU-9`/`AU-10`). |
 | **NIST SP 800-207** | Zero Trust Architecture (Tenets 1–7) | Never trusts removable media by bus/vendor name; verifies every byte stream via read-once ingestion (`I2`) and least-privilege `sentinel-cdr-worker` isolation before projection. |
 | **IEC 62443-3-3 (SL-3)** | `SR 1.13` (Access via Untrusted Networks/Media), `SR 3.1` (Communication Integrity), `SR 3.2` (Malicious Code Protection), `SR 6.1` (Audit Log Accessibility) | Air-gapped Kiosk Station workflow (`KioskEnforcer`), ECDSA P-256 signed policy/YARA bundles, deterministic CDR reconstruction, and local non-repudiable audit receipts. |
@@ -285,27 +285,29 @@ sentinel kiosk --media USB-SCADA-TURBINE-04
 
 ## 12. Structured Degradation & Error Event Taxonomy
 
-Enterprise SOC teams require explicit visibility whenever an endpoint operates with reduced hardware or OS capabilities. Instead of silently downgrading security, Sentinel emits structured [`DegradationEvent`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/error.rs#L82-L104) codes (`7` canonical degradation events) and [`SentinelError`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/error.rs#L10-L80) codes (`SNTL-ERR-001`..`SNTL-ERR-009`) into both the SIEM stream and the signed Audit Ledger:
+Enterprise SOC teams require explicit visibility whenever an endpoint operates with reduced hardware or OS capabilities. Instead of silently downgrading security, Sentinel emits structured [`DegradationEvent`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/error.rs#L82-L108) codes (`9` canonical degradation events) and [`SentinelError`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/error.rs#L10-L80) codes (`SNTL-ERR-001`..`SNTL-ERR-009`) into both the SIEM stream and the signed Audit Ledger:
 
-### 12.1 Canonical `DegradationEvent` Taxonomy ([`error.rs:82-104`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/error.rs#L82-L104))
+### 12.1 Canonical `DegradationEvent` Taxonomy ([`error.rs:82-108`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/error.rs#L82-L108))
 
 | Degradation Event Code | Associated `SentinelError` | Trigger Condition | Fail-Safe Compensating Behavior |
 | :--- | :--- | :--- | :--- |
 | `POSTURE_REDUCED_NO_PROJFS` | — | Windows Optional Feature `Client-ProjFS` (`ProjectedFSLib.dll`) is not enabled | [`ProjFsProvider::mount_sanitized_volume`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/vfs/projfs.rs#L87-L144) records `DegradationEvent::PostureReducedNoProjfs.event_code()` (`"POSTURE_REDUCED_NO_PROJFS"`) and serves files on demand via [`ShadowCacheManager::resolve_projected_file`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/vfs/mod.rs#L887-L955) with Mark-of-the-Web (`Zone.Identifier` `ZoneId=3`). |
-| `POSTURE_REDUCED_NO_TPM` | — | Endpoint lacks TPM 2.0 (`MS_PLATFORM_CRYPTO_PROVIDER` on Windows or non-TPM Linux host in [`crypto_seal.rs:13-20, 750-864, 1364-1407`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/crypto_seal.rs#L750-L864)) | Falls back to Machine-scope DPAPI (Windows) or [`KeyProtectionPosture::UnixLocalKeyring`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/crypto_seal.rs#L13-L20) (`0600`->`0400` root-only read via [`load_or_create_unix_root_wrapping_key`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/crypto_seal.rs#L826-L864) on Linux) with explicit audit trail. |
+| `POSTURE_REDUCED_NO_FUSE` | — | Native Linux kernel FUSE3 (`vfs-fuse` / `/dev/fuse`) is unavailable | [`FuseVfsProvider::mount_sanitized_volume`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/vfs/fuse.rs#L96-L130) records `POSTURE_REDUCED_NO_FUSE` and delegates to hardened read-only `StagingFolderProvider` (`0500`/`0444`, zero `bindfs` shell-outs). |
+| `POSTURE_REDUCED_NO_TPM` | — | Endpoint lacks TPM 2.0 (`MS_PLATFORM_CRYPTO_PROVIDER` on Windows or non-TPM Linux host in [`crypto_seal.rs`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-sys/src/crypto_seal.rs)) | Falls back to Machine-scope DPAPI (Windows), non-swappable Linux Kernel Keyring (`LinuxKernelKeyring`), or root-only file-backed `UnixLocalKeyring` (`master.seed`, refused fail-closed in strict kiosk mode) with explicit audit trail. |
 | `CACHE_QUOTA_EXCEEDED` | `SNTL-ERR-006` | `ShadowCacheManager` session exceeds `512 MiB` or `10,000` files | Rejects additional file ingestion for the session (`CacheQuotaExceeded(String)`) to prevent host disk exhaustion. |
 | `CDR_WORKER_FAILED` | `SNTL-ERR-005` | Out-of-process `sentinel-cdr-worker` crashes, hits `256 MiB` limit, or exceeds `30 s` timeout | Terminates worker Job Object / process group (`CdrWorkerFailed(String)`) and quarantines or blocks the untrusted carrier fail-closed. |
 | `VAULT_INTEGRITY_FAIL` | `SNTL-ERR-002` | Quarantine `.quar` envelope AEAD tag or header AAD check fails | Refuses restoration (`QuarantineIntegrityFail(String)`) and logs high-severity tamper alert to SIEM and Audit Ledger. |
 | `POLICY_REJECTED` | `SNTL-ERR-007` | `SignedPolicyBundle` or YARA bundle fails ECDSA P-256 verification or anti-rollback check | Rejects policy update (`PolicySignatureInvalid(String)`) and retains existing pinned security policy. |
 | `SANDBOX_OFFLINE_EMULATED` | — | Hardware microVM hypervisor (`WHVP` / `KVM`) is unavailable during `detonate` | Recorded in `SandboxDetonationReport.degradation_event` and `AuditLedger` ([`tier3_sandbox.rs:211-236`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/scanner/tier3_sandbox.rs#L211-L236)) so analysts never confuse static heuristics with live VM execution. |
+| `SOC_ESCROW_UNCONFIGURED` | — | Quarantine vault initialized without an offline SOC RSA-3072+ / `OCESCROW3` public key bundle | Emits `SOC_ESCROW_UNCONFIGURED` degradation alert to `AuditLedger` so operators provision offline disaster-recovery escrow before endpoint TPM loss. |
 
 ### 12.2 Canonical `SentinelError` Taxonomy (`SNTL-ERR-001`..`SNTL-ERR-009`, [`error.rs:12-71`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/error.rs#L12-L71))
 
 | Error Code | Enum Variant (`error.rs:12-41`) | `event_code()` (`error.rs:59-71`) | Display Template & Operational Condition |
 | :--- | :--- | :--- | :--- |
 | `SNTL-ERR-001` | `MountPostureViolation(String)` | `MOUNT_POSTURE_VIOLATION` | `[SNTL-ERR-001] Mount posture violation (MOUNT_POSTURE_VIOLATION): {0}` — Pre-mount USB hardware hold or posture requirement failed. |
-| `SNTL-ERR-002` | `QuarantineIntegrityFail(String)` | `VAULT_INTEGRITY_FAIL` | `[SNTL-ERR-002] Quarantine vault integrity failure (VAULT_INTEGRITY_FAIL): {0}` — Quarantine vault `.quar` (`SNTLQV02`) AEAD tag or AAD header verification failed. |
-| `SNTL-ERR-003` | `ShredOperationFailed(String)` | `SHRED_OPERATION_FAILED` | `[SNTL-ERR-003] Secure shred operation failed (SHRED_OPERATION_FAILED): {0}` — NIST SP 800-88 Rev 1 `SecureShredder` write-through, read-back `SHA-256` verify, or symlink refusal failed. |
+| `SNTL-ERR-002` | `QuarantineIntegrityFail(String)` | `VAULT_INTEGRITY_FAIL` | `[SNTL-ERR-002] Quarantine vault integrity failure (VAULT_INTEGRITY_FAIL): {0}` — Quarantine vault `.quar` (`SNTLQV03`/`SNTLQV02`) AEAD tag or AAD header verification failed. |
+| `SNTL-ERR-003` | `ShredOperationFailed(String)` | `SHRED_OPERATION_FAILED` | `[SNTL-ERR-003] Secure shred operation failed (SHRED_OPERATION_FAILED): {0}` — NIST SP 800-88 Rev. 2 `SecureShredder` write-through, read-back `SHA-256` verify, or symlink refusal failed. |
 | `SNTL-ERR-004` | `WalkAccessDenied(String)` | `WALK_ACCESS_DENIED` | `[SNTL-ERR-004] Directory walk / file access error (WALK_ACCESS_DENIED): {0}` — Directory scanner encountered an unreadable or locked entry (sets `ScanReport.complete = false`). |
 | `SNTL-ERR-005` | `CdrWorkerFailed(String)` | `CDR_WORKER_FAILED` | `[SNTL-ERR-005] Isolated CDR worker failure (CDR_WORKER_FAILED): {0}` — Sandboxed `sentinel-cdr-worker` failed, exceeded `256 MiB`, or timed out after `30 s`. |
 | `SNTL-ERR-006` | `CacheQuotaExceeded(String)` | `CACHE_QUOTA_EXCEEDED` | `[SNTL-ERR-006] Shadow cache quota exceeded (CACHE_QUOTA_EXCEEDED): {0}` — `ShadowCacheManager` session quota (`512 MiB` / `10,000` files) exceeded. |
@@ -321,8 +323,8 @@ Enterprise SOC teams require explicit visibility whenever an endpoint operates w
 Usage: sentinel <COMMAND>
 
 Commands:
-  scan-drive      Scan an external drive or directory for all 6 hidden threat carrier classes (supports --break-glass-token)
-  shred           Execute NIST SP 800-88 Rev 1 Clear (3-pass write-through + SHA-256 verify) on a file
+  scan-drive      Scan an external drive or directory for all 6 hidden threat carrier classes
+  shred           Execute NIST SP 800-88 Rev. 2 Clear (3-pass write-through + SHA-256 verify) on a file
   watch           Run autonomous Drive Arrival Sentry for real-time USB interception
   sanitize        Disarm and reconstruct a document or image via the pure-Rust CDR engine
   detonate        Execute behavioral sandbox analysis in an isolated OpenSandbox microVM profile
@@ -330,9 +332,13 @@ Commands:
   ui              Launch localhost (127.0.0.1) Cyber Defense Station with bearer auth & CSRF protection
   intune          Display active policy or export XML-escaped Microsoft Intune OMA-URI SyncML profile
   telemetry       Emit CEF-escaped CrowdStrike Falcon FDR NDJSON and ArcSight CEF syslog events
+  siem            Manage the AEAD-encrypted SIEM CEF telemetry spool (`sentinel siem flush`)
   kiosk           Run an IEC 62443-3-3 SL-3 air-gapped industrial media verification session
-  confirm-device  Confirm physical user presence for a quarantined USB device (--device-id <ID> --challenge <8-CHAR-HEX>)
-  vault           List, inspect, restore, or migrate AES-256-GCM AEAD quarantine vault envelopes (.quar)
+  verify-passport Verify a detached ECDSA P-256 signed CDR Kiosk Passport (.sentinel-passport.json)
+  confirm-device  Confirm physical user presence for a quarantined USB device (--device-id <ID> --challenge <32-CHAR-HEX-OR-TOKEN-PATH>)
+  break-glass     Verify an ECDSA P-256 signed emergency break-glass token (--token <PATH>) with expiry & nonce replay guard
+  policy-verify   Verify an enterprise signed policy bundle against pinned root public keys
+  vault           List, inspect, restore, recover-escrow, or migrate AES-256-GCM AEAD quarantine vault envelopes (.quar)
   ledger          Verify the SHA-256 hash chain and FIPS 186-5 ECDSA P-256 chain-head signature of the audit ledger
 ```
 
@@ -352,7 +358,7 @@ When `sentinel ui --port 8088` starts ([`crates/sentinel-cli/src/main.rs:1485-15
 | `sentinel_cdr_processed_total` | `counter` | Total files processed by the CDR engine labeled by `format` and `status` ([`error.rs:194, 222, 228`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/error.rs#L222-L228)). |
 | `sentinel_cdr_duration_ms` | `counter` | Cumulative CDR sanitization duration in milliseconds labeled by `format` (`30,000 ms` hard watchdog ceiling per worker). |
 | `sentinel_threats_total` | `counter` | Cumulative threats detected and blocked labeled by `category` and `severity` ([`error.rs:196, 260, 266`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/error.rs#L260-L266)). |
-| `sentinel_vault_ops_total` | `counter` | Total `.quar` (`SNTLQV02`) quarantine vault operations labeled by `op` and `status` ([`error.rs:197, 280, 286`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/error.rs#L280-L286)). |
+| `sentinel_vault_ops_total` | `counter` | Total `.quar` (`SNTLQV03`/`SNTLQV02`) quarantine vault operations labeled by `op` and `status` ([`error.rs:197, 280, 286`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/error.rs#L280-L286)). |
 | `sentinel_posture` | `gauge` | Endpoint hardware/OS security posture labeled by `feature` (`automount_disabled`, `user_deny_policy_present`, `install_restrictions_active`, `write_protect_active`, `removable_volumes_offline`, `is_compliant` — [`error.rs:295-323`](file:///c:/Users/hulkh/Downloads/OmniConnect-Sentinel/crates/sentinel-core/src/error.rs#L295-L323)). |
 | `sentinel_policy_drift_total` | `counter` | Total rejected policy updates (`POLICY_REJECTED` / `SNTL-ERR-007`) or posture drift events. |
 
@@ -461,13 +467,15 @@ cargo machete
 # 7. CycloneDX Software Bill of Materials (SBOM) Generation
 cargo cyclonedx --format json --all --override-filename sbom.cdx
 
-# 8. Locked Release Binary Build (with MSVC Control Flow Guard on Windows)
-cargo build --workspace --release --locked
+# 8. Cross-Platform Auditable Release Binary Build & .dep-v0 Verification (Windows PE + Linux ELF)
+cargo auditable build --workspace --release --locked
+python3 tests/verify_auditable_dep_v0.py target/release/sentinel target/release/sentinel-agent target/release/sentinel-cdr-daemon target/release/sentinel-cdr-worker
 
-# 9. Zero #[allow(...)] / #![allow(...)] Attribute Audit
-git grep -n "allow(" crates/   # Must return 0 matches
+# 9. Zero Unapproved #[allow(...)] / thread_rng() Audit + CI Loopback Shred Oracle (ext4 & FAT32)
+git grep -n "allow(" crates/ | grep -v "cold_eye"   # Must return 0 matches
+bash tests/ci_shred_verify_oracle.sh --bin target/release/sentinel
 
-# 10. SLSA v1.0 Build Provenance & SBOM Attestation (on main/master)
+# 10. SLSA v1.0 Build Provenance & SBOM/CBOM Attestation (Linux & Windows on main/master)
 ```
 
 ---
