@@ -66,10 +66,62 @@ jobs:
       - name: Clippy strict lint gate (no unwrap/expect in production crates)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Execute full test pyramid (unit, property, invariant I1-I5, output oracles, chaos)
+      - name: Execute full test pyramid (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
+          set -o pipefail
           cargo build --workspace --bins --locked
-          cargo test --workspace --locked -- --nocapture
+          cargo test --workspace --locked --no-fail-fast -- --nocapture 2>&1 | tee ci-test.log
+
+      - name: Execute full test pyramid (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cargo build --workspace --bins --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --workspace --locked --no-fail-fast -- --nocapture 2>&1 | Tee-Object -FilePath ci-test.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Emit structured test failure annotations
+        if: failure()
+        shell: bash
+        run: |
+          PY="$(command -v python3 || command -v python)"
+          "$PY" - <<'PYEOF'
+          import os, re, pathlib
+          p = pathlib.Path("ci-test.log")
+          if not p.exists():
+              print("::error title=Test Log Missing::ci-test.log was not created (cargo build or earlier step failed)")
+              raise SystemExit(0)
+          lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+          def esc(s):
+              return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          blocks = []
+          i = 0
+          while i < len(lines):
+              if lines[i].startswith("---- ") and lines[i].endswith(" stdout ----"):
+                  hdr = lines[i]
+                  buf = [hdr]
+                  i += 1
+                  while i < len(lines) and not (lines[i].startswith("---- ") and lines[i].endswith(" stdout ----")) and lines[i] != "failures:":
+                      if lines[i].strip():
+                          buf.append(lines[i])
+                      if len(buf) >= 12:
+                          break
+                      i += 1
+                  blocks.append("\n".join(buf))
+                  continue
+              i += 1
+          failed_summary = [l for l in lines if re.search(r"(^test .* FAILED$|^error:|test result: FAILED)", l)]
+          if failed_summary:
+              print("::error title=Failed Tests Summary::" + esc("\n".join(failed_summary[:40])))
+          for idx, blk in enumerate(blocks[:6], 1):
+              print(f"::error title=Failure Detail {idx}::" + esc(blk[:1800]))
+          if not failed_summary and not blocks:
+              print("::error title=Test Tail::" + esc("\n".join(lines[-30:])[:2500]))
+          PYEOF
 
   supply-chain-and-sbom:
     name: Linux Supply-Chain Gate (cargo-deny, cargo-audit, cargo-machete, Trivy, CycloneDX SBOM, Auditable ELF .dep-v0, SLSA)
@@ -224,4 +276,19 @@ jobs:
         run: cargo build -p sentinel-cli --bin sentinel --release --locked
 
       - name: Execute CI-only loopback shred verification oracle (0 residual canary matches)
-        run: bash tests/ci_shred_verify_oracle.sh --bin target/release/sentinel
+        shell: bash
+        run: |
+          set -o pipefail
+          bash tests/ci_shred_verify_oracle.sh --bin target/release/sentinel 2>&1 | tee ci-shred-oracle.log
+
+      - name: Emit shred oracle failure annotation
+        if: failure()
+        shell: bash
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib
+          p = pathlib.Path("ci-shred-oracle.log")
+          txt = p.read_text(encoding="utf-8", errors="replace") if p.exists() else "ci-shred-oracle.log missing"
+          esc = txt[-3000:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error title=Shred Oracle Output::" + esc)
+          PYEOF
