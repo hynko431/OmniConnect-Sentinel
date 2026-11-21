@@ -1010,6 +1010,7 @@ async fn test_interceptor_retains_channel_sender_and_vfs_shadow_cache() {
             vid: 0x0781,
             pid: 0x5583,
             serial: "SN-TEST-001".to_string(),
+            device_instance_id: Some(r"USB\VID_0781&PID_5583\SN-TEST-001".to_string()),
             interfaces: Vec::new(),
         },
         raw_mount_point: None,
@@ -1163,6 +1164,7 @@ fn test_kiosk_posture_blocks_session_when_noncompliant() {
         write_protect_active: true,
         autoplay_suppressed: true,
         linux_authorized_default_zero: Some(false),
+        hardware_write_blocker: Default::default(),
     };
     assert!(!noncompliant.is_compliant());
     assert!(
@@ -1180,6 +1182,7 @@ fn test_kiosk_posture_blocks_session_when_noncompliant() {
         write_protect_active: true,
         autoplay_suppressed: true,
         linux_authorized_default_zero: Some(true),
+        hardware_write_blocker: Default::default(),
     };
     assert!(compliant.is_compliant());
     let sess_id = kiosk
@@ -1471,6 +1474,7 @@ fn invariant_i1() {
         write_protect_active: false,
         autoplay_suppressed: false,
         linux_authorized_default_zero: Some(false),
+        hardware_write_blocker: Default::default(),
     };
     assert!(!non_compliant.is_compliant());
 
@@ -1485,6 +1489,7 @@ fn invariant_i1() {
         write_protect_active: true,
         autoplay_suppressed: true,
         linux_authorized_default_zero: Some(true),
+        hardware_write_blocker: Default::default(),
     };
     assert!(
         !online_volume_noncompliant.is_compliant(),
@@ -2023,6 +2028,7 @@ fn kiosk_posture_blocks_session() {
         write_protect_active: true,
         autoplay_suppressed: true,
         linux_authorized_default_zero: Some(false),
+        hardware_write_blocker: Default::default(),
     };
     assert!(!noncompliant.is_compliant());
     assert!(

@@ -15,13 +15,14 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-pub use sentinel_sys::PostureReport;
 use sentinel_sys::{
     create_restricted_dir_atomic, create_restricted_file_atomic,
-    ensure_not_symlink_or_reparse_point, enumerate_ntfs_ads, is_reparse_point_or_symlink,
-    open_untrusted_readonly_nofollow, query_ntp_sync_status, validate_p256_uncompressed_point,
-    verify_ecdsa_p256_digest, verify_system_posture, zeroize_slice, NtpSyncStatus, ZeroizingBytes,
+    ensure_not_symlink_or_reparse_point, enumerate_ntfs_ads, evaluate_strict_kiosk_key_posture,
+    is_reparse_point_or_symlink, open_untrusted_readonly_nofollow, query_ntp_sync_status,
+    validate_p256_uncompressed_point, verify_ecdsa_p256_digest, verify_system_posture,
+    zeroize_slice, KeyProtectionPosture, NtpSyncStatus, ZeroizingBytes,
 };
+pub use sentinel_sys::{HardwareWriteBlockerState, PostureReport};
 
 use crate::enterprise::ledger::{
     tokenize_path_for_ledger, AuditLedger, AuditSubsystem, SharedAuditLedger,
@@ -54,13 +55,14 @@ struct CanonicalPassportSignable<'a> {
     ntp_sync: &'a NtpSyncStatus,
     policy_id: &'a str,
     policy_sequence: u64,
-    binary_dep_v0_sha256: &'a str,
+    binary_exe_sha256: &'a str,
+    binary_dep_v0_sha256: Option<&'a str>,
     sanitized_files: &'a [PassportSanitizedFileEntry],
     signature_algorithm: &'a str,
     public_key_blob_hex: &'a str,
 }
 
-/// Detached ECDSA P-256 Signed CDR Kiosk Sanitization Passport (`.sentinel-passport.json`, `Sub-Phase 2.2`, `CSE-14`).
+/// Detached ECDSA P-256 Signed CDR Kiosk Sanitization Passport (`.sentinel-passport.json`, `Sub-Phase 2.2`, `CSE-14`, `CSE-17`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KioskSanitizationPassport {
@@ -73,7 +75,11 @@ pub struct KioskSanitizationPassport {
     pub ntp_sync: NtpSyncStatus,
     pub policy_id: String,
     pub policy_sequence: u64,
-    pub binary_dep_v0_sha256: String,
+    /// Full streaming SHA-256 of the running kiosk executable (`ADR-014`, `CSE-17`).
+    pub binary_exe_sha256: String,
+    /// Exact SHA-256 of the embedded `cargo-auditable` `.dep-v0` PE/ELF section when present,
+    /// or `None` when running a non-auditable binary (`ADR-014`, `CSE-17`). Never spoofs the full exe hash.
+    pub binary_dep_v0_sha256: Option<String>,
     pub sanitized_files: Vec<PassportSanitizedFileEntry>,
     pub signature_algorithm: String,
     pub public_key_blob_hex: String,
@@ -370,6 +376,30 @@ impl KioskEnforcer {
         Ok(())
     }
 
+    /// Formats an honest Pivot A hardware write-blocker posture banner for Kiosk UI/CLI output (`CSE-27`).
+    pub fn format_hardware_write_blocker_banner(state: &HardwareWriteBlockerState) -> String {
+        match state {
+            HardwareWriteBlockerState::NotDetected => {
+                "HW-WRITE-BLOCKER: NOT_DETECTED (software OS write-protect only)".to_string()
+            }
+            HardwareWriteBlockerState::Bay1RoOnly {
+                bay1_device,
+                bay1_readonly_verified,
+            } => format!(
+                "HW-WRITE-BLOCKER: BAY1_RO_VERIFIED (bay1={bay1_device}, readonly={bay1_readonly_verified})"
+            ),
+            HardwareWriteBlockerState::DualBayVerified {
+                bay1_ro_device,
+                bay2_rw_device,
+            } => format!(
+                "HW-WRITE-BLOCKER: DUAL_BAY_VERIFIED (bay1_ro={bay1_ro_device}, bay2_rw={bay2_rw_device})"
+            ),
+            HardwareWriteBlockerState::Faulted { reason } => {
+                format!("HW-WRITE-BLOCKER: FAULTED ({reason})")
+            }
+        }
+    }
+
     pub fn verify_posture(&self) -> PostureReport {
         let report = verify_system_posture();
         let _ = self.append_kiosk_event(
@@ -381,6 +411,7 @@ impl KioskEnforcer {
                 "user_deny_policy_present": report.user_deny_policy_present,
                 "install_restrictions_active": report.install_restrictions_active,
                 "write_protect_active": report.write_protect_active,
+                "hardware_write_blocker": report.hardware_write_blocker,
             }),
         );
         report
@@ -391,12 +422,43 @@ impl KioskEnforcer {
         self.verify_posture().write_protect_active
     }
 
-    /// Enforces `PostureReport::is_compliant()` before starting a strict kiosk session
-    /// (Master Plan v2 §0.1 & §5 `kiosk_posture_blocks_session`), recording the decision
-    /// in the tamper-evident `AuditLedger` (`Rows 23, 168`).
+    /// Enforces `PostureReport::is_compliant()` and strict key protection posture (refusing
+    /// file-backed `KeyProtectionPosture::UnixLocalKeyring` fallback on Linux with `POSTURE_REDUCED_NO_TPM`,
+    /// `CSE-28`) before starting a strict kiosk session, recording the decision in `AuditLedger`.
+    ///
+    /// Resolves key posture fail-closed from either `self.shared_ledger` or
+    /// `AuditLedger::open_result(&self.ledger_path)?` so callers without a shared ledger cannot
+    /// bypass `evaluate_strict_kiosk_key_posture`.
     pub fn begin_kiosk_session_with_posture(
         &mut self,
         posture: &PostureReport,
+    ) -> Result<String, String> {
+        let resolved_key_posture = if let Some(ref shared) = self.shared_ledger {
+            let guard = shared
+                .lock()
+                .map_err(|e| format!("Kiosk shared ledger mutex poisoned: {e}"))?;
+            guard.key_posture().ok_or_else(|| {
+                "POSTURE_REDUCED_NO_TPM: Refusing strict kiosk session because attached AuditLedger signing key posture is unavailable"
+                    .to_string()
+            })?
+        } else {
+            let ledger = AuditLedger::open_result(&self.ledger_path)?;
+            ledger.key_posture().ok_or_else(|| {
+                "POSTURE_REDUCED_NO_TPM: Refusing strict kiosk session because AuditLedger signing key posture is unavailable"
+                    .to_string()
+            })?
+        };
+        self.begin_kiosk_session_with_posture_and_key_posture(posture, resolved_key_posture)
+    }
+
+    /// Enforces both `PostureReport::is_compliant()` AND `evaluate_strict_kiosk_key_posture(key_posture)`
+    /// (`CSE-28`): refuses strict kiosk startup fail-closed if the host fell back to plaintext file-backed
+    /// `KeyProtectionPosture::UnixLocalKeyring` (`master.seed`), logging `KIOSK_POSTURE_BLOCKED` +
+    /// `POSTURE_REDUCED_NO_TPM` in the tamper-evident `AuditLedger`.
+    pub fn begin_kiosk_session_with_posture_and_key_posture(
+        &mut self,
+        posture: &PostureReport,
+        key_posture: KeyProtectionPosture,
     ) -> Result<String, String> {
         if !posture.is_compliant() {
             self.append_kiosk_event(
@@ -408,16 +470,34 @@ impl KioskEnforcer {
                     "user_deny_policy_present": posture.user_deny_policy_present,
                     "install_restrictions_active": posture.install_restrictions_active,
                     "write_protect_active": posture.write_protect_active,
+                    "hardware_write_blocker": posture.hardware_write_blocker,
+                    "key_protection_posture": key_posture,
                 }),
             )?;
             return Err(format!(
-                "Refusing to start strict kiosk session: system posture non-compliant (automount_disabled={}, user_deny_policy_present={}, install_restrictions_active={}, write_protect_active={})",
+                "Refusing to start strict kiosk session: system posture non-compliant (automount_disabled={}, user_deny_policy_present={}, install_restrictions_active={}, write_protect_active={}, hardware_write_blocker={:?})",
                 posture.automount_disabled,
                 posture.user_deny_policy_present,
                 posture.install_restrictions_active,
-                posture.write_protect_active
+                posture.write_protect_active,
+                posture.hardware_write_blocker
             ));
         }
+
+        if let Err(reason) = evaluate_strict_kiosk_key_posture(key_posture) {
+            self.append_kiosk_event(
+                "KIOSK_POSTURE_BLOCKED",
+                serde_json::json!({
+                    "status": "KIOSK_SESSION_REJECTED",
+                    "kiosk_id": self.config.kiosk_id,
+                    "reduced_posture_event": "POSTURE_REDUCED_NO_TPM",
+                    "key_protection_posture": key_posture,
+                    "reason": "FILE_BACKED_KEY_FALLBACK_REFUSED_IN_STRICT_KIOSK",
+                }),
+            )?;
+            return Err(reason);
+        }
+
         let session_id = self.begin_kiosk_session();
         self.append_kiosk_event(
             "KIOSK_SESSION_STARTED",
@@ -426,6 +506,7 @@ impl KioskEnforcer {
                 "session_id": session_id,
                 "session_dir_token": self.tokenize_kiosk_path(&self.session_dir),
                 "posture_verified": true,
+                "key_protection_posture": key_posture,
             }),
         )?;
         Ok(session_id)
@@ -1029,7 +1110,7 @@ impl KioskEnforcer {
         let passport_id = format!("PASS-{}", Uuid::new_v4());
         let issued_at_utc = Utc::now().to_rfc3339();
         let ntp_sync = query_ntp_sync_status();
-        let binary_dep_v0_sha256 = compute_current_binary_provenance_sha256();
+        let (binary_exe_sha256, binary_dep_v0_sha256) = compute_current_binary_provenance();
         let schema_version = "1.0".to_string();
         let signature_algorithm = "ECDSA-P256-SHA256".to_string();
 
@@ -1066,7 +1147,8 @@ impl KioskEnforcer {
             ntp_sync: &ntp_sync,
             policy_id,
             policy_sequence,
-            binary_dep_v0_sha256: &binary_dep_v0_sha256,
+            binary_exe_sha256: &binary_exe_sha256,
+            binary_dep_v0_sha256: binary_dep_v0_sha256.as_deref(),
             sanitized_files: &entries,
             signature_algorithm: &signature_algorithm,
             public_key_blob_hex: &public_key_blob_hex,
@@ -1095,6 +1177,7 @@ impl KioskEnforcer {
             ntp_sync: ntp_sync.clone(),
             policy_id: policy_id.to_string(),
             policy_sequence,
+            binary_exe_sha256,
             binary_dep_v0_sha256,
             sanitized_files: entries,
             signature_algorithm,
@@ -1192,13 +1275,197 @@ fn hash_file_streaming_64k(path: &Path) -> Result<(u64, String), String> {
     Ok((total, hex::encode(hasher.finalize())))
 }
 
-fn compute_current_binary_provenance_sha256() -> String {
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Ok((_sz, digest)) = hash_file_streaming_64k(&exe_path) {
-            return digest;
+/// Extracts and hashes the exact payload bytes of an embedded `cargo-auditable` `.dep-v0` section
+/// from a PE32/PE32+ or ELF32/ELF64 executable image (`ADR-014`, `CSE-17`).
+/// Returns `None` when the binary contains no `.dep-v0` section or is not a valid PE/ELF image.
+pub fn extract_dep_v0_section_sha256(bytes: &[u8]) -> Option<String> {
+    if bytes.len() >= 0x40 && &bytes[0..2] == b"MZ" {
+        return extract_pe_dep_v0_sha256(bytes);
+    }
+    if bytes.len() >= 52 && &bytes[0..4] == b"\x7fELF" {
+        return extract_elf_dep_v0_sha256(bytes);
+    }
+    None
+}
+
+fn read_u16_le(bytes: &[u8], off: usize) -> Option<u16> {
+    let slice = bytes.get(off..off.checked_add(2)?)?;
+    Some(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn read_u32_le(bytes: &[u8], off: usize) -> Option<u32> {
+    let slice = bytes.get(off..off.checked_add(4)?)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_u16_endian(bytes: &[u8], off: usize, big: bool) -> Option<u16> {
+    let slice = bytes.get(off..off.checked_add(2)?)?;
+    let arr = [slice[0], slice[1]];
+    Some(if big {
+        u16::from_be_bytes(arr)
+    } else {
+        u16::from_le_bytes(arr)
+    })
+}
+
+fn read_u32_endian(bytes: &[u8], off: usize, big: bool) -> Option<u32> {
+    let slice = bytes.get(off..off.checked_add(4)?)?;
+    let arr = [slice[0], slice[1], slice[2], slice[3]];
+    Some(if big {
+        u32::from_be_bytes(arr)
+    } else {
+        u32::from_le_bytes(arr)
+    })
+}
+
+fn read_u64_endian(bytes: &[u8], off: usize, big: bool) -> Option<u64> {
+    let slice = bytes.get(off..off.checked_add(8)?)?;
+    let arr = [
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+    ];
+    Some(if big {
+        u64::from_be_bytes(arr)
+    } else {
+        u64::from_le_bytes(arr)
+    })
+}
+
+fn extract_pe_dep_v0_sha256(bytes: &[u8]) -> Option<String> {
+    let pe_off = read_u32_le(bytes, 0x3C)? as usize;
+    if bytes.get(pe_off..pe_off.checked_add(4)?)? != b"PE\0\0" {
+        return None;
+    }
+    let coff_off = pe_off.checked_add(4)?;
+    let num_sections = read_u16_le(bytes, coff_off.checked_add(2)?)? as usize;
+    let opt_hdr_size = read_u16_le(bytes, coff_off.checked_add(16)?)? as usize;
+    let sec_table_off = coff_off.checked_add(20)?.checked_add(opt_hdr_size)?;
+
+    for idx in 0..num_sections {
+        let entry_off = sec_table_off.checked_add(idx.checked_mul(40)?)?;
+        let name_bytes = bytes.get(entry_off..entry_off.checked_add(8)?)?;
+        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(8);
+        if &name_bytes[..name_end] == b".dep-v0" {
+            let virtual_size = read_u32_le(bytes, entry_off.checked_add(8)?)? as usize;
+            let raw_size = read_u32_le(bytes, entry_off.checked_add(16)?)? as usize;
+            let raw_ptr = read_u32_le(bytes, entry_off.checked_add(20)?)? as usize;
+            let effective_len = if virtual_size > 0 {
+                virtual_size.min(raw_size)
+            } else {
+                raw_size
+            };
+            if effective_len == 0 {
+                return None;
+            }
+            let payload = bytes.get(raw_ptr..raw_ptr.checked_add(effective_len)?)?;
+            return Some(hex::encode(Sha256::digest(payload)));
         }
     }
-    "UNAVAILABLE_IN_EPHEMERAL_HARNESS".to_string()
+    None
+}
+
+fn extract_elf_dep_v0_sha256(bytes: &[u8]) -> Option<String> {
+    let ei_class = *bytes.get(4)?;
+    let ei_data = *bytes.get(5)?;
+    let big = match ei_data {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+
+    let (shoff, shentsize, shnum, shstrndx) = match ei_class {
+        1 => {
+            if bytes.len() < 52 {
+                return None;
+            }
+            (
+                read_u32_endian(bytes, 32, big)? as usize,
+                read_u16_endian(bytes, 46, big)? as usize,
+                read_u16_endian(bytes, 48, big)? as usize,
+                read_u16_endian(bytes, 50, big)? as usize,
+            )
+        }
+        2 => {
+            if bytes.len() < 64 {
+                return None;
+            }
+            (
+                usize::try_from(read_u64_endian(bytes, 40, big)?).ok()?,
+                read_u16_endian(bytes, 58, big)? as usize,
+                read_u16_endian(bytes, 60, big)? as usize,
+                read_u16_endian(bytes, 62, big)? as usize,
+            )
+        }
+        _ => return None,
+    };
+
+    if shoff == 0 || shnum == 0 || shstrndx >= shnum {
+        return None;
+    }
+    let min_ent = if ei_class == 2 { 64 } else { 40 };
+    if shentsize < min_ent {
+        return None;
+    }
+
+    let strtab_hdr = shoff.checked_add(shstrndx.checked_mul(shentsize)?)?;
+    let (strtab_off, strtab_size) = if ei_class == 2 {
+        (
+            usize::try_from(read_u64_endian(bytes, strtab_hdr.checked_add(24)?, big)?).ok()?,
+            usize::try_from(read_u64_endian(bytes, strtab_hdr.checked_add(32)?, big)?).ok()?,
+        )
+    } else {
+        (
+            read_u32_endian(bytes, strtab_hdr.checked_add(16)?, big)? as usize,
+            read_u32_endian(bytes, strtab_hdr.checked_add(20)?, big)? as usize,
+        )
+    };
+    let strtab = bytes.get(strtab_off..strtab_off.checked_add(strtab_size)?)?;
+
+    for idx in 0..shnum {
+        let hdr = shoff.checked_add(idx.checked_mul(shentsize)?)?;
+        let sh_name = read_u32_endian(bytes, hdr, big)? as usize;
+        if sh_name >= strtab.len() {
+            continue;
+        }
+        let tail = &strtab[sh_name..];
+        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        if &tail[..end] == b".dep-v0" {
+            let (sec_off, sec_size) = if ei_class == 2 {
+                (
+                    usize::try_from(read_u64_endian(bytes, hdr.checked_add(24)?, big)?).ok()?,
+                    usize::try_from(read_u64_endian(bytes, hdr.checked_add(32)?, big)?).ok()?,
+                )
+            } else {
+                (
+                    read_u32_endian(bytes, hdr.checked_add(16)?, big)? as usize,
+                    read_u32_endian(bytes, hdr.checked_add(20)?, big)? as usize,
+                )
+            };
+            if sec_size == 0 {
+                return None;
+            }
+            let payload = bytes.get(sec_off..sec_off.checked_add(sec_size)?)?;
+            return Some(hex::encode(Sha256::digest(payload)));
+        }
+    }
+    None
+}
+
+/// Computes `(binary_exe_sha256, binary_dep_v0_sha256)` for the currently running binary (`ADR-014`, `CSE-17`).
+/// Never substitutes the full executable SHA-256 into `binary_dep_v0_sha256`.
+pub fn compute_current_binary_provenance() -> (String, Option<String>) {
+    if let Ok(exe_path) = std::env::current_exe() {
+        let exe_hash = hash_file_streaming_64k(&exe_path)
+            .map(|(_sz, digest)| digest)
+            .unwrap_or_else(|_| "UNAVAILABLE_IN_EPHEMERAL_HARNESS".to_string());
+        let dep_v0_hash = fs::File::open(&exe_path)
+            .ok()
+            .and_then(|mut f| {
+                sentinel_sys::read_untrusted_to_end_bounded(&mut f, 64 * 1024 * 1024).ok()
+            })
+            .and_then(|bytes| extract_dep_v0_section_sha256(&bytes));
+        return (exe_hash, dep_v0_hash);
+    }
+    ("UNAVAILABLE_IN_EPHEMERAL_HARNESS".to_string(), None)
 }
 
 /// RFC 5480 ASN.1 DER SubjectPublicKeyInfo 26-byte prefix for `id-ecPublicKey` (`1.2.840.10045.2.1`)
@@ -1503,7 +1770,8 @@ pub fn verify_kiosk_passport(
         ntp_sync: &passport.ntp_sync,
         policy_id: &passport.policy_id,
         policy_sequence: passport.policy_sequence,
-        binary_dep_v0_sha256: &passport.binary_dep_v0_sha256,
+        binary_exe_sha256: &passport.binary_exe_sha256,
+        binary_dep_v0_sha256: passport.binary_dep_v0_sha256.as_deref(),
         sanitized_files: &passport.sanitized_files,
         signature_algorithm: &passport.signature_algorithm,
         public_key_blob_hex: &passport.public_key_blob_hex,
@@ -1533,9 +1801,12 @@ pub fn verify_kiosk_passport(
     canonical_passport.ecdsa_p256_signature_hex = canonical_passport
         .ecdsa_p256_signature_hex
         .to_ascii_lowercase();
-    if canonical_passport.binary_dep_v0_sha256 != "UNAVAILABLE_IN_EPHEMERAL_HARNESS" {
-        canonical_passport.binary_dep_v0_sha256 =
-            canonical_passport.binary_dep_v0_sha256.to_ascii_lowercase();
+    if canonical_passport.binary_exe_sha256 != "UNAVAILABLE_IN_EPHEMERAL_HARNESS" {
+        canonical_passport.binary_exe_sha256 =
+            canonical_passport.binary_exe_sha256.to_ascii_lowercase();
+    }
+    if let Some(dep_hash) = canonical_passport.binary_dep_v0_sha256.as_mut() {
+        *dep_hash = dep_hash.to_ascii_lowercase();
     }
     for f in &mut canonical_passport.sanitized_files {
         f.sha256 = f.sha256.to_ascii_lowercase();

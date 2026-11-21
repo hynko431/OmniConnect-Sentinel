@@ -8,7 +8,8 @@ use tracing::{info, warn};
 
 use sentinel_sys::{
     disable_device_node, disable_usb_interface, enumerate_usb_pnp_devices, get_removable_drives,
-    register_pnp_notification_watcher, PnpNotificationGuard, UsbPnpDeviceInfo,
+    register_pnp_notification_watcher, resolve_volume_usb_topology, PnpNotificationGuard,
+    UsbPnpDeviceInfo,
 };
 
 use crate::events::{ConnectionVector, DeviceConnectedEvent, UsbInterfaceDescriptor};
@@ -160,6 +161,7 @@ impl DeviceInterceptor for LinuxUdevInterceptor {
                                 vid: dev.vid,
                                 pid: dev.pid,
                                 serial: dev.serial.clone(),
+                                device_instance_id: Some(dev.instance_id.clone()),
                                 interfaces: Self::build_interfaces(dev, &dev.instance_id),
                             },
                             raw_mount_point: None,
@@ -186,29 +188,55 @@ impl DeviceInterceptor for LinuxUdevInterceptor {
                     *known = current_set;
                 }
 
-                let primary_usb = usb_devs.first().cloned();
+                // Attribute each arrived mount strictly via `/sys/block/<dev>/device` canonical
+                // sysfs topology (`CSE-24` — NEVER guessing via `usb_devs.first()`).
                 for mount_path in newly_arrived {
-                    let (vid, pid, serial, interfaces) = if let Some(ref dev) = primary_usb {
-                        (
-                            dev.vid,
-                            dev.pid,
-                            dev.serial.clone(),
-                            Self::build_interfaces(dev, &mount_path),
-                        )
-                    } else {
-                        (
-                            0x0000,
-                            0x0000,
-                            format!("UDEV-{mount_path}"),
-                            vec![UsbInterfaceDescriptor {
-                                interface_number: 0,
-                                interface_class: 0x08,
-                                interface_subclass: 0x06,
-                                protocol: 0x50,
-                                description: mount_path.clone(),
-                            }],
-                        )
-                    };
+                    let topo = resolve_volume_usb_topology(std::path::Path::new(&mount_path));
+                    let matched_dev = topo.as_ref().and_then(|t| {
+                        usb_devs
+                            .iter()
+                            .find(|d| d.instance_id == t.instance_id)
+                            .cloned()
+                    });
+                    let (vid, pid, serial, device_instance_id, interfaces) =
+                        if let Some(ref dev) = matched_dev {
+                            (
+                                dev.vid,
+                                dev.pid,
+                                dev.serial.clone(),
+                                Some(dev.instance_id.clone()),
+                                Self::build_interfaces(dev, &mount_path),
+                            )
+                        } else if let Some(t) = topo {
+                            let desc = t.device_desc.unwrap_or_else(|| mount_path.clone());
+                            (
+                                t.vid,
+                                t.pid,
+                                t.serial,
+                                Some(t.instance_id),
+                                vec![UsbInterfaceDescriptor {
+                                    interface_number: 0,
+                                    interface_class: 0x08,
+                                    interface_subclass: 0x06,
+                                    protocol: 0x50,
+                                    description: desc,
+                                }],
+                            )
+                        } else {
+                            (
+                                0x0000,
+                                0x0000,
+                                format!("UDEV-{mount_path}"),
+                                None,
+                                vec![UsbInterfaceDescriptor {
+                                    interface_number: 0,
+                                    interface_class: 0x08,
+                                    interface_subclass: 0x06,
+                                    protocol: 0x50,
+                                    description: mount_path.clone(),
+                                }],
+                            )
+                        };
 
                     let event = DeviceConnectedEvent {
                         connection_id: uuid::Uuid::new_v4(),
@@ -217,6 +245,7 @@ impl DeviceInterceptor for LinuxUdevInterceptor {
                             vid,
                             pid,
                             serial,
+                            device_instance_id,
                             interfaces,
                         },
                         raw_mount_point: Some(PathBuf::from(&mount_path)),

@@ -7,13 +7,24 @@ use tracing::info;
 use tracing::warn;
 
 use sentinel_sys::{
-    read_registry_string, sign_ecdsa_p256_with_private_blob, verify_ecdsa_p256_digest,
+    create_restricted_dir_atomic, create_restricted_file_atomic,
+    ensure_not_symlink_or_reparse_point, read_registry_string, sign_ecdsa_p256_with_private_blob,
+    verify_ecdsa_p256_digest,
 };
 
 use crate::enterprise::ledger::{AuditLedger, AuditSubsystem, SharedAuditLedger};
 use crate::error::{DegradationEvent, SentinelError};
 
 const SENTINEL_POLICY_REG_SUBKEY: &str = r"SOFTWARE\Policies\OmniConnect\Sentinel";
+/// Windows PolicyManager CSP registry path populated by Microsoft Intune OMA-URI
+/// `./Device/Vendor/MSFT/Policy/Config/OmniConnectSentinel/SignedPolicyBundleJson` (`CSE-26`).
+pub const INTUNE_POLICY_MANAGER_REG_SUBKEY: &str =
+    r"SOFTWARE\Microsoft\PolicyManager\current\device\OmniConnectSentinel";
+
+/// Maximum allowed emergency break-glass token validity window (4 hours) (`CSE-26`).
+pub const BREAK_GLASS_MAX_TTL_SECS: i64 = 4 * 60 * 60;
+/// Maximum allowed forward clock skew on break-glass token `issued_at_unix` (60 seconds) (`CSE-26`).
+pub const BREAK_GLASS_MAX_FUTURE_SKEW_SECS: i64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -525,9 +536,14 @@ impl IntunePolicyManager {
 
         #[cfg(windows)]
         {
-            if let Some(bundle_json) =
-                read_registry_string(SENTINEL_POLICY_REG_SUBKEY, "SignedPolicyBundleJson")
-            {
+            // Check Microsoft Intune PolicyManager CSP path first, then enterprise GPO path (`CSE-26`):
+            // both require an ECDSA P-256 signed `SignedPolicyBundleJson` (unsigned scalar values are ignored).
+            let bundle_json_opt =
+                read_registry_string(INTUNE_POLICY_MANAGER_REG_SUBKEY, "SignedPolicyBundleJson")
+                    .or_else(|| {
+                        read_registry_string(SENTINEL_POLICY_REG_SUBKEY, "SignedPolicyBundleJson")
+                    });
+            if let Some(bundle_json) = bundle_json_opt {
                 match serde_json::from_str::<SignedPolicyBundle>(&bundle_json) {
                     Ok(bundle) => {
                         if let Err(e) = self.apply_signed_bundle(&bundle) {
@@ -591,6 +607,114 @@ impl IntunePolicyManager {
     /// Alias for `xml_escape`.
     pub fn escape_xml(raw: &str) -> String {
         Self::xml_escape(raw)
+    }
+
+    /// Reverses standard XML character entity escapes (`&lt;`, `&gt;`, `&quot;`, `&apos;`, `&amp;`)
+    /// when extracting `SignedPolicyBundleJson` from an Intune OMA-URI SyncML `<Data>` element (`CSE-26`).
+    pub fn xml_unescape(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        let mut rest = raw;
+        while let Some(amp_idx) = rest.find('&') {
+            out.push_str(&rest[..amp_idx]);
+            let after_amp = &rest[amp_idx..];
+            if let Some(tail) = after_amp.strip_prefix("&amp;") {
+                out.push('&');
+                rest = tail;
+            } else if let Some(tail) = after_amp.strip_prefix("&lt;") {
+                out.push('<');
+                rest = tail;
+            } else if let Some(tail) = after_amp.strip_prefix("&gt;") {
+                out.push('>');
+                rest = tail;
+            } else if let Some(tail) = after_amp.strip_prefix("&quot;") {
+                out.push('"');
+                rest = tail;
+            } else if let Some(tail) = after_amp.strip_prefix("&apos;") {
+                out.push('\'');
+                rest = tail;
+            } else {
+                out.push('&');
+                rest = &after_amp[1..];
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Exports an Intune OMA-URI SyncML profile embedding the cryptographically signed
+    /// `SignedPolicyBundleJson` at `./Device/Vendor/MSFT/Policy/Config/OmniConnectSentinel/SignedPolicyBundleJson`,
+    /// which is ingested directly by `load_active_policy()` via `INTUNE_POLICY_MANAGER_REG_SUBKEY` (`CSE-26`).
+    pub fn export_signed_oma_uri_profile_xml(
+        signed_bundle: &SignedPolicyBundle,
+    ) -> Result<String, String> {
+        let bundle_json = serde_json::to_string(signed_bundle)
+            .map_err(|e| format!("Failed serializing SignedPolicyBundle for OMA-URI XML: {e}"))?;
+        let escaped_bundle = Self::xml_escape(&bundle_json);
+        Ok(format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!-- OmniConnect Sentinel - Signed Microsoft Intune OMA-URI SyncML Policy Bundle -->
+<SyncBody>
+  <Replace>
+    <CmdID>1</CmdID>
+    <Item>
+      <Target>
+        <LocURI>./Device/Vendor/MSFT/Policy/Config/OmniConnectSentinel/SignedPolicyBundleJson</LocURI>
+      </Target>
+      <Meta>
+        <Format xmlns="syncml:metinf">chr</Format>
+      </Meta>
+      <Data>{escaped_bundle}</Data>
+    </Item>
+  </Replace>
+</SyncBody>"#
+        ))
+    }
+
+    /// Extracts a `SignedPolicyBundle` from an Intune OMA-URI SyncML XML payload containing
+    /// `./Device/Vendor/MSFT/Policy/Config/OmniConnectSentinel/SignedPolicyBundleJson`.
+    /// Unsigned OMA-URI profiles lacking `SignedPolicyBundleJson` fail closed (`CSE-26`).
+    pub fn parse_signed_bundle_from_oma_uri_xml(
+        xml: &str,
+    ) -> Result<SignedPolicyBundle, SentinelError> {
+        const TARGET_URI: &str =
+            "./Device/Vendor/MSFT/Policy/Config/OmniConnectSentinel/SignedPolicyBundleJson";
+        let uri_pos = xml.find(TARGET_URI).ok_or_else(|| {
+            SentinelError::PolicySignatureInvalid(
+                "Intune OMA-URI XML missing SignedPolicyBundleJson node (unsigned SyncML profiles are rejected)"
+                    .to_string(),
+            )
+        })?;
+        let after_uri = &xml[uri_pos + TARGET_URI.len()..];
+        let item_end = after_uri.find("</Item>").unwrap_or(after_uri.len());
+        let item_slice = &after_uri[..item_end];
+        let data_start = item_slice.find("<Data>").ok_or_else(|| {
+            SentinelError::PolicySignatureInvalid(
+                "Intune OMA-URI SignedPolicyBundleJson item missing <Data> element".to_string(),
+            )
+        })? + "<Data>".len();
+        let data_rest = &item_slice[data_start..];
+        let data_end = data_rest.find("</Data>").ok_or_else(|| {
+            SentinelError::PolicySignatureInvalid(
+                "Intune OMA-URI SignedPolicyBundleJson item missing </Data> closing tag"
+                    .to_string(),
+            )
+        })?;
+        let unescaped = Self::xml_unescape(data_rest[..data_end].trim());
+        serde_json::from_str::<SignedPolicyBundle>(&unescaped).map_err(|e| {
+            SentinelError::PolicySignatureInvalid(format!(
+                "Invalid SignedPolicyBundleJson inside Intune OMA-URI XML: {e}"
+            ))
+        })
+    }
+
+    /// Parses an Intune OMA-URI SyncML XML payload, verifies its ECDSA P-256 signature and
+    /// monotonic version against pinned enterprise roots, and activates the policy (`CSE-26`).
+    pub fn apply_signed_oma_uri_profile_xml(
+        &mut self,
+        xml: &str,
+    ) -> Result<IntuneMdmPolicy, SentinelError> {
+        let bundle = Self::parse_signed_bundle_from_oma_uri_xml(xml)?;
+        self.apply_signed_bundle(&bundle)
     }
 
     /// Exports a well-formed OMA-URI SyncML XML profile with all dynamic values XML-escaped (`BUG-CORE-08`, `Row 161`).
@@ -671,6 +795,291 @@ impl IntunePolicyManager {
             escaped_hw_ids,
             escaped_mode
         )
+    }
+}
+
+/// Verified activation metadata returned by `BreakGlassToken::verify` (`CSE-26`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BreakGlassVerificationOutcome {
+    pub token_id: String,
+    pub operator_id: String,
+    pub incident_ticket: String,
+    pub scope: String,
+    pub target_device_id: Option<String>,
+    pub expires_at_unix: i64,
+    pub nonce_sha256: String,
+}
+
+/// Cryptographically signed emergency break-glass token verified by `sentinel break-glass --token <PATH>`
+/// using FIPS 186-5 ECDSA P-256 against pinned enterprise root public keys, bounded TTL (`<= 4h`),
+/// and a persistent symlink-checked nonce replay store (`CSE-26`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BreakGlassToken {
+    pub token_id: String,
+    pub operator_id: String,
+    pub incident_ticket: String,
+    pub scope: String,
+    pub target_device_id: Option<String>,
+    pub issued_at_unix: i64,
+    pub expires_at_unix: i64,
+    pub nonce: String,
+    pub signer_public_key_hex: String,
+    pub signature_hex: String,
+}
+
+/// Default persistent replay-blocking nonce store path for `sentinel break-glass` (`CSE-26`).
+pub fn default_break_glass_nonce_store_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(pd) = std::env::var("ProgramData") {
+            let dir = PathBuf::from(pd).join("OmniConnect").join("Sentinel");
+            if create_restricted_dir_atomic(&dir).is_ok() {
+                return dir.join("break_glass_nonces.json");
+            }
+        }
+        if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+            let dir = PathBuf::from(lad).join("OmniConnect").join("Sentinel");
+            if create_restricted_dir_atomic(&dir).is_ok() {
+                return dir.join("break_glass_nonces.json");
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = PathBuf::from("/var/lib/omniconnect/sentinel");
+        if create_restricted_dir_atomic(&dir).is_ok() {
+            return dir.join("break_glass_nonces.json");
+        }
+    }
+    PathBuf::from(".sentinel_vault").join("break_glass_nonces.json")
+}
+
+impl BreakGlassToken {
+    /// Computes the unambiguous length-prefixed canonical SHA-256 signing digest binding every
+    /// break-glass token field (preventing cross-field delimiter smuggling) (`CSE-26`).
+    pub fn signing_digest(&self) -> [u8; 32] {
+        let (dev_present, dev_str) = match self.target_device_id.as_deref() {
+            Some(d) => (1u8, d),
+            None => (0u8, ""),
+        };
+        let payload = format!(
+            "SENTINEL-BREAK-GLASS-TOKEN-V1|id:{}:{}|op:{}:{}|tkt:{}:{}|sc:{}:{}|dev:{}:{}:{}|iat:{}|exp:{}|n:{}:{}|pk:{}:{}",
+            self.token_id.len(),
+            self.token_id,
+            self.operator_id.len(),
+            self.operator_id,
+            self.incident_ticket.len(),
+            self.incident_ticket,
+            self.scope.len(),
+            self.scope,
+            dev_present,
+            dev_str.len(),
+            dev_str,
+            self.issued_at_unix,
+            self.expires_at_unix,
+            self.nonce.len(),
+            self.nonce,
+            self.signer_public_key_hex.len(),
+            self.signer_public_key_hex,
+        );
+        let digest = Sha256::digest(payload.as_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+
+    /// Signs an already-populated `BreakGlassToken` (ignoring any prior `signature_hex`) (`CSE-26`).
+    pub fn sign(mut self, private_key_blob: &[u8], public_key_blob: &[u8]) -> Result<Self, String> {
+        self.signer_public_key_hex = hex::encode(public_key_blob);
+        self.signature_hex.clear();
+        let digest = self.signing_digest();
+        let sig_bytes = sign_ecdsa_p256_with_private_blob(private_key_blob, &digest)
+            .map_err(|e| format!("Failed signing BreakGlassToken with ECDSA P-256: {e}"))?;
+        self.signature_hex = hex::encode(sig_bytes);
+        Ok(self)
+    }
+
+    /// Verifies `self` against `trusted_root_public_keys`, enforces bounded TTL (`<= 4h`),
+    /// clock skew (`<= 60s`), expiration (`now_unix < expires_at_unix`), and consumes `self.nonce`
+    /// atomically in `nonce_store_path` to prevent token replay (`CSE-26`).
+    pub fn verify(
+        &self,
+        trusted_root_public_keys: &[Vec<u8>],
+        nonce_store_path: &Path,
+        now_unix: i64,
+    ) -> Result<BreakGlassVerificationOutcome, SentinelError> {
+        // 1. Validate required metadata fields and nonce hygiene
+        for (label, val) in [
+            ("token_id", self.token_id.as_str()),
+            ("operator_id", self.operator_id.as_str()),
+            ("incident_ticket", self.incident_ticket.as_str()),
+            ("scope", self.scope.as_str()),
+        ] {
+            if val.trim().is_empty() || val.chars().any(|c| c.is_control()) {
+                return Err(SentinelError::PolicySignatureInvalid(format!(
+                    "BREAK_GLASS_INVALID_FIELD: '{label}' must be non-empty without control characters"
+                )));
+            }
+        }
+        if let Some(ref dev) = self.target_device_id {
+            if dev.trim().is_empty() || dev.chars().any(|c| c.is_control()) {
+                return Err(SentinelError::PolicySignatureInvalid(
+                    "BREAK_GLASS_INVALID_FIELD: 'target_device_id' must be non-empty without control characters"
+                        .to_string(),
+                ));
+            }
+        }
+        if self.nonce.len() < 16
+            || self.nonce.len() > 128
+            || self.nonce != self.nonce.trim()
+            || !self.nonce.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(SentinelError::PolicySignatureInvalid(
+                "BREAK_GLASS_INVALID_NONCE: nonce must be 16..=128 ASCII graphic characters"
+                    .to_string(),
+            ));
+        }
+
+        // 2. Enforce bounded TTL, future skew, and expiration fail-closed
+        if self.issued_at_unix <= 0 || self.expires_at_unix <= self.issued_at_unix {
+            return Err(SentinelError::PolicySignatureInvalid(
+                "BREAK_GLASS_INVALID_TTL: expires_at_unix must be strictly greater than positive issued_at_unix"
+                    .to_string(),
+            ));
+        }
+        let ttl_secs = self.expires_at_unix.saturating_sub(self.issued_at_unix);
+        if ttl_secs > BREAK_GLASS_MAX_TTL_SECS {
+            return Err(SentinelError::PolicySignatureInvalid(format!(
+                "BREAK_GLASS_TTL_EXCEEDED: token TTL ({ttl_secs}s) exceeds maximum {BREAK_GLASS_MAX_TTL_SECS}s"
+            )));
+        }
+        if self.issued_at_unix > now_unix.saturating_add(BREAK_GLASS_MAX_FUTURE_SKEW_SECS) {
+            return Err(SentinelError::PolicySignatureInvalid(format!(
+                "BREAK_GLASS_FUTURE_ISSUED: issued_at_unix ({}) exceeds current time ({now_unix}) by > {BREAK_GLASS_MAX_FUTURE_SKEW_SECS}s",
+                self.issued_at_unix
+            )));
+        }
+        if now_unix >= self.expires_at_unix {
+            return Err(SentinelError::PolicySignatureInvalid(format!(
+                "BREAK_GLASS_EXPIRED: token '{}' expired at unix {} (now={now_unix})",
+                self.token_id, self.expires_at_unix
+            )));
+        }
+
+        // 3. Verify signer public key matches a pinned enterprise root and validate ECDSA P-256 signature
+        if trusted_root_public_keys.is_empty() {
+            return Err(SentinelError::PolicySignatureInvalid(
+                "BREAK_GLASS_NO_TRUSTED_ROOTS: zero pinned enterprise root keys configured"
+                    .to_string(),
+            ));
+        }
+        let signer_pk = hex::decode(&self.signer_public_key_hex).map_err(|e| {
+            SentinelError::PolicySignatureInvalid(format!(
+                "BREAK_GLASS_BAD_PUBKEY_HEX: invalid signer_public_key_hex: {e}"
+            ))
+        })?;
+        let matched_root = trusted_root_public_keys
+            .iter()
+            .find(|root| root.len() == signer_pk.len() && bool::from(root.as_slice().ct_eq(&signer_pk)))
+            .ok_or_else(|| {
+                SentinelError::PolicySignatureInvalid(format!(
+                    "BREAK_GLASS_UNTRUSTED_SIGNER: token '{}' signer public key does not match any pinned enterprise root",
+                    self.token_id
+                ))
+            })?;
+
+        let sig_bytes = hex::decode(&self.signature_hex).map_err(|e| {
+            SentinelError::PolicySignatureInvalid(format!(
+                "BREAK_GLASS_BAD_SIG_HEX: invalid signature_hex: {e}"
+            ))
+        })?;
+        let digest = self.signing_digest();
+        let verified =
+            verify_ecdsa_p256_digest(matched_root, &digest, &sig_bytes).map_err(|e| {
+                SentinelError::PolicySignatureInvalid(format!(
+                    "BREAK_GLASS_CRYPTO_ERROR: ECDSA P-256 verification error: {e}"
+                ))
+            })?;
+        if !verified {
+            return Err(SentinelError::PolicySignatureInvalid(format!(
+                "BREAK_GLASS_SIGNATURE_INVALID: ECDSA P-256 signature invalid for token '{}'",
+                self.token_id
+            )));
+        }
+
+        // 4. Persistent symlink-checked replay-blocking nonce store (fail closed on tamper/symlink/replay)
+        if let Some(parent) = nonce_store_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if parent.exists() {
+                    ensure_not_symlink_or_reparse_point(parent).map_err(|e| {
+                        SentinelError::PolicySignatureInvalid(format!(
+                            "BREAK_GLASS_NONCE_STORE_SYMLINK: parent directory rejected: {e}"
+                        ))
+                    })?;
+                } else {
+                    create_restricted_dir_atomic(parent).map_err(|e| {
+                        SentinelError::PolicySignatureInvalid(format!(
+                            "BREAK_GLASS_NONCE_STORE_IO: failed creating parent directory: {e}"
+                        ))
+                    })?;
+                }
+            }
+        }
+        let mut consumed: std::collections::HashMap<String, i64> = if nonce_store_path.exists() {
+            ensure_not_symlink_or_reparse_point(nonce_store_path).map_err(|e| {
+                SentinelError::PolicySignatureInvalid(format!(
+                    "BREAK_GLASS_NONCE_STORE_SYMLINK: nonce store rejected: {e}"
+                ))
+            })?;
+            let raw = std::fs::read_to_string(nonce_store_path).map_err(|e| {
+                SentinelError::PolicySignatureInvalid(format!(
+                    "BREAK_GLASS_NONCE_STORE_IO: failed reading nonce store: {e}"
+                ))
+            })?;
+            serde_json::from_str(&raw).map_err(|e| {
+                SentinelError::PolicySignatureInvalid(format!(
+                    "BREAK_GLASS_NONCE_STORE_CORRUPT: refusing to reset corrupted nonce replay store: {e}"
+                ))
+            })?
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        if consumed.contains_key(&self.nonce) {
+            return Err(SentinelError::PolicySignatureInvalid(format!(
+                "BREAK_GLASS_NONCE_REPLAY: token '{}' nonce has already been consumed",
+                self.token_id
+            )));
+        }
+
+        // Prune only entries strictly expired by > 24h when store grows large; NEVER drop unexpired nonces
+        if consumed.len() >= 8_192 {
+            let prune_cutoff = now_unix.saturating_sub(86_400);
+            consumed.retain(|_, exp| *exp > prune_cutoff);
+        }
+        consumed.insert(self.nonce.clone(), self.expires_at_unix);
+        let serialized = serde_json::to_string_pretty(&consumed).map_err(|e| {
+            SentinelError::PolicySignatureInvalid(format!(
+                "BREAK_GLASS_NONCE_STORE_IO: serialization failed: {e}"
+            ))
+        })?;
+        create_restricted_file_atomic(nonce_store_path, serialized.as_bytes()).map_err(|e| {
+            SentinelError::PolicySignatureInvalid(format!(
+                "BREAK_GLASS_NONCE_STORE_IO: failed persisting consumed nonce atomically: {e}"
+            ))
+        })?;
+
+        let nonce_sha256 = hex::encode(Sha256::digest(self.nonce.as_bytes()));
+        Ok(BreakGlassVerificationOutcome {
+            token_id: self.token_id.clone(),
+            operator_id: self.operator_id.clone(),
+            incident_ticket: self.incident_ticket.clone(),
+            scope: self.scope.clone(),
+            target_device_id: self.target_device_id.clone(),
+            expires_at_unix: self.expires_at_unix,
+            nonce_sha256,
+        })
     }
 }
 

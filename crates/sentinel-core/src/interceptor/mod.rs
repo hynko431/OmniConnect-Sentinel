@@ -63,11 +63,23 @@ pub struct IssuedBadUsbChallenge {
 /// composite HID+Storage or newly connected input devices disabled via `CM_Disable_DevNode`.
 pub struct PendingDeviceConfirmationManager {
     state_file: PathBuf,
+    device_enabler: fn(&str) -> io::Result<()>,
 }
 
 impl PendingDeviceConfirmationManager {
     pub fn new(state_file: PathBuf) -> Self {
-        Self { state_file }
+        Self {
+            state_file,
+            device_enabler: sentinel_sys::enable_device_node,
+        }
+    }
+
+    /// Overrides the OS device re-enable callback (for deterministic unit/integration testing
+    /// without synthetic USB PnP hardware nodes) (`CSE-26`). Production callers use the default
+    /// `sentinel_sys::enable_device_node`.
+    pub fn with_device_enabler(mut self, device_enabler: fn(&str) -> io::Result<()>) -> Self {
+        self.device_enabler = device_enabler;
+        self
     }
 
     pub fn default_state_file() -> PathBuf {
@@ -318,15 +330,17 @@ impl PendingDeviceConfirmationManager {
             }
         }
 
-        // Successful validation: mark confirmed, purge secret token file, and re-enable device node
+        // Re-enable the OS device node BEFORE marking confirmed or purging the challenge token (`CSE-26`):
+        // strictly propagate OS errors (e.g. non-admin PermissionDenied or unplugged NotFound) rather
+        // than swallowing failures and falsely reporting success.
+        (self.device_enabler)(device_id)?;
+
+        // Successful validation + hardware re-enable: mark confirmed and purge secret token file
         entry.confirmed = true;
         let challenge_id = entry.challenge_id.clone();
         self.save_map(&map)?;
         self.purge_token_file(&challenge_id);
 
-        if let Err(e) = sentinel_sys::enable_device_node(device_id) {
-            tracing::warn!("enable_device_node notice for {device_id}: {e}");
-        }
         Ok(())
     }
 

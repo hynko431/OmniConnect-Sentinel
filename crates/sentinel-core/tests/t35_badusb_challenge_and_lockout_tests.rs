@@ -81,7 +81,7 @@ fn test_128bit_challenge_generation_and_entropy() {
 fn test_successful_confirmation_and_token_cleanup() {
     let tmp = tempdir().expect("tempdir");
     let state_file = tmp.path().join("pending_confirmations.json");
-    let mgr = PendingDeviceConfirmationManager::new(state_file);
+    let mgr = PendingDeviceConfirmationManager::new(state_file).with_device_enabler(|_| Ok(()));
 
     let device_id = "USB\\VID_1234&PID_5678\\SN001";
     let issued = mgr
@@ -121,7 +121,7 @@ fn test_successful_confirmation_and_token_cleanup() {
 fn test_3_strike_lockout_and_fail_closed() {
     let tmp = tempdir().expect("tempdir");
     let state_file = tmp.path().join("pending_confirmations.json");
-    let mgr = PendingDeviceConfirmationManager::new(state_file);
+    let mgr = PendingDeviceConfirmationManager::new(state_file).with_device_enabler(|_| Ok(()));
 
     let device_id = "USB\\VID_9999&PID_8888\\BADUSB01";
     let issued = mgr
@@ -251,5 +251,29 @@ fn test_secret_token_never_in_telemetry_or_logs() {
     assert!(
         audit_event.contains(&challenge.challenge_id),
         "Audit log event must contain public challenge_id"
+    );
+}
+
+#[test]
+fn test_enable_device_node_error_propagates_fail_closed() {
+    let tmp = tempdir().expect("tempdir");
+    let state_file = tmp.path().join("pending_confirmations_fail_closed.json");
+    // Production default PendingDeviceConfirmationManager invokes real `sentinel_sys::enable_device_node`
+    let mgr = PendingDeviceConfirmationManager::new(state_file);
+
+    let nonexistent_device_id = r"USB\VID_DEAD&PID_BEEF\NONEXISTENT_CSE26_NODE";
+    let issued = mgr
+        .request_user_presence_challenge_extended(nonexistent_device_id)
+        .expect("request challenge");
+
+    let confirm_res =
+        mgr.confirm_device_with_challenge(nonexistent_device_id, &issued.challenge_token);
+    assert!(
+        confirm_res.is_err(),
+        "CSE-26: confirm_device_with_challenge MUST propagate sentinel_sys::enable_device_node errors instead of swallowing them!"
+    );
+    assert!(
+        !mgr.is_confirmed(nonexistent_device_id),
+        "CSE-26: device MUST NOT be marked confirmed when OS enable_device_node fails"
     );
 }

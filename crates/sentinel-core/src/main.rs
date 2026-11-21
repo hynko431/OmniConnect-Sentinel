@@ -2,7 +2,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -31,14 +31,35 @@ fn append_system_ledger(shared_ledger: &SharedAuditLedger, event: &str, msg: &st
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::registry()
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let run_as_windows_service = std::env::args().any(|arg| arg == "--service");
+    if run_as_windows_service {
+        sentinel_sys::run_windows_service(
+            sentinel_sys::SENTINEL_WINDOWS_SERVICE_NAME,
+            |shutdown_flag| {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(run_agent(shutdown_flag))
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            },
+        )?;
+        return Ok(());
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(run_agent(Arc::new(AtomicBool::new(false))))
+}
+
+async fn run_agent(shutdown_flag: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info,sentinel_core=debug".into()),
         ))
         .with(tracing_subscriber::fmt::layer())
-        .init();
+        .try_init();
 
     info!("===========================================================");
     info!("   OmniConnect Sentinel - Universal Device Interceptor     ");
@@ -129,6 +150,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Initialize VFS Provider (ProjFS on Windows with Read-Once Encrypted Shadow Cache)
     let vfs_provider = resolve_best_vfs_provider_with_ledger(Some(shared_ledger.clone()));
     info!("Active VFS Provider: {}", vfs_provider.provider_name());
+    info!(
+        "SafeDrive Virtual Mount Path: {}",
+        config.safe_drive_mount_path.display()
+    );
 
     // 5. Initialize Tier 1 CDR Client (Sandboxed Pipe Worker default), Quarantine Vault, Confirmation Manager, Metrics, and Falcon SIEM Bridge
     let cdr_client = Arc::new(Tier1CdrClient::new(Default::default()));
@@ -146,10 +171,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let confirmation_mgr = PendingDeviceConfirmationManager::new(
         PendingDeviceConfirmationManager::default_state_file(),
     );
-    let falcon_bridge = Arc::new(
-        CrowdStrikeFalconBridge::new(&config.siem_syslog_endpoint)
-            .with_shared_ledger(shared_ledger.clone()),
+    let mut falcon_builder = CrowdStrikeFalconBridge::new(&config.siem_syslog_endpoint)
+        .with_shared_ledger(shared_ledger.clone());
+    if !config.siem_allowed_private_cidrs.is_empty() {
+        let mut parsed_cidrs = Vec::new();
+        for cidr_str in &config.siem_allowed_private_cidrs {
+            match sentinel_core::enterprise::falcon::AllowedCidr::parse(cidr_str) {
+                Ok(cidr) => parsed_cidrs.push(cidr),
+                Err(e) => warn!("Ignoring invalid SIEM CIDR '{cidr_str}': {e}"),
+            }
+        }
+        if !parsed_cidrs.is_empty() {
+            falcon_builder = falcon_builder.with_allowed_private_cidrs(parsed_cidrs);
+        }
+    }
+    if let Some(ca_path) = &config.siem_ca_cert_path {
+        match sentinel_sys::ensure_not_symlink_or_reparse_point(ca_path)
+            .and_then(|()| std::fs::read(ca_path))
+        {
+            Ok(bytes) => falcon_builder = falcon_builder.with_custom_ca(bytes),
+            Err(e) => {
+                let msg = format!(
+                    "Failed loading SIEM custom CA PEM '{}': {e}",
+                    ca_path.display()
+                );
+                warn!("{msg}");
+                falcon_builder = falcon_builder.with_tls_config_error(msg);
+            }
+        }
+    }
+    match (&config.siem_client_cert_path, &config.siem_client_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_res = sentinel_sys::ensure_not_symlink_or_reparse_point(cert_path)
+                .and_then(|()| std::fs::read(cert_path));
+            let key_res = sentinel_sys::ensure_not_symlink_or_reparse_point(key_path)
+                .and_then(|()| std::fs::read(key_path));
+            match (cert_res, key_res) {
+                (Ok(cert_pem), Ok(key_pem)) => {
+                    falcon_builder = falcon_builder.with_client_mtls(cert_pem, key_pem);
+                }
+                (Err(e), _) => {
+                    let msg = format!(
+                        "Failed loading SIEM mTLS client certificate PEM '{}': {e}",
+                        cert_path.display()
+                    );
+                    warn!("{msg}");
+                    falcon_builder = falcon_builder.with_tls_config_error(msg);
+                }
+                (_, Err(e)) => {
+                    let msg = format!(
+                        "Failed loading SIEM mTLS client private key PEM '{}': {e}",
+                        key_path.display()
+                    );
+                    warn!("{msg}");
+                    falcon_builder = falcon_builder.with_tls_config_error(msg);
+                }
+            }
+        }
+        (Some(cert_path), None) => {
+            let msg = format!(
+                "Partial SIEM mTLS config: siem_client_cert_path '{}' set without siem_client_key_path",
+                cert_path.display()
+            );
+            warn!("{msg}");
+            falcon_builder = falcon_builder
+                .with_client_mtls_optional(Some(Vec::new()), None)
+                .with_tls_config_error(msg);
+        }
+        (None, Some(key_path)) => {
+            let msg = format!(
+                "Partial SIEM mTLS config: siem_client_key_path '{}' set without siem_client_cert_path",
+                key_path.display()
+            );
+            warn!("{msg}");
+            falcon_builder = falcon_builder
+                .with_client_mtls_optional(None, Some(Vec::new()))
+                .with_tls_config_error(msg);
+        }
+        (None, None) => {}
+    }
+    let falcon_bridge = Arc::new(falcon_builder);
+    info!(
+        "SIEM Falcon Bridge initialized (endpoint={}, mtls_enforced={})",
+        config.siem_syslog_endpoint,
+        falcon_bridge.is_mtls_enforced()
     );
+    // CSE-23: Drain buffered SIEM spool records immediately on agent startup
+    match falcon_bridge.flush_spool() {
+        Ok(flushed) if flushed > 0 => {
+            info!("Flushed {flushed} buffered SIEM telemetry record(s) on agent startup");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!("Startup SIEM spool flush deferred: {e}");
+        }
+    }
     let metrics = Arc::new(SentinelMetrics::default());
 
     // 6. Start Universal Hardware Interceptor (retaining tx in background task - BUG-CORE-01)
@@ -161,12 +277,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     reconcile_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     reconcile_interval.tick().await; // consume initial tick
 
+    // 8. 250ms SCM Shutdown Signal Poll (ensures graceful teardown on SERVICE_CONTROL_STOP/SHUTDOWN) (`CSE-26`)
+    let mut scm_shutdown_poll = tokio::time::interval(Duration::from_millis(250));
+    scm_shutdown_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    scm_shutdown_poll.tick().await;
+
     info!("Sentinel Agent running. Zero BSOD risk: 100% userspace execution.");
     info!("Monitoring physical wire, LAN, Wi-Fi, and Bluetooth channels...");
 
-    // Event Loop (BUG-CORE-01 + Phase 0.1/3.1/4.5 60s posture reconciliation & heartbeat beacon)
+    // Event Loop (BUG-CORE-01 + Phase 0.1/3.1/4.5 60s posture reconciliation & heartbeat beacon + CSE-26 SCM stop)
     loop {
+        if shutdown_flag.load(Ordering::Acquire) {
+            info!("Windows SCM shutdown signal received; tearing down Sentinel Agent cleanly.");
+            break;
+        }
         tokio::select! {
+            _ = scm_shutdown_poll.tick() => {
+                if shutdown_flag.load(Ordering::Acquire) {
+                    info!("Windows SCM shutdown signal received; tearing down Sentinel Agent cleanly.");
+                    break;
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl+C shutdown signal received; tearing down Sentinel Agent cleanly.");
+                break;
+            }
             maybe_event = event_rx.recv() => {
                 let event = match maybe_event {
                     Some(ev) => ev,
@@ -179,26 +314,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         vid,
                         pid,
                         serial,
+                        device_instance_id,
                         interfaces,
                     } => {
                         let has_hid = interfaces.iter().any(|i| i.interface_class == 0x03);
                         let has_storage = interfaces.iter().any(|i| i.interface_class == 0x08);
-                        let device_id = format!("USB\\VID_{vid:04X}&PID_{pid:04X}\\{serial}");
+                        let policy_hw_id = format!("USB\\VID_{vid:04X}&PID_{pid:04X}\\{serial}");
+                        // CSE-24 / CSE-25: Use the exact OS-attributed device node ID (Windows
+                        // `USB\VID_...` instance ID or Linux canonical sysfs bus-port `1-2.3`)
+                        // when disabling hardware rather than fabricating Windows IDs on Linux.
+                        let os_node_id = match device_instance_id.as_deref() {
+                            Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+                            _ => {
+                                #[cfg(windows)]
+                                {
+                                    policy_hw_id.clone()
+                                }
+                                #[cfg(not(windows))]
+                                {
+                                    if sentinel_sys::is_valid_linux_usb_bus_port(serial.trim()) {
+                                        serial.trim().to_string()
+                                    } else {
+                                        String::new()
+                                    }
+                                }
+                            }
+                        };
 
-                        // 1. Hardware ID Allowlist Enforcement (Row 141)
-                        if !sentinel_sys::is_hardware_id_allowed(&device_id, &intune_policy.allowed_hardware_ids) {
+                        // 1. Hardware ID Allowlist Enforcement (Row 141, CSE-24)
+                        let hw_allowed = sentinel_sys::is_hardware_id_allowed(
+                            &policy_hw_id,
+                            &intune_policy.allowed_hardware_ids,
+                        ) || sentinel_sys::is_hardware_id_allowed(
+                            &os_node_id,
+                            &intune_policy.allowed_hardware_ids,
+                        );
+                        if !hw_allowed {
                             warn!(
-                                "Unapproved USB Hardware ID {} rejected by policy — severing data lines!",
-                                device_id
+                                "Unapproved USB Hardware ID {} (node={}) rejected by policy — severing data lines!",
+                                policy_hw_id, os_node_id
                             );
                             metrics.sentinel_threats_total.fetch_add(1, Ordering::Relaxed);
-                            if let Err(e) = interceptor.sever_data_lines(&device_id).await {
-                                warn!("sever_data_lines failed for {}: {}", device_id, e);
+                            if let Err(e) = interceptor.sever_data_lines(&os_node_id).await {
+                                warn!("sever_data_lines failed for {}: {}", os_node_id, e);
                             }
                             append_system_ledger(
                                 &shared_ledger,
                                 "HARDWARE_ID_BLOCKED",
-                                &format!("Blocked unapproved hardware ID {device_id}"),
+                                &format!("Blocked unapproved hardware ID {policy_hw_id} (node={os_node_id})"),
                             );
                             continue;
                         }
@@ -207,18 +370,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if intune_policy.block_composite_hid_storage
                             && has_hid
                             && has_storage
-                            && !confirmation_mgr.is_confirmed(&device_id)
+                            && !confirmation_mgr.is_confirmed(&os_node_id)
                         {
                             warn!(
-                                "Composite HID+MassStorage BadUSB anomaly detected on {} — severing data lines and requiring user confirmation challenge!",
-                                device_id
+                                "Composite HID+MassStorage BadUSB anomaly detected on {} (node={}) — severing data lines and requiring user confirmation challenge!",
+                                policy_hw_id, os_node_id
                             );
                             metrics.sentinel_threats_total.fetch_add(1, Ordering::Relaxed);
-                            if let Err(e) = interceptor.sever_data_lines(&device_id).await {
-                                warn!("sever_data_lines failed for {}: {}", device_id, e);
+                            if let Err(e) = interceptor.sever_data_lines(&os_node_id).await {
+                                warn!("sever_data_lines failed for {}: {}", os_node_id, e);
                             }
                             let challenge_info = confirmation_mgr
-                                .request_user_presence_challenge_extended(&device_id);
+                                .request_user_presence_challenge_extended(&os_node_id);
                             let challenge_id = challenge_info
                                 .as_ref()
                                 .map(|c| c.challenge_id.as_str())
@@ -233,14 +396,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 file_sha256: None,
                                 action_taken: "SEVER_DATA_LINES_AWAITING_CONFIRMATION".to_string(),
                                 details: format!(
-                                    "Blocked composite device {device_id}; challenge_id={challenge_id}; physical console authorization token required (see pending_challenge_{challenge_id}.token)"
+                                    "Blocked composite device {policy_hw_id} (node={os_node_id}); challenge_id={challenge_id}; physical console authorization token required (see pending_challenge_{challenge_id}.token)"
                                 ),
                             });
                             append_system_ledger(
                                 &shared_ledger,
                                 "BADUSB_BLOCKED",
                                 &format!(
-                                    "Severed data lines for composite device {device_id}; challenge_id={challenge_id} issued"
+                                    "Severed data lines for composite device {policy_hw_id} (node={os_node_id}); challenge_id={challenge_id} issued"
                                 ),
                             );
                         } else if let Some(raw_mount) = &event.raw_mount_point {
@@ -271,7 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 warn!("set_volume_online_readonly({}) notice: {}", volume_target.display(), e);
                             }
 
-                            let virtual_mount = PathBuf::from(r"C:\OmniConnect\SafeDrive");
+                            let virtual_mount = config.safe_drive_mount_path.clone();
                             let mount_res = vfs_provider
                                 .mount_sanitized_volume(&volume_target, &virtual_mount)
                                 .await;
@@ -356,11 +519,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let current_posture = sentinel_sys::verify_system_posture();
                 if !current_posture.is_compliant() {
                     metrics.sentinel_policy_drift_total.fetch_add(1, Ordering::Relaxed);
-                    let _ = sentinel_sys::set_automount_disabled(true);
-                    let _ = sentinel_sys::apply_autoplay_suppression_policy();
-                    let _ = sentinel_sys::apply_usb_storage_and_install_policies(&intune_policy.allowed_hardware_ids);
-                    let _ = sentinel_sys::purge_stale_mounted_devices();
-                    let _ = sentinel_sys::cleanup_unapproved_usb_devices(&intune_policy.allowed_hardware_ids);
+                    if let Err(e) = sentinel_sys::set_automount_disabled(true) {
+                        warn!("60s reconcile set_automount_disabled failed: {e}");
+                    }
+                    if let Err(e) = sentinel_sys::apply_autoplay_suppression_policy() {
+                        warn!("60s reconcile apply_autoplay_suppression_policy failed: {e}");
+                    }
+                    if let Err(e) = sentinel_sys::apply_usb_storage_and_install_policies(
+                        &intune_policy.allowed_hardware_ids,
+                    ) {
+                        warn!("60s reconcile apply_usb_storage_and_install_policies failed: {e}");
+                    }
+                    if let Err(e) = sentinel_sys::purge_stale_mounted_devices() {
+                        warn!("60s reconcile purge_stale_mounted_devices failed: {e}");
+                    }
+                    if let Err(e) = sentinel_sys::cleanup_unapproved_usb_devices(
+                        &intune_policy.allowed_hardware_ids,
+                    ) {
+                        warn!("60s reconcile cleanup_unapproved_usb_devices failed: {e}");
+                    }
                     let _ = falcon_bridge.emit_alert(&FalconTelemetryEvent {
                         severity: 8,
                         signature_id: "POSTURE-DRIFT-001".to_string(),
@@ -395,13 +572,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(mut guard) = shared_ledger.lock() {
                     let _ = guard.emit_worm_checkpoint();
                 }
+                // CSE-23: Drain undelivered SIEM spool records during 60s reconciliation tick
+                match falcon_bridge.flush_spool() {
+                    Ok(flushed) if flushed > 0 => {
+                        info!(
+                            "Flushed {flushed} buffered SIEM telemetry record(s) during 60s reconciliation"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("Periodic SIEM spool flush deferred: {e}");
+                    }
+                }
             }
         }
     }
 
     // Teardown any active VFS projection and emit shutdown alert (`Row 1, 149, 190`)
     let _ = vfs_provider
-        .unmount_volume(&PathBuf::from(r"C:\OmniConnect\SafeDrive"))
+        .unmount_volume(&config.safe_drive_mount_path)
         .await;
     append_system_ledger(
         &shared_ledger,
