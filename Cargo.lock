@@ -2008,6 +2008,7 @@ dependencies = [
  "rsa",
  "serde",
  "sha2 0.10.9",
+ "sha3",
  "tracing",
  "windows-sys 0.61.2",
 ]

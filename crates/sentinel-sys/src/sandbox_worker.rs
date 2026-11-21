@@ -6,6 +6,54 @@ use std::process::Child;
 /// Default Named Pipe IPC endpoint replacing the retired TCP `127.0.0.1:50051` listener (`Master Plan v2 §0.2`, Rows 25–28).
 pub const DEFAULT_NAMED_PIPE_ENDPOINT: &str = r"\\.\pipe\OmniConnectSentinel";
 
+/// Default ACL-hardened Named Pipe IPC endpoint for `sentinel-cdr-daemon` on Windows (`CSE-22`).
+pub const DEFAULT_CDR_NAMED_PIPE_ENDPOINT: &str = r"\\.\pipe\OmniConnectSentinelCdr";
+
+/// Default mode-`0600` Unix Domain Socket IPC endpoint for `sentinel-cdr-daemon` on Linux (`CSE-22`).
+pub const DEFAULT_CDR_UNIX_SOCKET_PATH: &str = "/run/omniconnect/cdr.sock";
+
+/// Hardened Named Pipe server SDDL (`CSE-22`, `ADR-016`):
+/// Grants access strictly to `SYSTEM` (`SY`) and `Administrators` (`BA`).
+/// `ALL APPLICATION PACKAGES` (`AC`), `Authenticated Users` (`AU`), and `Everyone` (`WD`)
+/// are explicitly excluded so arbitrary Store/AppContainer processes cannot connect to the privileged CDR pipe.
+pub const NAMED_PIPE_SERVER_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+
+/// Returns `true` ONLY when the operator explicitly sets `SENTINEL_UNSAFE_DEV_SANDBOX=1` (`CSE-22`).
+/// Production builds NEVER silently downgrade CIG, Linux `unshare`, or Landlock sandboxing.
+pub fn is_unsafe_dev_sandbox_opt_in() -> bool {
+    std::env::var("SENTINEL_UNSAFE_DEV_SANDBOX")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Fail-closed evaluator for OS sandbox enforcement errors (`CSE-22`, `ADR-016`).
+///
+/// Always returns `Err(PermissionDenied)` unless `unsafe_dev_opt_in` is explicitly `true`
+/// (`SENTINEL_UNSAFE_DEV_SANDBOX=1`), in which case it emits a loud `POSTURE_REDUCED_SANDBOX`
+/// warning before allowing dev-only continuation.
+pub fn evaluate_sandbox_enforcement_failure(
+    component: &str,
+    err: io::Error,
+    unsafe_dev_opt_in: bool,
+) -> io::Result<()> {
+    if unsafe_dev_opt_in {
+        tracing::warn!(
+            "POSTURE_REDUCED_SANDBOX: {component} enforcement bypassed via SENTINEL_UNSAFE_DEV_SANDBOX=1 (error: {err})"
+        );
+        eprintln!(
+            "POSTURE_REDUCED_SANDBOX: {component} enforcement bypassed via SENTINEL_UNSAFE_DEV_SANDBOX=1 (error: {err})"
+        );
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "SANDBOX_FAIL_CLOSED: {component} failed ({err}); refusing to continue unsandboxed"
+            ),
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct JobSandboxConfig {
     pub memory_limit_bytes: usize,
@@ -295,6 +343,23 @@ extern "system" {
         nDefaultTimeOut: u32,
         lpSecurityAttributes: *const SecurityAttributes,
     ) -> isize;
+    fn ConnectNamedPipe(hNamedPipe: isize, lpOverlapped: *mut core::ffi::c_void) -> i32;
+    fn DisconnectNamedPipe(hNamedPipe: isize) -> i32;
+    fn FlushFileBuffers(hFile: isize) -> i32;
+    fn ReadFile(
+        hFile: isize,
+        lpBuffer: *mut u8,
+        nNumberOfBytesToRead: u32,
+        lpNumberOfBytesRead: *mut u32,
+        lpOverlapped: *mut core::ffi::c_void,
+    ) -> i32;
+    fn WriteFile(
+        hFile: isize,
+        lpBuffer: *const u8,
+        nNumberOfBytesToWrite: u32,
+        lpNumberOfBytesWritten: *mut u32,
+        lpOverlapped: *mut core::ffi::c_void,
+    ) -> i32;
     fn CreatePipe(
         hReadPipe: *mut isize,
         hWritePipe: *mut isize,
@@ -334,6 +399,8 @@ extern "system" {
     fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
     fn WaitForSingleObject(hHandle: isize, dwMilliseconds: u32) -> u32;
     fn GetExitCodeProcess(hProcess: isize, lpExitCode: *mut u32) -> i32;
+    fn GetCurrentProcessId() -> u32;
+    fn ProcessIdToSessionId(dwProcessId: u32, pSessionId: *mut u32) -> i32;
     fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
     fn QueryFullProcessImageNameW(
         hProcess: isize,
@@ -363,7 +430,25 @@ extern "system" {
         SecurityDescriptor: *mut *mut core::ffi::c_void,
         SecurityDescriptorSize: *mut u32,
     ) -> i32;
+    fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        SecurityDescriptor: *const core::ffi::c_void,
+        RequestedStringSDRevision: u32,
+        SecurityInformation: u32,
+        StringSecurityDescriptor: *mut *mut u16,
+        StringSecurityDescriptorLen: *mut u32,
+    ) -> i32;
+    fn GetSecurityInfo(
+        handle: isize,
+        ObjectType: u32,
+        SecurityInfo: u32,
+        ppsidOwner: *mut *mut core::ffi::c_void,
+        ppsidGroup: *mut *mut core::ffi::c_void,
+        ppDacl: *mut *mut core::ffi::c_void,
+        ppSacl: *mut *mut core::ffi::c_void,
+        ppSecurityDescriptor: *mut *mut core::ffi::c_void,
+    ) -> u32;
     fn FreeSid(pSid: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn IsValidSid(pSid: *mut core::ffi::c_void) -> i32;
 }
 
 #[cfg(windows)]
@@ -496,6 +581,68 @@ impl Drop for JobSandboxGuard {
     }
 }
 
+/// AppContainer SID derivation strategy selected from the host Windows Session ID (`CSE-26`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppContainerSessionStrategy {
+    /// Windows Session 0 (`NT AUTHORITY\SYSTEM` service): derive deterministic AppContainer SID
+    /// directly via `DeriveAppContainerSidFromAppContainerName` without requiring an interactive
+    /// `HKCU` user profile hive (which causes `CreateAppContainerProfile` to fail with
+    /// `E_ACCESSDENIED` / missing profile errors under `LocalSystem`).
+    DirectDeriveSessionZero,
+    /// Interactive desktop session (Session >= 1): create/reuse profile via `CreateAppContainerProfile`
+    /// and fall back to `DeriveAppContainerSidFromAppContainerName` on `ERROR_ALREADY_EXISTS` or
+    /// restricted profile contexts.
+    CreateOrDeriveInteractive,
+}
+
+/// Selects the appropriate AppContainer profile derivation strategy for a Windows Session ID (`CSE-26`).
+pub fn resolve_appcontainer_strategy_for_session(session_id: u32) -> AppContainerSessionStrategy {
+    if session_id == 0 {
+        AppContainerSessionStrategy::DirectDeriveSessionZero
+    } else {
+        AppContainerSessionStrategy::CreateOrDeriveInteractive
+    }
+}
+
+/// Returns the current Windows Session ID via `ProcessIdToSessionId(GetCurrentProcessId())`,
+/// or `None` on non-Windows hosts (`CSE-26`).
+pub fn current_process_session_id() -> Option<u32> {
+    #[cfg(windows)]
+    {
+        let mut session_id: u32 = 0;
+        let pid = unsafe { GetCurrentProcessId() };
+        if unsafe { ProcessIdToSessionId(pid, &mut session_id) } != 0 {
+            Some(session_id)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Verifies that the zero-capability AppContainer SID can be derived cleanly (including in
+/// Windows Session 0 without an interactive user profile hive) and validates it via `IsValidSid` (`CSE-26`).
+pub fn verify_appcontainer_sid_derivation() -> io::Result<bool> {
+    #[cfg(windows)]
+    {
+        let Some(sid) = obtain_zero_capability_appcontainer_sid() else {
+            return Ok(false);
+        };
+        let valid = unsafe { IsValidSid(sid) } != 0;
+        unsafe {
+            let _ = FreeSid(sid);
+        }
+        Ok(valid)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
+
 #[cfg(windows)]
 fn obtain_zero_capability_appcontainer_sid() -> Option<*mut core::ffi::c_void> {
     use std::os::windows::ffi::OsStrExt;
@@ -512,25 +659,57 @@ fn obtain_zero_capability_appcontainer_sid() -> Option<*mut core::ffi::c_void> {
         .chain(Some(0))
         .collect();
 
-    let mut sid: *mut core::ffi::c_void = core::ptr::null_mut();
-    let hr = unsafe {
-        CreateAppContainerProfile(
-            name.as_ptr(),
-            display.as_ptr(),
-            desc.as_ptr(),
-            core::ptr::null_mut(),
-            0,
-            &mut sid,
-        )
+    let session_id = current_process_session_id().unwrap_or(1);
+    let strategy = resolve_appcontainer_strategy_for_session(session_id);
+
+    let derive_direct = || -> Option<*mut core::ffi::c_void> {
+        let mut sid: *mut core::ffi::c_void = core::ptr::null_mut();
+        let hr_derive =
+            unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
+        if hr_derive == 0 && !sid.is_null() && unsafe { IsValidSid(sid) } != 0 {
+            Some(sid)
+        } else {
+            if !sid.is_null() {
+                unsafe {
+                    let _ = FreeSid(sid);
+                }
+            }
+            None
+        }
     };
-    if hr == 0 && !sid.is_null() {
-        return Some(sid);
+
+    let create_profile = || -> Option<*mut core::ffi::c_void> {
+        let mut sid: *mut core::ffi::c_void = core::ptr::null_mut();
+        let hr = unsafe {
+            CreateAppContainerProfile(
+                name.as_ptr(),
+                display.as_ptr(),
+                desc.as_ptr(),
+                core::ptr::null_mut(),
+                0,
+                &mut sid,
+            )
+        };
+        if hr == 0 && !sid.is_null() && unsafe { IsValidSid(sid) } != 0 {
+            Some(sid)
+        } else {
+            if !sid.is_null() {
+                unsafe {
+                    let _ = FreeSid(sid);
+                }
+            }
+            None
+        }
+    };
+
+    match strategy {
+        AppContainerSessionStrategy::DirectDeriveSessionZero => {
+            derive_direct().or_else(create_profile)
+        }
+        AppContainerSessionStrategy::CreateOrDeriveInteractive => {
+            create_profile().or_else(derive_direct)
+        }
     }
-    let hr_derive = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
-    if hr_derive == 0 && !sid.is_null() {
-        return Some(sid);
-    }
-    None
 }
 
 /// Spawns `sentinel-cdr-worker` using `CreateProcessW` with `CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW`:
@@ -646,17 +825,27 @@ pub fn spawn_sandboxed_worker_process(
             None
         };
 
-        // Attempt creation in strict fail-closed tier order:
-        // Tier 1: Full AppContainer + CIG + ACG + ChildProcessRestricted
-        // Tier 2: Full AppContainer + ACG + ExtensionPointDisable + ImageLoadNoRemote/NoLowLabel + ChildProcessRestricted (CIG disabled for unsigned/debug binaries)
-        // Under no circumstances is AppContainer omitted when config.enable_appcontainer is true!
-        let tiers: [(bool, bool); 2] = [
-            (
-                appcontainer_sid.is_some(),
-                config.enforce_microsoft_signed_dlls,
-            ),
-            (appcontainer_sid.is_some(), false),
-        ];
+        // Strict fail-closed single-tier launch (`CSE-22`, `ADR-016`):
+        // NEVER silently retry without CIG (`enforce_microsoft_signed_dlls`) or AppContainer.
+        // Relaxing CIG requires explicit operator opt-in via `SENTINEL_UNSAFE_DEV_SANDBOX=1`,
+        // which logs `POSTURE_REDUCED_SANDBOX`.
+        let use_appcontainer = appcontainer_sid.is_some();
+        let use_cig = if config.enforce_microsoft_signed_dlls {
+            if is_unsafe_dev_sandbox_opt_in() {
+                tracing::warn!(
+                    "POSTURE_REDUCED_SANDBOX: Windows CIG disabled for worker launch via SENTINEL_UNSAFE_DEV_SANDBOX=1"
+                );
+                eprintln!(
+                    "POSTURE_REDUCED_SANDBOX: Windows CIG disabled for worker launch via SENTINEL_UNSAFE_DEV_SANDBOX=1"
+                );
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        let tiers: [(bool, bool); 1] = [(use_appcontainer, use_cig)];
 
         let mut spawned_pi: Option<(ProcessInformation, JobSandboxGuard, bool, bool)> = None;
         let mut last_spawn_err: Option<io::Error> = None;
@@ -1007,12 +1196,18 @@ pub fn apply_worker_process_mitigations() -> io::Result<()> {
                 &flag_one as *const _ as *const core::ffi::c_void,
                 core::mem::size_of::<u32>(),
             ))?;
-            // Apply ProcessSignaturePolicy (CIG MicrosoftSignedOnly = 1); ignore only if unsigned test build
-            let _ = SetProcessMitigationPolicy(
+            // Apply ProcessSignaturePolicy (CIG MicrosoftSignedOnly = 1) fail-closed (`CSE-22`).
+            if let Err(err) = check_mitigation(SetProcessMitigationPolicy(
                 PROCESS_SIGNATURE_POLICY,
                 &flag_one as *const _ as *const core::ffi::c_void,
                 core::mem::size_of::<u32>(),
-            );
+            )) {
+                evaluate_sandbox_enforcement_failure(
+                    "windows_cig_process_signature_policy",
+                    err,
+                    is_unsafe_dev_sandbox_opt_in(),
+                )?;
+            }
         }
         Ok(())
     }
@@ -1026,71 +1221,85 @@ pub fn apply_worker_process_mitigations() -> io::Result<()> {
     }
 }
 
-/// Creates a local Named Pipe server handle (`\\.\pipe\OmniConnectSentinel`) protected by an explicit
-/// SDDL DACL (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AC)`), `FILE_FLAG_FIRST_PIPE_INSTANCE` (anti-squatting),
-/// and `PIPE_REJECT_REMOTE_CLIENTS` (`Row 26, 27`, Master Plan v2 §3.2.1.b.i).
+/// Internal helper creating an ACL-hardened Windows Named Pipe instance using
+/// `NAMED_PIPE_SERVER_SDDL` (`D:P(A;;GA;;;SY)(A;;GA;;;BA)` — zero `AC`/`AU`/`WD`)
+/// and `PIPE_REJECT_REMOTE_CLIENTS` (`CSE-22`, `ADR-016`).
+#[cfg(windows)]
+fn create_acl_named_pipe_server_instance(
+    pipe_name: &str,
+    first_instance: bool,
+) -> io::Result<isize> {
+    use std::os::windows::ffi::OsStrExt;
+    const SDDL_REVISION_1: u32 = 1;
+    const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+    const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+    const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
+    const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
+    const PIPE_WAIT: u32 = 0x0000_0000;
+    const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    let sddl_wide: Vec<u16> = std::ffi::OsStr::new(NAMED_PIPE_SERVER_SDDL)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let mut sd_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut sd_size: u32 = 0;
+    let ok_sddl = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd_ptr,
+            &mut sd_size,
+        )
+    };
+    if ok_sddl == 0 || sd_ptr.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+
+    let sa = SecurityAttributes {
+        n_length: core::mem::size_of::<SecurityAttributes>() as u32,
+        lp_security_descriptor: sd_ptr,
+        b_inherit_handle: 0,
+    };
+    let pipe_wide: Vec<u16> = std::ffi::OsStr::new(pipe_name)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let open_mode = if first_instance {
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
+    } else {
+        PIPE_ACCESS_DUPLEX
+    };
+    let handle = unsafe {
+        CreateNamedPipeW(
+            pipe_wide.as_ptr(),
+            open_mode,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            8, // Max instances bound to 8
+            64 * 1024,
+            64 * 1024,
+            5_000,
+            &sa,
+        )
+    };
+    unsafe {
+        let _ = LocalFree(sd_ptr);
+    }
+    if handle == INVALID_HANDLE_VALUE || handle == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(handle)
+}
+
+/// Creates a local Named Pipe server handle (`\\.\pipe\OmniConnectSentinelCdr`) protected by the
+/// hardened SDDL DACL `D:P(A;;GA;;;SY)(A;;GA;;;BA)` (zero `AC`/`AU`/`WD`),
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE` (anti-squatting), and `PIPE_REJECT_REMOTE_CLIENTS`
+/// (`CSE-22`, `ADR-016`, `Row 26, 27`).
 pub fn create_acl_named_pipe_server(pipe_name: &str) -> io::Result<isize> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        const SDDL_REVISION_1: u32 = 1;
-        const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
-        const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
-        const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
-        const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
-        const PIPE_WAIT: u32 = 0x0000_0000;
-        const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
-        const INVALID_HANDLE_VALUE: isize = -1;
-
-        // Tightened SDDL DACL: SYSTEM (SY), Administrators (BA), and AppContainer packages (AC).
-        // Authenticated Users (AU) is strictly removed to prevent unprivileged local IPC tampering.
-        let sddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AC)";
-        let sddl_wide: Vec<u16> = std::ffi::OsStr::new(sddl)
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        let mut sd_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
-        let mut sd_size: u32 = 0;
-        let ok_sddl = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl_wide.as_ptr(),
-                SDDL_REVISION_1,
-                &mut sd_ptr,
-                &mut sd_size,
-            )
-        };
-        if ok_sddl == 0 || sd_ptr.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-
-        let sa = SecurityAttributes {
-            n_length: core::mem::size_of::<SecurityAttributes>() as u32,
-            lp_security_descriptor: sd_ptr,
-            b_inherit_handle: 0,
-        };
-        let pipe_wide: Vec<u16> = std::ffi::OsStr::new(pipe_name)
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        let handle = unsafe {
-            CreateNamedPipeW(
-                pipe_wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                8, // Max instances bound to 8
-                64 * 1024,
-                64 * 1024,
-                5_000,
-                &sa,
-            )
-        };
-        unsafe {
-            let _ = LocalFree(sd_ptr);
-        }
-        if handle == INVALID_HANDLE_VALUE || handle == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(handle)
+        create_acl_named_pipe_server_instance(pipe_name, true)
     }
     #[cfg(not(windows))]
     {
@@ -1099,6 +1308,453 @@ pub fn create_acl_named_pipe_server(pipe_name: &str) -> io::Result<isize> {
             io::ErrorKind::Unsupported,
             "Windows Named Pipe creation is only supported on Windows",
         ))
+    }
+}
+
+/// Queries the live OS kernel DACL SDDL string of an open kernel object handle (such as a Windows
+/// Named Pipe handle) via `GetSecurityInfo(SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION)` (`CSE-22`).
+pub fn query_kernel_handle_dacl_sddl(handle: isize) -> io::Result<String> {
+    #[cfg(windows)]
+    {
+        const SE_KERNEL_OBJECT: u32 = 6;
+        const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+        const SDDL_REVISION_1: u32 = 1;
+
+        let mut sd_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        let rc = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                &mut sd_ptr,
+            )
+        };
+        if rc != 0 || sd_ptr.is_null() {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+
+        let mut sddl_ptr: *mut u16 = core::ptr::null_mut();
+        let mut sddl_len: u32 = 0;
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd_ptr,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl_ptr,
+                &mut sddl_len,
+            )
+        };
+        unsafe {
+            let _ = LocalFree(sd_ptr);
+        }
+        if ok == 0 || sddl_ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let slice = unsafe { core::slice::from_raw_parts(sddl_ptr, sddl_len as usize) };
+        let sddl = String::from_utf16_lossy(slice)
+            .trim_end_matches('\0')
+            .to_string();
+        unsafe {
+            let _ = LocalFree(sddl_ptr as *mut core::ffi::c_void);
+        }
+        Ok(sddl)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = handle;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Kernel handle SDDL inspection is Windows-specific",
+        ))
+    }
+}
+
+/// Closes a raw Windows kernel handle safely across crate boundaries without exposing `unsafe`.
+pub fn close_raw_kernel_handle(handle: isize) {
+    #[cfg(windows)]
+    {
+        if handle != 0 && handle != -1 {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = handle;
+    }
+}
+
+/// Connected local IPC stream (`\\.\pipe\...` on Windows or Unix Domain Socket on Linux) (`CSE-22`).
+pub struct LocalIpcStream {
+    #[cfg(windows)]
+    handle: isize,
+    #[cfg(windows)]
+    is_server_side: bool,
+    #[cfg(unix)]
+    stream: std::os::unix::net::UnixStream,
+}
+
+impl LocalIpcStream {
+    /// Connects as a local client to an ACL-hardened Named Pipe (`Windows`) or Unix Domain Socket (`Unix`).
+    pub fn connect(endpoint: &str) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            const GENERIC_READ: u32 = 0x8000_0000;
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const OPEN_EXISTING: u32 = 3;
+            const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
+            const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
+            const INVALID_HANDLE_VALUE: isize = -1;
+
+            let wide: Vec<u16> = std::ffi::OsStr::new(endpoint)
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    core::ptr::null(),
+                    OPEN_EXISTING,
+                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                    0,
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE || handle == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                handle,
+                is_server_side: false,
+            })
+        }
+        #[cfg(unix)]
+        {
+            let stream = std::os::unix::net::UnixStream::connect(endpoint)?;
+            Ok(Self { stream })
+        }
+    }
+}
+
+impl io::Read for LocalIpcStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        #[cfg(windows)]
+        {
+            const ERROR_BROKEN_PIPE: i32 = 109;
+            let to_read = buf.len().min(u32::MAX as usize) as u32;
+            let mut bytes_read: u32 = 0;
+            let ok = unsafe {
+                ReadFile(
+                    self.handle,
+                    buf.as_mut_ptr(),
+                    to_read,
+                    &mut bytes_read,
+                    core::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(ERROR_BROKEN_PIPE) {
+                    return Ok(0);
+                }
+                return Err(err);
+            }
+            Ok(bytes_read as usize)
+        }
+        #[cfg(unix)]
+        {
+            self.stream.read(buf)
+        }
+    }
+}
+
+impl io::Write for LocalIpcStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        #[cfg(windows)]
+        {
+            let to_write = buf.len().min(u32::MAX as usize) as u32;
+            let mut written: u32 = 0;
+            let ok = unsafe {
+                WriteFile(
+                    self.handle,
+                    buf.as_ptr(),
+                    to_write,
+                    &mut written,
+                    core::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(written as usize)
+        }
+        #[cfg(unix)]
+        {
+            self.stream.write(buf)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            let _ = unsafe { FlushFileBuffers(self.handle) };
+            Ok(())
+        }
+        #[cfg(unix)]
+        {
+            self.stream.flush()
+        }
+    }
+}
+
+impl Drop for LocalIpcStream {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            if self.handle != 0 && self.handle != -1 {
+                unsafe {
+                    if self.is_server_side {
+                        let _ = FlushFileBuffers(self.handle);
+                        let _ = DisconnectNamedPipe(self.handle);
+                    }
+                    let _ = CloseHandle(self.handle);
+                }
+                self.handle = 0;
+            }
+        }
+    }
+}
+
+/// ACL-hardened local IPC server listener (`\\.\pipe\OmniConnectSentinelCdr` on Windows or
+/// mode-`0600` + `SO_PEERCRED` Unix Domain Socket `/run/omniconnect/cdr.sock` on Linux) (`CSE-22`).
+pub struct LocalIpcServer {
+    endpoint: String,
+    #[cfg(windows)]
+    next_pipe_handle: isize,
+    #[cfg(unix)]
+    listener: std::os::unix::net::UnixListener,
+    #[cfg(unix)]
+    socket_path: PathBuf,
+}
+
+impl LocalIpcServer {
+    /// Binds an ACL-hardened local IPC listener on the given endpoint (or the OS default CDR endpoint).
+    pub fn bind(endpoint_override: Option<&str>) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            let endpoint = endpoint_override
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT_CDR_NAMED_PIPE_ENDPOINT)
+                .to_string();
+            let first_handle = create_acl_named_pipe_server_instance(&endpoint, true)?;
+            Ok(Self {
+                endpoint,
+                next_pipe_handle: first_handle,
+            })
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let endpoint = endpoint_override
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT_CDR_UNIX_SOCKET_PATH)
+                .to_string();
+            let socket_path = PathBuf::from(&endpoint);
+            if let Some(parent) = socket_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    crate::fs_lowlevel::ensure_not_symlink_or_reparse_point(parent)?;
+                    if std::fs::symlink_metadata(parent).is_err() {
+                        crate::fs_lowlevel::create_restricted_dir_atomic(parent)?;
+                    }
+                }
+            }
+            // Unconditionally reject symlinked parents OR dangling/existing symlinks at socket_path
+            crate::fs_lowlevel::ensure_not_symlink_or_reparse_point(&socket_path)?;
+            if std::fs::symlink_metadata(&socket_path).is_ok() {
+                let _ = std::fs::remove_file(&socket_path);
+            }
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
+            if let Err(err) =
+                std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            {
+                let _ = std::fs::remove_file(&socket_path);
+                return Err(err);
+            }
+            Ok(Self {
+                endpoint,
+                listener,
+                socket_path,
+            })
+        }
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Queries the live OS kernel DACL SDDL of the bound Windows Named Pipe listener.
+    pub fn kernel_dacl_sddl(&self) -> io::Result<String> {
+        #[cfg(windows)]
+        {
+            query_kernel_handle_dacl_sddl(self.next_pipe_handle)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "SDDL inspection applies only to Windows Named Pipes",
+            ))
+        }
+    }
+
+    /// Blocks until a local client connects, verifies OS peer credentials (`GetNamedPipeClientProcessId`
+    /// on Windows, `SO_PEERCRED` UID/PID check on Linux), and returns the connected `LocalIpcStream`.
+    pub fn accept(&mut self) -> io::Result<(LocalIpcStream, PeerCredentials)> {
+        #[cfg(windows)]
+        {
+            const ERROR_PIPE_CONNECTED: i32 = 535;
+            let active_handle = self.next_pipe_handle;
+            let connected = unsafe { ConnectNamedPipe(active_handle, core::ptr::null_mut()) };
+            if connected == 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(ERROR_PIPE_CONNECTED) {
+                    // Reset the pipe instance cleanly so transient disconnects (e.g., ERROR_NO_DATA)
+                    // never wedge `next_pipe_handle` in a hot spin loop.
+                    unsafe {
+                        let _ = DisconnectNamedPipe(active_handle);
+                    }
+                    return Err(err);
+                }
+            }
+
+            // Immediately create the next listening instance so no squat gap exists.
+            // If creating the replacement instance fails, disconnect the already-connected
+            // `active_handle` before returning Err so it stays reusable for the next accept.
+            let replacement = match create_acl_named_pipe_server_instance(&self.endpoint, false) {
+                Ok(h) => h,
+                Err(e) => {
+                    unsafe {
+                        let _ = DisconnectNamedPipe(active_handle);
+                    }
+                    return Err(e);
+                }
+            };
+            self.next_pipe_handle = replacement;
+
+            let creds = match verify_named_pipe_peer_credentials(active_handle) {
+                Ok(c) => c,
+                Err(e) => {
+                    unsafe {
+                        let _ = DisconnectNamedPipe(active_handle);
+                        let _ = CloseHandle(active_handle);
+                    }
+                    return Err(e);
+                }
+            };
+
+            Ok((
+                LocalIpcStream {
+                    handle: active_handle,
+                    is_server_side: true,
+                },
+                creds,
+            ))
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let (stream, _) = self.listener.accept()?;
+            let fd = stream.as_raw_fd();
+            #[cfg(target_os = "linux")]
+            {
+                let mut cred = libc::ucred {
+                    pid: 0,
+                    uid: u32::MAX,
+                    gid: u32::MAX,
+                };
+                let mut len = core::mem::size_of::<libc::ucred>() as libc::socklen_t;
+                let rc = unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_PEERCRED,
+                        &mut cred as *mut _ as *mut libc::c_void,
+                        &mut len,
+                    )
+                };
+                if rc != 0 || cred.pid <= 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "SO_PEERCRED peer verification failed on CDR Unix socket",
+                    ));
+                }
+                let my_euid = unsafe { libc::geteuid() };
+                if cred.uid != my_euid && cred.uid != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Rejected unauthorized Unix socket peer UID {} (expected {} or root)",
+                            cred.uid, my_euid
+                        ),
+                    ));
+                }
+                let exe_path = std::fs::read_link(format!("/proc/{}/exe", cred.pid))
+                    .unwrap_or_else(|_| PathBuf::from("<unknown>"));
+                Ok((
+                    LocalIpcStream { stream },
+                    PeerCredentials {
+                        pid: cred.pid as u32,
+                        executable_path: exe_path,
+                        signature_verified: false,
+                    },
+                ))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = fd;
+                Ok((
+                    LocalIpcStream { stream },
+                    PeerCredentials {
+                        pid: 0,
+                        executable_path: PathBuf::from("<unix-peer>"),
+                        signature_verified: false,
+                    },
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for LocalIpcServer {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            if self.next_pipe_handle != 0 && self.next_pipe_handle != -1 {
+                unsafe {
+                    let _ = CloseHandle(self.next_pipe_handle);
+                }
+                self.next_pipe_handle = 0;
+            }
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 }
 

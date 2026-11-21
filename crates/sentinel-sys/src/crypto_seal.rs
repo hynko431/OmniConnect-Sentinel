@@ -10,12 +10,108 @@ use crate::mem_guard::zeroize_slice;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyProtectionPosture {
-    /// Hardware-backed TPM 2.0 (Windows Platform Crypto Provider non-exportable RSA-2048 OAEP key wrapping)
+    /// Hardware-backed TPM 2.0 (Windows Platform Crypto Provider non-exportable RSA-2048 OAEP key wrapping,
+    /// or Linux TPM 2.0 resource manager `/dev/tpmrm0` when feature `linux-tpm2` is active)
     Tpm2Assisted,
     /// Windows DPAPI CRYPTPROTECT_LOCAL_MACHINE fallback (`POSTURE_REDUCED_NO_TPM`)
     DpapiLocalMachine,
-    /// Unix root-restricted `0400` keyring wrapping fallback (`POSTURE_REDUCED_NO_TPM`)
+    /// Linux kernel keyring (`SYS_keyctl(KEYCTL_SEARCH)` / `SYS_add_key`, non-swappable kernel memory — no disk `master.seed`, `POSTURE_REDUCED_NO_TPM`)
+    LinuxKernelKeyring,
+    /// Unix root-restricted `0400` file-backed wrapping fallback (`master.seed`, `POSTURE_REDUCED_NO_TPM`; refused in strict kiosk mode)
     UnixLocalKeyring,
+}
+
+impl KeyProtectionPosture {
+    /// Returns `true` when key custody relies on a local plaintext seed file on disk (`master.seed`),
+    /// which strict OT kiosk mode refuses fail-closed (`CSE-28`).
+    pub fn is_file_backed_fallback(self) -> bool {
+        matches!(self, Self::UnixLocalKeyring)
+    }
+
+    /// Returns `true` when key custody is anchored directly in hardware TPM 2.0.
+    pub fn is_hardware_backed(self) -> bool {
+        matches!(self, Self::Tpm2Assisted)
+    }
+
+    /// Returns `true` when key custody uses hardware TPM 2.0 or OS kernel-managed memory/DPAPI
+    /// rather than a local disk seed file (`CSE-28`).
+    pub fn is_strict_kiosk_acceptable(self) -> bool {
+        matches!(
+            self,
+            Self::Tpm2Assisted | Self::DpapiLocalMachine | Self::LinuxKernelKeyring
+        )
+    }
+}
+
+/// Allowed TPM 2.0 PCP RSA-OAEP hash algorithms (`CSE-28`): SHA-256 exclusively (SHA-1 fallback retired).
+pub const TPM_OAEP_ALLOWED_ALGORITHMS: &[(&str, bool)] = &[("SHA256", true), ("SHA256", false)];
+
+/// Evaluates whether a `KeyProtectionPosture` is permissible in strict OT kiosk mode (`CSE-28`).
+/// File-backed `UnixLocalKeyring` (`master.seed`) is refused fail-closed with `POSTURE_REDUCED_NO_TPM`.
+pub fn evaluate_strict_kiosk_key_posture(posture: KeyProtectionPosture) -> Result<(), String> {
+    if posture.is_file_backed_fallback() {
+        return Err(
+            "POSTURE_REDUCED_NO_TPM: Refusing strict kiosk session with file-backed key fallback (UnixLocalKeyring / master.seed); require hardware TPM 2.0 or Linux kernel keyring"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Deterministic Linux key-sealing backend priority selector (`CSE-28`):
+/// 1. Hardware TPM 2.0 (`/dev/tpmrm0`, feature-gated `linux-tpm2`) -> `Tpm2Assisted` (no reduced posture)
+/// 2. Linux kernel keyring (`SYS_keyctl(KEYCTL_SEARCH)` / `SYS_add_key`) -> `LinuxKernelKeyring` (`POSTURE_REDUCED_NO_TPM`)
+/// 3. File-backed `master.seed` fallback -> `UnixLocalKeyring` (`POSTURE_REDUCED_NO_TPM`, refused in strict kiosk mode)
+pub fn resolve_linux_key_sealing_backend(
+    tpm2_available: bool,
+    kernel_keyring_available: bool,
+) -> (KeyProtectionPosture, Option<&'static str>) {
+    if tpm2_available {
+        (KeyProtectionPosture::Tpm2Assisted, None)
+    } else if kernel_keyring_available {
+        (
+            KeyProtectionPosture::LinuxKernelKeyring,
+            Some("POSTURE_REDUCED_NO_TPM"),
+        )
+    } else {
+        (
+            KeyProtectionPosture::UnixLocalKeyring,
+            Some("POSTURE_REDUCED_NO_TPM"),
+        )
+    }
+}
+
+/// Probes whether a Linux TPM 2.0 in-kernel resource manager character device (`/dev/tpmrm0`) exists.
+pub fn is_linux_tpm2_device_present() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::symlink_metadata("/dev/tpmrm0")
+            .map(|m| !m.file_type().is_symlink() && m.file_type().is_char_device())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// RFC 5869 audited `HKDF-SHA256` key derivation returning a 32-byte volatile-zeroized key (`CSE-28`).
+pub fn hkdf_sha256_derive_32(
+    ikm: &[u8],
+    salt: &[u8],
+    info: &[u8],
+) -> io::Result<crate::mem_guard::ZeroizingBytes<32>> {
+    use hkdf::Hkdf;
+
+    let salt_opt = if salt.is_empty() { None } else { Some(salt) };
+    let hk = Hkdf::<Sha256>::new(salt_opt, ikm);
+    let mut okm = [0u8; 32];
+    hk.expand(info, &mut okm)
+        .map_err(|e| io::Error::other(format!("HKDF-SHA256 expand failed: {e}")))?;
+    let guarded = crate::mem_guard::ZeroizingBytes::new(okm);
+    zeroize_slice(&mut okm);
+    Ok(guarded)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -460,13 +556,9 @@ fn tpm_pcp_rsa_seal(raw_key: &[u8], entropy_tag: &[u8], kek_id: &str) -> io::Res
         }
     }
 
-    // Encrypt `raw_key` with RSA-OAEP and verify round-trip hardware TPM decryption before committing
-    for (alg_name, use_label) in [
-        ("SHA256", true),
-        ("SHA256", false),
-        ("SHA1", true),
-        ("SHA1", false),
-    ] {
+    // Encrypt `raw_key` with RSA-OAEP-SHA256 exclusively (SHA-1 fallback retired per `CSE-28`)
+    // and verify round-trip hardware TPM decryption before committing
+    for &(alg_name, use_label) in TPM_OAEP_ALLOWED_ALGORITHMS {
         let wide_alg = to_wide(alg_name);
         let label_slice = if use_label { entropy_tag } else { &[][..] };
         let padding = BcryptOaepPaddingInfo {
@@ -594,12 +686,8 @@ fn tpm_pcp_rsa_unseal(
         ));
     }
 
-    for (alg_name, use_label) in [
-        ("SHA256", true),
-        ("SHA256", false),
-        ("SHA1", true),
-        ("SHA1", false),
-    ] {
+    // Unwrap strictly via RSA-OAEP-SHA256 (SHA-1 OAEP fallback retired per `CSE-28`)
+    for &(alg_name, use_label) in TPM_OAEP_ALLOWED_ALGORITHMS {
         let wide_alg = to_wide(alg_name);
         let label_slice = if use_label { entropy_tag } else { &[][..] };
         let padding = BcryptOaepPaddingInfo {
@@ -779,12 +867,68 @@ pub fn seal_key_bytes(
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        let master_secret = load_or_create_unix_root_wrapping_key()?;
-        let sealed = unix_authenticated_seal(raw_key, &master_secret, entropy_tag, kek_id)?;
+        // 1. Optional feature-gated Linux TPM 2.0 hardware sealing (`/dev/tpmrm0`, `CSE-28`)
+        #[cfg(feature = "linux-tpm2")]
+        {
+            if let Ok(tpm_sealed) = tpm2_linux_seal(raw_key, entropy_tag, kek_id) {
+                return Ok(SealedKeyBlob {
+                    posture: KeyProtectionPosture::Tpm2Assisted,
+                    kek_id: kek_id.to_string(),
+                    sealed_bytes: tpm_sealed,
+                    reduced_posture_event: None,
+                });
+            }
+        }
+
+        // 2. Prefer Linux kernel keyring (`SYS_keyctl(KEYCTL_SEARCH)` / `SYS_add_key`, non-swappable kernel memory — zero disk `master.seed`)
+        match load_or_create_linux_kernel_keyring_key(true) {
+            Ok(mut kernel_secret) => {
+                let sealed_res =
+                    unix_authenticated_seal(raw_key, &kernel_secret, entropy_tag, kek_id);
+                zeroize_slice(&mut kernel_secret);
+                let sealed = sealed_res?;
+                warn!(
+                    "POSTURE_REDUCED_NO_TPM: Hardware TPM 2.0 unavailable; sealing '{}' via Linux kernel keyring (non-swappable kernel memory, no disk master.seed)",
+                    kek_id
+                );
+                return Ok(SealedKeyBlob {
+                    posture: KeyProtectionPosture::LinuxKernelKeyring,
+                    kek_id: kek_id.to_string(),
+                    sealed_bytes: sealed,
+                    reduced_posture_event: Some("POSTURE_REDUCED_NO_TPM".to_string()),
+                });
+            }
+            Err(keyring_err) => {
+                warn!(
+                    "POSTURE_REDUCED_NO_TPM: Linux kernel keyring unavailable for '{}' ({}); falling back to file-backed UnixLocalKeyring (master.seed; refused in strict kiosk mode)",
+                    kek_id, keyring_err
+                );
+            }
+        }
+
+        // 3. Last-resort fallback: root-restricted `0400` file-backed wrapping key (`master.seed`)
+        let mut master_secret = load_or_create_unix_root_wrapping_key()?;
+        let sealed_res = unix_authenticated_seal(raw_key, &master_secret, entropy_tag, kek_id);
+        zeroize_slice(&mut master_secret);
+        let sealed = sealed_res?;
+        Ok(SealedKeyBlob {
+            posture: KeyProtectionPosture::UnixLocalKeyring,
+            kek_id: kek_id.to_string(),
+            sealed_bytes: sealed,
+            reduced_posture_event: Some("POSTURE_REDUCED_NO_TPM".to_string()),
+        })
+    }
+
+    #[cfg(all(not(windows), not(target_os = "linux")))]
+    {
+        let mut master_secret = load_or_create_unix_root_wrapping_key()?;
+        let sealed_res = unix_authenticated_seal(raw_key, &master_secret, entropy_tag, kek_id);
+        zeroize_slice(&mut master_secret);
+        let sealed = sealed_res?;
         warn!(
-            "POSTURE_REDUCED_NO_TPM: Using Unix root-restricted 0400 wrapping key for '{}'",
+            "POSTURE_REDUCED_NO_TPM: Using Unix root-restricted 0400 wrapping key for '{}' (refused in strict kiosk mode)",
             kek_id
         );
         Ok(SealedKeyBlob {
@@ -807,28 +951,77 @@ pub fn unseal_key_bytes(blob: &SealedKeyBlob, entropy_tag: &[u8]) -> io::Result<
             KeyProtectionPosture::DpapiLocalMachine => {
                 dpapi_local_machine_unseal(&blob.sealed_bytes, entropy_tag)
             }
-            KeyProtectionPosture::UnixLocalKeyring => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Cannot unseal UnixLocalKeyring blob on Windows host",
-            )),
+            KeyProtectionPosture::LinuxKernelKeyring | KeyProtectionPosture::UnixLocalKeyring => {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Cannot unseal Linux/Unix keyring blob on Windows host",
+                ))
+            }
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
         match blob.posture {
+            KeyProtectionPosture::Tpm2Assisted => {
+                #[cfg(feature = "linux-tpm2")]
+                {
+                    tpm2_linux_unseal(&blob.sealed_bytes, entropy_tag, &blob.kek_id)
+                }
+                #[cfg(not(feature = "linux-tpm2"))]
+                {
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Cannot unseal Tpm2Assisted blob on Linux without `linux-tpm2` feature enabled",
+                    ))
+                }
+            }
+            KeyProtectionPosture::LinuxKernelKeyring => {
+                let mut kernel_secret = load_or_create_linux_kernel_keyring_key(false)?;
+                let res = unix_authenticated_unseal(
+                    &blob.sealed_bytes,
+                    &kernel_secret,
+                    entropy_tag,
+                    &blob.kek_id,
+                );
+                zeroize_slice(&mut kernel_secret);
+                res
+            }
             KeyProtectionPosture::UnixLocalKeyring => {
-                let master_secret = load_or_create_unix_root_wrapping_key()?;
-                unix_authenticated_unseal(
+                let mut master_secret = load_or_create_unix_root_wrapping_key()?;
+                let res = unix_authenticated_unseal(
                     &blob.sealed_bytes,
                     &master_secret,
                     entropy_tag,
                     &blob.kek_id,
-                )
+                );
+                zeroize_slice(&mut master_secret);
+                res
+            }
+            KeyProtectionPosture::DpapiLocalMachine => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cannot unseal Windows DPAPI blob on Linux host",
+            )),
+        }
+    }
+
+    #[cfg(all(not(windows), not(target_os = "linux")))]
+    {
+        match blob.posture {
+            KeyProtectionPosture::UnixLocalKeyring => {
+                let mut master_secret = load_or_create_unix_root_wrapping_key()?;
+                let res = unix_authenticated_unseal(
+                    &blob.sealed_bytes,
+                    &master_secret,
+                    entropy_tag,
+                    &blob.kek_id,
+                );
+                zeroize_slice(&mut master_secret);
+                res
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Cannot unseal Windows TPM/DPAPI blob on Unix host",
+                "Cannot unseal non-UnixLocalKeyring blob on this Unix host",
             )),
         }
     }
@@ -948,6 +1141,178 @@ pub fn unix_authenticated_unseal_with_secret(
     })?;
 
     Ok(plaintext)
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-tpm2"))]
+fn tpm2_linux_seal(_raw_key: &[u8], _entropy_tag: &[u8], _kek_id: &str) -> io::Result<Vec<u8>> {
+    if !is_linux_tpm2_device_present() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Linux TPM 2.0 resource manager /dev/tpmrm0 not present",
+        ));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Linux TPM 2.0 sealing requires an initialized tss-esapi primary storage key on /dev/tpmrm0; failing closed to next sealing tier",
+    ))
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-tpm2"))]
+fn tpm2_linux_unseal(
+    _sealed_bytes: &[u8],
+    _entropy_tag: &[u8],
+    _kek_id: &str,
+) -> io::Result<Vec<u8>> {
+    if !is_linux_tpm2_device_present() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Linux TPM 2.0 resource manager /dev/tpmrm0 not present",
+        ));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Linux TPM 2.0 unsealing requires an initialized tss-esapi primary storage key on /dev/tpmrm0",
+    ))
+}
+
+/// Loads (or provisions when `create_if_missing == true`) the 32-byte wrapping key in the
+/// Linux kernel keyring (`KEYCTL_SEARCH` / `SYS_add_key` / `KEYCTL_SETPERM` / `KEYCTL_READ`, `CSE-28`)
+/// so secret material stays in non-swappable kernel RAM without writing a plaintext `master.seed` file to disk.
+#[cfg(target_os = "linux")]
+fn load_or_create_linux_kernel_keyring_key(create_if_missing: bool) -> io::Result<[u8; 32]> {
+    use rand::RngCore;
+    use std::ffi::CString;
+
+    const KEY_SPEC_PROCESS_KEYRING: libc::c_long = -2;
+    const KEY_SPEC_SESSION_KEYRING: libc::c_long = -3;
+    const KEY_SPEC_USER_KEYRING: libc::c_long = -4;
+    const KEYCTL_REVOKE: libc::c_long = 3;
+    const KEYCTL_SETPERM: libc::c_long = 5;
+    const KEYCTL_SEARCH: libc::c_long = 10;
+    const KEYCTL_READ: libc::c_long = 11;
+    // Possessor all (0x3f) + User view/read/search (0x0b), zero group/other permissions
+    const KEY_PERM_RESTRICTED: libc::c_ulong = 0x3f0b_0000;
+
+    let key_type = CString::new("user")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid keyring type CString"))?;
+    let description = CString::new("omniconnect-sentinel:master-kek-v2").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid keyring description CString",
+        )
+    })?;
+
+    let candidate_keyrings = [
+        KEY_SPEC_USER_KEYRING,
+        KEY_SPEC_SESSION_KEYRING,
+        KEY_SPEC_PROCESS_KEYRING,
+    ];
+
+    // Explicitly search each candidate keyring via `KEYCTL_SEARCH` (unlike `request_key(2)`,
+    // which does not directly search `KEY_SPEC_USER_KEYRING` when a systemd service uses
+    // `KeyringMode=private`).
+    for keyring in candidate_keyrings {
+        let key_serial = unsafe {
+            libc::syscall(
+                libc::SYS_keyctl,
+                KEYCTL_SEARCH,
+                keyring,
+                key_type.as_ptr(),
+                description.as_ptr(),
+                0 as libc::c_long,
+            )
+        };
+        if key_serial > 0 {
+            let mut secret = [0u8; 32];
+            let read_len = unsafe {
+                libc::syscall(
+                    libc::SYS_keyctl,
+                    KEYCTL_READ,
+                    key_serial,
+                    secret.as_mut_ptr(),
+                    secret.len() as libc::c_ulong,
+                )
+            };
+            if read_len == 32 {
+                return Ok(secret);
+            }
+            zeroize_slice(&mut secret);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Linux kernel keyring key returned unexpected byte length: {read_len} (expected 32)"
+                ),
+            ));
+        }
+    }
+
+    if !create_if_missing {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Linux kernel keyring key 'omniconnect-sentinel:master-kek-v2' not found for unseal",
+        ));
+    }
+
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    let mut last_err = io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "Linux kernel keyring add_key failed on all candidate keyrings",
+    );
+
+    for keyring in candidate_keyrings {
+        let key_serial = unsafe {
+            libc::syscall(
+                libc::SYS_add_key,
+                key_type.as_ptr(),
+                description.as_ptr(),
+                secret.as_ptr(),
+                secret.len() as libc::c_ulong,
+                keyring,
+            )
+        };
+        if key_serial > 0 {
+            let setperm_rc = unsafe {
+                libc::syscall(
+                    libc::SYS_keyctl,
+                    KEYCTL_SETPERM,
+                    key_serial,
+                    KEY_PERM_RESTRICTED,
+                )
+            };
+            if setperm_rc != 0 {
+                let perm_err = io::Error::last_os_error();
+                let _ = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_REVOKE, key_serial) };
+                last_err = io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("Linux kernel keyring KEYCTL_SETPERM failed ({perm_err}); revoked key"),
+                );
+                continue;
+            }
+            let mut verify = [0u8; 32];
+            let verify_len = unsafe {
+                libc::syscall(
+                    libc::SYS_keyctl,
+                    KEYCTL_READ,
+                    key_serial,
+                    verify.as_mut_ptr(),
+                    verify.len() as libc::c_ulong,
+                )
+            };
+            let verified = verify_len == 32 && verify == secret;
+            zeroize_slice(&mut verify);
+            if verified {
+                return Ok(secret);
+            }
+            let _ = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_REVOKE, key_serial) };
+            last_err = io::Error::other("Linux kernel keyring read-back verification failed");
+        } else {
+            last_err = io::Error::last_os_error();
+        }
+    }
+
+    zeroize_slice(&mut secret);
+    Err(last_err)
 }
 
 #[cfg(not(windows))]
@@ -1158,12 +1523,11 @@ pub fn encrypt_kek_for_soc_escrow(
         ));
     }
 
-    let mut fp_hasher = Sha256::new();
-    fp_hasher.update(soc_rsa_pub_blob);
-    let soc_key_fingerprint = hex_encode(&fp_hasher.finalize()[..16]);
-
     #[cfg(windows)]
     {
+        let mut fp_hasher = Sha256::new();
+        fp_hasher.update(soc_rsa_pub_blob);
+        let soc_key_fingerprint = hex_encode(&fp_hasher.finalize()[..16]);
         let alg_rsa = to_wide("RSA");
         let pub_type = to_wide("RSAPUBLICBLOB");
         let alg_sha256 = to_wide("SHA256");
@@ -1448,12 +1812,14 @@ pub fn create_sealed_ecdsa_p256_keypair(
         let (pub_blob, mut priv_blob) = generate_raw_ecdsa_p256_keypair()?;
         let sealed_priv = seal_key_bytes(&priv_blob, entropy_tag, key_id)?;
         zeroize_slice(&mut priv_blob);
+        let posture = sealed_priv.posture;
+        let reduced_posture_event = sealed_priv.reduced_posture_event.clone();
         Ok(SealedEcdsaKeyPair {
-            posture: KeyProtectionPosture::UnixLocalKeyring,
+            posture,
             key_id: key_id.to_string(),
             public_key_blob: pub_blob,
             sealed_private_key: Some(sealed_priv),
-            reduced_posture_event: Some("POSTURE_REDUCED_NO_TPM".to_string()),
+            reduced_posture_event,
         })
     }
 }
@@ -1691,6 +2057,7 @@ pub fn sign_ecdsa_p256_digest_software(
 
 /// Normalizes a 64-byte `(r || s)` ECDSA P-256 signature to canonical low-S (`s <= (n - 1) / 2`)
 /// so `(r, n - s)` signature malleability is eliminated across TPM 2.0 PCP, Windows CNG, and pure-Rust paths.
+#[cfg(windows)]
 fn normalize_ecdsa_p256_signature_low_s(raw_sig: &[u8]) -> io::Result<Vec<u8>> {
     let sig = p256::ecdsa::Signature::from_slice(raw_sig).map_err(|e| {
         io::Error::new(
@@ -2734,93 +3101,11 @@ pub fn encode_ocescrow3_wire(
     wire
 }
 
-/// NIST FIPS 202 SHA3-256 (`Keccak[512](M || 01, 256)`) for NIST FIPS 203 §7.3 `H(ek)` verification.
-fn fips202_sha3_256(msg: &[u8]) -> [u8; 32] {
-    const RC: [u64; 24] = [
-        0x0000000000000001,
-        0x0000000000008082,
-        0x800000000000808a,
-        0x8000000080008000,
-        0x000000000000808b,
-        0x0000000080000001,
-        0x8000000080008081,
-        0x8000000000008009,
-        0x000000000000008a,
-        0x0000000000000088,
-        0x0000000080008009,
-        0x000000008000000a,
-        0x000000008000808b,
-        0x800000000000008b,
-        0x8000000000008089,
-        0x8000000000008003,
-        0x8000000000008002,
-        0x8000000000000080,
-        0x000000000000800a,
-        0x800000008000000a,
-        0x8000000080008081,
-        0x8000000000008080,
-        0x0000000080000001,
-        0x8000000080008008,
-    ];
-    const RHO: [u32; 24] = [
-        1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
-    ];
-    const PI: [usize; 24] = [
-        10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
-    ];
-
-    fn keccak_f1600(st: &mut [u64; 25]) {
-        for &rc in &RC {
-            let mut c = [0u64; 5];
-            for x in 0..5 {
-                c[x] = st[x] ^ st[x + 5] ^ st[x + 10] ^ st[x + 15] ^ st[x + 20];
-            }
-            for x in 0..5 {
-                let d = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
-                for y in (0..25).step_by(5) {
-                    st[y + x] ^= d;
-                }
-            }
-            let mut cur = st[1];
-            for t in 0..24 {
-                let next_idx = PI[t];
-                let tmp = st[next_idx];
-                st[next_idx] = cur.rotate_left(RHO[t]);
-                cur = tmp;
-            }
-            for y in (0..25).step_by(5) {
-                let row = [st[y], st[y + 1], st[y + 2], st[y + 3], st[y + 4]];
-                for x in 0..5 {
-                    st[y + x] = row[x] ^ ((!row[(x + 1) % 5]) & row[(x + 2) % 5]);
-                }
-            }
-            st[0] ^= rc;
-        }
-    }
-
-    const RATE: usize = 136;
-    let mut state = [0u64; 25];
-    let (blocks, rem) = msg.as_chunks::<RATE>();
-    for block in blocks {
-        for (i, lane_bytes) in block.as_chunks::<8>().0.iter().enumerate() {
-            state[i] ^= u64::from_le_bytes(*lane_bytes);
-        }
-        keccak_f1600(&mut state);
-    }
-    let mut pad = [0u8; RATE];
-    pad[..rem.len()].copy_from_slice(rem);
-    pad[rem.len()] ^= 0x06;
-    pad[RATE - 1] ^= 0x80;
-    for (i, lane_bytes) in pad.as_chunks::<8>().0.iter().enumerate() {
-        state[i] ^= u64::from_le_bytes(*lane_bytes);
-    }
-    keccak_f1600(&mut state);
-
-    let mut out = [0u8; 32];
-    for i in 0..4 {
-        out[i * 8..(i + 1) * 8].copy_from_slice(&state[i].to_le_bytes());
-    }
-    out
+/// NIST FIPS 202 SHA3-256 (`sha3::Sha3_256` audited RustCrypto primitive, `CSE-28`)
+/// for NIST FIPS 203 §7.3 `H(ek)` decapsulation key verification.
+pub fn fips202_sha3_256(msg: &[u8]) -> [u8; 32] {
+    use sha3::{Digest as _, Sha3_256};
+    Sha3_256::digest(msg).into()
 }
 
 fn validate_mlkem768_12bit_poly_vec(encoded_1152: &[u8], label: &str) -> io::Result<()> {
@@ -3460,6 +3745,83 @@ mod tests {
             unix_authenticated_unseal_with_secret(&sealed, &wrong_secret, entropy, kek_id).is_err(),
             "Wrong master secret must fail unseal"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_cse28_audited_sha3_hkdf_no_sha1_oaep_and_linux_key_posture(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // 1. SHA-1 RSA-OAEP fallback MUST be absent from TPM OAEP candidate list
+        assert!(!TPM_OAEP_ALLOWED_ALGORITHMS.is_empty());
+        assert!(
+            TPM_OAEP_ALLOWED_ALGORITHMS
+                .iter()
+                .all(|(alg, _)| *alg == "SHA256"),
+            "TPM OAEP must permit SHA-256 exclusively (zero SHA-1 fallback)"
+        );
+
+        // 2. Audited sha3::Sha3_256 matches official NIST FIPS 202 KAT vectors
+        assert_eq!(
+            hex_encode(&fips202_sha3_256(b"")),
+            "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a"
+        );
+        assert_eq!(
+            hex_encode(&fips202_sha3_256(b"abc")),
+            "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532"
+        );
+
+        // 3. Audited hkdf::Hkdf<Sha256> matches official RFC 5869 Appendix A.1 Test Case 1 (first 32 bytes)
+        let ikm = [0x0bu8; 22];
+        let salt: [u8; 13] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        ];
+        let info: [u8; 10] = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9];
+        let okm = hkdf_sha256_derive_32(&ikm, &salt, &info)?;
+        assert_eq!(
+            hex_encode(okm.as_slice()),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+        );
+
+        // Empty-salt RFC 5869 equivalence (`None` == 32 zero bytes)
+        let okm_empty = hkdf_sha256_derive_32(&ikm, &[], &info)?;
+        let okm_zero32 = hkdf_sha256_derive_32(&ikm, &[0u8; 32], &info)?;
+        assert_eq!(okm_empty.as_slice(), okm_zero32.as_slice());
+
+        // 4. Linux key sealing priority: TPM2 -> LinuxKernelKeyring -> UnixLocalKeyring (file fallback)
+        assert_eq!(
+            resolve_linux_key_sealing_backend(true, true),
+            (KeyProtectionPosture::Tpm2Assisted, None)
+        );
+        assert_eq!(
+            resolve_linux_key_sealing_backend(false, true),
+            (
+                KeyProtectionPosture::LinuxKernelKeyring,
+                Some("POSTURE_REDUCED_NO_TPM")
+            )
+        );
+        assert_eq!(
+            resolve_linux_key_sealing_backend(false, false),
+            (
+                KeyProtectionPosture::UnixLocalKeyring,
+                Some("POSTURE_REDUCED_NO_TPM")
+            )
+        );
+
+        // 5. Strict kiosk key posture enforcement: refuses file-backed UnixLocalKeyring fail-closed
+        assert!(evaluate_strict_kiosk_key_posture(KeyProtectionPosture::Tpm2Assisted).is_ok());
+        assert!(evaluate_strict_kiosk_key_posture(KeyProtectionPosture::DpapiLocalMachine).is_ok());
+        assert!(
+            evaluate_strict_kiosk_key_posture(KeyProtectionPosture::LinuxKernelKeyring).is_ok()
+        );
+        let refused = evaluate_strict_kiosk_key_posture(KeyProtectionPosture::UnixLocalKeyring);
+        assert!(
+            refused.is_err(),
+            "File-backed UnixLocalKeyring must be refused in strict kiosk mode"
+        );
+        assert!(refused
+            .err()
+            .unwrap_or_default()
+            .contains("POSTURE_REDUCED_NO_TPM"));
         Ok(())
     }
 }

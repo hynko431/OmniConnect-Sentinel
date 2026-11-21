@@ -422,8 +422,14 @@ pub fn apply_landlock_filesystem_lockdown() -> io::Result<()> {
     };
 
     if abi_version <= 0 {
-        // Landlock not supported on this kernel version; return Ok and rely on BPF + root drop
-        return Ok(());
+        return crate::sandbox_worker::evaluate_sandbox_enforcement_failure(
+            "linux_landlock_abi",
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Linux Landlock LSM ABI unavailable on this kernel",
+            ),
+            crate::sandbox_worker::is_unsafe_dev_sandbox_opt_in(),
+        );
     }
 
     let attr = LandlockRulesetAttr {
@@ -456,13 +462,30 @@ pub fn apply_landlock_filesystem_lockdown() -> io::Result<()> {
 /// Applies non-root UID/GID/capability drop and checked `setrlimit` calls on Linux (`CSE-05`).
 #[cfg(target_os = "linux")]
 pub fn apply_linux_privilege_and_namespace_drop() -> io::Result<()> {
-    // 1. Unshare network and IPC namespaces
+    // 1. Unshare network and IPC namespaces fail-closed (`CSE-22`, `ADR-016`):
+    //    Never silently continue unsandboxed on `EPERM` or non-root failure unless
+    //    explicitly overridden via `SENTINEL_UNSAFE_DEV_SANDBOX=1` (`POSTURE_REDUCED_SANDBOX`).
     let unshare_rc = unsafe { libc::unshare(libc::CLONE_NEWNET | libc::CLONE_NEWIPC) };
     if unshare_rc != 0 {
-        let err = io::Error::last_os_error();
-        // If unshare fails with EPERM because already non-root, do not fail; otherwise fail
-        if unsafe { libc::getuid() } == 0 && err.raw_os_error() != Some(libc::EPERM) {
-            return Err(err);
+        let mut err = io::Error::last_os_error();
+        let mut unshared = false;
+        // For unprivileged non-root processes, attempt user+net+ipc unshare before failing closed
+        if unsafe { libc::getuid() } != 0 {
+            let user_ns_rc = unsafe {
+                libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWIPC)
+            };
+            if user_ns_rc == 0 {
+                unshared = true;
+            } else {
+                err = io::Error::last_os_error();
+            }
+        }
+        if !unshared {
+            crate::sandbox_worker::evaluate_sandbox_enforcement_failure(
+                "linux_unshare(CLONE_NEWNET|CLONE_NEWIPC)",
+                err,
+                crate::sandbox_worker::is_unsafe_dev_sandbox_opt_in(),
+            )?;
         }
     }
 

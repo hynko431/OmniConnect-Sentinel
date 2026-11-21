@@ -214,6 +214,28 @@ extern "system" {
         pDacl: *const core::ffi::c_void,
         pSacl: *const core::ffi::c_void,
     ) -> u32;
+    fn SetKernelObjectSecurity(
+        Handle: isize,
+        SecurityInformation: u32,
+        SecurityDescriptor: *const core::ffi::c_void,
+    ) -> i32;
+    fn GetNamedSecurityInfoW(
+        pObjectName: *const u16,
+        ObjectType: i32,
+        SecurityInfo: u32,
+        ppsidOwner: *mut *mut core::ffi::c_void,
+        ppsidGroup: *mut *mut core::ffi::c_void,
+        ppDacl: *mut *mut core::ffi::c_void,
+        ppSacl: *mut *mut core::ffi::c_void,
+        ppSecurityDescriptor: *mut *mut core::ffi::c_void,
+    ) -> u32;
+    fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        SecurityDescriptor: *const core::ffi::c_void,
+        RequestedStringSDRevision: u32,
+        SecurityInformation: u32,
+        StringSecurityDescriptor: *mut *mut u16,
+        StringSecurityDescriptorLen: *mut u32,
+    ) -> i32;
 }
 
 /// Lexically normalizes `.` and `..` components and converts a Path to a Windows `\\?\`
@@ -1254,6 +1276,7 @@ pub fn create_restricted_file_atomic(path: &Path, content: &[u8]) -> io::Result<
             }
         }
     }
+    use std::io::Write;
     let mut file = create_restricted_file_handle_atomic(path)?;
     file.write_all(content)?;
     file.sync_all()?;
@@ -1417,6 +1440,603 @@ pub fn create_restricted_dir_atomic(path: &Path) -> io::Result<()> {
             }
             Err(err) => Err(err),
         }
+    }
+}
+
+/// Windows SDDL for materialized sanitized staging directories (`CSE-18`):
+/// `SY`/`BA`/`OW` hold full control for service lifecycle/teardown, while `AU`
+/// (Authenticated Users) receives strictly read+traverse (`FRFX`) on directories
+/// and read-only (`FR`, zero write/delete/execute) inherited onto files.
+pub const STAGING_DIR_READONLY_USER_SDDL: &str =
+    "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GA;;;OW)(A;CI;FRFX;;;AU)(A;OIIO;FR;;;AU)";
+
+/// Windows SDDL for materialized sanitized staging files (`CSE-18`):
+/// `SY`/`BA`/`OW` hold full control for hydration/MOTW/teardown, while `AU`
+/// (Authenticated Users) receives strictly `FILE_GENERIC_READ` (`FR`, zero write/delete/execute).
+pub const STAGING_FILE_READONLY_USER_SDDL: &str =
+    "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;FR;;;AU)";
+
+/// Applies the read-only interactive-user staging ACL (`SY`/`BA`/`OW` full control + `AU` read-only)
+/// to a materialized sanitized staging directory or file (`CSE-18`).
+///
+/// Must NEVER be used on `ShadowCache`, `Quarantine`, `AuditLedger`, or key material.
+pub fn apply_readonly_staging_dacl(path: &Path) -> io::Result<()> {
+    ensure_not_symlink_or_reparse_point(path)?;
+    let verbatim = to_verbatim_path(path);
+    let meta = fs::symlink_metadata(&verbatim).or_else(|_| fs::symlink_metadata(path))?;
+    if is_reparse_point_or_symlink(&meta) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Refusing staging DACL application on symlink or reparse point '{}'",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        const SDDL_REVISION_1: u32 = 1;
+        const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+        const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        const OPEN_EXISTING: u32 = 3;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        const INVALID_HANDLE_VALUE: isize = -1;
+
+        let sddl = if meta.is_dir() {
+            STAGING_DIR_READONLY_USER_SDDL
+        } else {
+            STAGING_FILE_READONLY_USER_SDDL
+        };
+        let wide_sddl: Vec<u16> = std::ffi::OsStr::new(sddl)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut sd_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        let mut sd_size: u32 = 0;
+
+        let ok_sddl = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd_ptr,
+                &mut sd_size,
+            )
+        };
+        if ok_sddl == 0 || sd_ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Open handle directly with `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`
+        // and apply the protected DACL via `SetKernelObjectSecurity` (zero path-swap TOCTOU and
+        // reliable handling of `\\?\` verbatim paths).
+        let wide_path: Vec<u16> = verbatim.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                WRITE_DAC | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                core::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                0,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE || handle == 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                let _ = LocalFree(sd_ptr);
+            }
+            return Err(err);
+        }
+
+        let mut info: ByHandleFileInformation = unsafe { core::mem::zeroed() };
+        let ok_info = unsafe {
+            GetFileInformationByHandle(handle, &mut info as *mut _ as *mut core::ffi::c_void)
+        };
+        if ok_info == 0 || (info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            let err = if ok_info == 0 {
+                io::Error::last_os_error()
+            } else {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Refusing staging DACL application on reparse point '{}'",
+                        path.display()
+                    ),
+                )
+            };
+            unsafe {
+                let _ = CloseHandle(handle);
+                let _ = LocalFree(sd_ptr);
+            }
+            return Err(err);
+        }
+
+        let status = unsafe {
+            SetKernelObjectSecurity(
+                handle,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                sd_ptr,
+            )
+        };
+        let kernel_err = if status == 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        unsafe {
+            let _ = CloseHandle(handle);
+            let _ = LocalFree(sd_ptr);
+        }
+        if let Some(err) = kernel_err {
+            return Err(err);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = meta.permissions();
+        if meta.is_dir() {
+            perms.set_mode(0o755);
+        } else {
+            perms.set_mode(0o444);
+        }
+        fs::set_permissions(path, perms)
+    }
+}
+
+/// Atomically creates (or updates) a sanitized staging directory with `STAGING_DIR_READONLY_USER_SDDL`
+/// on Windows or `0o755` on Unix (`CSE-18`), refusing symlinks/reparse points.
+pub fn create_readonly_staging_dir_atomic(path: &Path) -> io::Result<()> {
+    ensure_not_symlink_or_reparse_point(path)?;
+    let verbatim = to_verbatim_path(path);
+    if let Ok(meta) = fs::symlink_metadata(&verbatim).or_else(|_| fs::symlink_metadata(path)) {
+        if is_reparse_point_or_symlink(&meta) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing staging directory operation: '{}' is a symlink or reparse point",
+                    path.display()
+                ),
+            ));
+        }
+        if !meta.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "Target staging directory '{}' already exists as a non-directory",
+                    path.display()
+                ),
+            ));
+        }
+        apply_readonly_staging_dacl(path)?;
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            ensure_not_symlink_or_reparse_point(parent)?;
+            let parent_verbatim = to_verbatim_path(parent);
+            match fs::symlink_metadata(&parent_verbatim).or_else(|_| fs::symlink_metadata(parent)) {
+                Ok(pm) => {
+                    if is_reparse_point_or_symlink(&pm) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "Refusing staging directory operation: parent '{}' is a symlink or reparse point",
+                                parent.display()
+                            ),
+                        ));
+                    }
+                    if !pm.is_dir() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!(
+                                "Parent path '{}' already exists as a non-directory",
+                                parent.display()
+                            ),
+                        ));
+                    }
+                }
+                Err(_) => {
+                    create_readonly_staging_dir_atomic(parent)?;
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        const SDDL_REVISION_1: u32 = 1;
+        let wide_sddl: Vec<u16> = std::ffi::OsStr::new(STAGING_DIR_READONLY_USER_SDDL)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut sd_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        let mut sd_size: u32 = 0;
+
+        let ok_sddl = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd_ptr,
+                &mut sd_size,
+            )
+        };
+        if ok_sddl == 0 || sd_ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        #[repr(C)]
+        struct SecurityAttributes {
+            n_length: u32,
+            lp_security_descriptor: *mut core::ffi::c_void,
+            b_inherit_handle: i32,
+        }
+
+        let sa = SecurityAttributes {
+            n_length: core::mem::size_of::<SecurityAttributes>() as u32,
+            lp_security_descriptor: sd_ptr,
+            b_inherit_handle: 0,
+        };
+
+        let wide_path: Vec<u16> = verbatim.as_os_str().encode_wide().chain(Some(0)).collect();
+        let res = unsafe {
+            CreateDirectoryW(
+                wide_path.as_ptr(),
+                &sa as *const _ as *const core::ffi::c_void,
+            )
+        };
+        unsafe {
+            let _ = LocalFree(sd_ptr);
+        }
+
+        if res == 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(183) {
+                ensure_not_symlink_or_reparse_point(path)?;
+                let meta =
+                    fs::symlink_metadata(&verbatim).or_else(|_| fs::symlink_metadata(path))?;
+                if is_reparse_point_or_symlink(&meta) || !meta.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Concurrent staging directory check failed: '{}' is a symlink/reparse point or non-directory",
+                            path.display()
+                        ),
+                    ));
+                }
+                apply_readonly_staging_dacl(path)?;
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o755);
+        match builder.create(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                ensure_not_symlink_or_reparse_point(path)?;
+                let meta = fs::symlink_metadata(path)?;
+                if is_reparse_point_or_symlink(&meta) || !meta.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Concurrent staging directory check failed: '{}' is a symlink or non-directory",
+                            path.display()
+                        ),
+                    ));
+                }
+                apply_readonly_staging_dacl(path)?;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// Atomically writes a materialized sanitized staging file with `STAGING_FILE_READONLY_USER_SDDL`
+/// on Windows (`SY`/`BA`/`OW` full control + `AU` strictly `FILE_GENERIC_READ`, zero write/delete/execute)
+/// or `0o644` on Unix (caller finishes with MOTW + `set_readonly(true)` -> `0o444`), rejecting
+/// symlinks, reparse points, and hardlink squatting (`CSE-18`).
+pub fn create_readonly_staging_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
+    ensure_not_symlink_or_reparse_point(path)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            ensure_not_symlink_or_reparse_point(parent)?;
+            let parent_verbatim = to_verbatim_path(parent);
+            match fs::symlink_metadata(&parent_verbatim).or_else(|_| fs::symlink_metadata(parent)) {
+                Ok(pm) => {
+                    if is_reparse_point_or_symlink(&pm) || !pm.is_dir() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "Staging parent path '{}' is a reparse point or non-directory",
+                                parent.display()
+                            ),
+                        ));
+                    }
+                }
+                Err(_) => {
+                    create_readonly_staging_dir_atomic(parent)?;
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    let mut file = {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+
+        const SDDL_REVISION_1: u32 = 1;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        const CREATE_NEW: u32 = 1;
+        const OPEN_EXISTING: u32 = 3;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+        const INVALID_HANDLE_VALUE: isize = -1;
+
+        let wide_sddl: Vec<u16> = std::ffi::OsStr::new(STAGING_FILE_READONLY_USER_SDDL)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut sd_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        let mut sd_size: u32 = 0;
+
+        let ok_sddl = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd_ptr,
+                &mut sd_size,
+            )
+        };
+        if ok_sddl == 0 || sd_ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        #[repr(C)]
+        struct SecurityAttributes {
+            n_length: u32,
+            lp_security_descriptor: *mut core::ffi::c_void,
+            b_inherit_handle: i32,
+        }
+
+        let sa = SecurityAttributes {
+            n_length: core::mem::size_of::<SecurityAttributes>() as u32,
+            lp_security_descriptor: sd_ptr,
+            b_inherit_handle: 0,
+        };
+
+        let verbatim = to_verbatim_path(path);
+        let wide_path: Vec<u16> = verbatim.as_os_str().encode_wide().chain(Some(0)).collect();
+
+        let h_new = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                &sa as *const _ as *const core::ffi::c_void,
+                CREATE_NEW,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL,
+                0,
+            )
+        };
+        unsafe {
+            let _ = LocalFree(sd_ptr);
+        }
+
+        if h_new != INVALID_HANDLE_VALUE && h_new != 0 {
+            unsafe { File::from_raw_handle(h_new as *mut core::ffi::c_void) }
+        } else {
+            let create_err = io::Error::last_os_error();
+            if create_err.raw_os_error() != Some(80) && create_err.raw_os_error() != Some(183) {
+                return Err(create_err);
+            }
+            ensure_not_symlink_or_reparse_point(path)?;
+            let h_existing = unsafe {
+                CreateFileW(
+                    wide_path.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    core::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL,
+                    0,
+                )
+            };
+            if h_existing == INVALID_HANDLE_VALUE || h_existing == 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let mut info: ByHandleFileInformation = unsafe { core::mem::zeroed() };
+            let ok_info = unsafe {
+                GetFileInformationByHandle(
+                    h_existing,
+                    &mut info as *mut _ as *mut core::ffi::c_void,
+                )
+            };
+            if ok_info == 0 {
+                let err = io::Error::last_os_error();
+                unsafe {
+                    let _ = CloseHandle(h_existing);
+                }
+                return Err(err);
+            }
+            if (info.dw_file_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))
+                != 0
+            {
+                unsafe {
+                    let _ = CloseHandle(h_existing);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Refusing staging file open: '{}' is a reparse point or directory",
+                        path.display()
+                    ),
+                ));
+            }
+            if info.n_number_of_links > 1 {
+                unsafe {
+                    let _ = CloseHandle(h_existing);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Refusing staging file open: hardlink squatting detected on '{}' (links={})",
+                        path.display(),
+                        info.n_number_of_links
+                    ),
+                ));
+            }
+
+            let existing = unsafe { File::from_raw_handle(h_existing as *mut core::ffi::c_void) };
+            apply_readonly_staging_dacl(path)?;
+            existing.set_len(0)?;
+            existing
+        }
+    };
+
+    #[cfg(not(windows))]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        options.mode(0o644);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let f = options.open(path)?;
+        let fd = f.as_raw_fd();
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Staging target '{}' is not a regular file", path.display()),
+            ));
+        }
+        if st.st_nlink > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing staging file open: hardlink squatting detected on '{}'",
+                    path.display()
+                ),
+            ));
+        }
+        if unsafe { libc::fchmod(fd, 0o644) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        f.set_len(0)?;
+        f
+    };
+
+    {
+        use std::io::Write as _;
+        file.write_all(content)?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
+/// Queries the active NTFS DACL SDDL string for `path` on Windows (or octal mode on Unix).
+/// Rejects symlinks and NTFS reparse points.
+pub fn query_path_dacl_sddl(path: &Path) -> io::Result<String> {
+    ensure_not_symlink_or_reparse_point(path)?;
+    let verbatim = to_verbatim_path(path);
+    let meta = fs::symlink_metadata(&verbatim).or_else(|_| fs::symlink_metadata(path))?;
+    if is_reparse_point_or_symlink(&meta) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Refusing DACL query on symlink or reparse point '{}'",
+                path.display()
+            ),
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        const SE_FILE_OBJECT: i32 = 1;
+        const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+        const SDDL_REVISION_1: u32 = 1;
+
+        let wide_path: Vec<u16> = verbatim.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut dacl_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        let mut sd_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                &mut dacl_ptr,
+                core::ptr::null_mut(),
+                &mut sd_ptr,
+            )
+        };
+        if status != 0 || sd_ptr.is_null() {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+
+        let mut wide_sddl_ptr: *mut u16 = core::ptr::null_mut();
+        let mut wide_sddl_len: u32 = 0;
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd_ptr,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut wide_sddl_ptr,
+                &mut wide_sddl_len,
+            )
+        };
+        unsafe {
+            let _ = LocalFree(sd_ptr);
+        }
+        if ok == 0 || wide_sddl_ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let slice = unsafe { core::slice::from_raw_parts(wide_sddl_ptr, wide_sddl_len as usize) };
+        let trimmed_len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+        let sddl = String::from_utf16_lossy(&slice[..trimmed_len]);
+        unsafe {
+            let _ = LocalFree(wide_sddl_ptr as *mut core::ffi::c_void);
+        }
+        Ok(sddl)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(format!(
+            "unix_mode:0o{:04o}",
+            meta.permissions().mode() & 0o7777
+        ))
     }
 }
 
@@ -3182,6 +3802,66 @@ mod projfs_callback_tests {
         ));
         let _ = fs::remove_dir_all(&tmp_dir);
 
+        Ok(())
+    }
+
+    #[test]
+    fn staging_dacl_vs_restricted_dacl_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "sentinel_sys_dacl_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&root)?;
+
+        let restricted_dir = root.join("restricted_dir");
+        create_restricted_dir_atomic(&restricted_dir)?;
+        let restricted_file = restricted_dir.join("secret.enc");
+        create_restricted_file_atomic(&restricted_file, b"cipher")?;
+
+        let staging_new_dir = root.join("staging_new_dir");
+        create_readonly_staging_dir_atomic(&staging_new_dir)?;
+        let staging_file = staging_new_dir.join("clean.txt");
+        create_readonly_staging_file_atomic(&staging_file, b"clean")?;
+
+        let r_dir = query_path_dacl_sddl(&restricted_dir)?;
+        let r_file = query_path_dacl_sddl(&restricted_file)?;
+        let s_new = query_path_dacl_sddl(&staging_new_dir)?;
+        let s_file = query_path_dacl_sddl(&staging_file)?;
+
+        #[cfg(windows)]
+        {
+            assert!(
+                r_dir.starts_with("D:P"),
+                "restricted dir DACL must be protected: {r_dir}"
+            );
+            assert!(!r_dir.contains(";;;AU)") && !r_dir.contains(";;;WD)"));
+            assert!(
+                r_file.starts_with("D:P"),
+                "restricted file DACL must be protected: {r_file}"
+            );
+            assert!(!r_file.contains(";;;AU)") && !r_file.contains(";;;WD)"));
+            assert!(
+                s_new.starts_with("D:P") && s_new.contains(";;;AU)") && !s_new.contains(";;;WD)")
+            );
+            assert!(
+                s_file.starts_with("D:P")
+                    && s_file.contains("(A;;FR;;;AU)")
+                    && !s_file.contains(";;;WD)")
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(r_dir, "unix_mode:0o0700");
+            assert_eq!(r_file, "unix_mode:0o0600");
+            assert_eq!(s_new, "unix_mode:0o0755");
+            assert_eq!(s_file, "unix_mode:0o0644");
+        }
+
+        let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 }
