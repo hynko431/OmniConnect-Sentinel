@@ -94,15 +94,15 @@ impl LocalSession {
                 resp.status
             ));
         }
-        if let Some(cookie) = resp.set_cookie {
-            if let Some(sid) = extract_cookie_token(&cookie, "sentinel_sid") {
-                self.cookie_sid = Some(sid);
-            }
+        if let Some(cookie) = resp.set_cookie
+            && let Some(sid) = extract_cookie_token(&cookie, "sentinel_sid")
+        {
+            self.cookie_sid = Some(sid);
         }
-        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&resp.body) {
-            if let Some(csrf) = val.get("csrf_token").and_then(|v| v.as_str()) {
-                self.csrf_token = csrf.to_owned();
-            }
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&resp.body)
+            && let Some(csrf) = val.get("csrf_token").and_then(|v| v.as_str())
+        {
+            self.csrf_token = csrf.to_owned();
         }
         self.backoff_secs = 1;
         Ok(())
@@ -298,15 +298,14 @@ pub fn spawn_backend_worker(
         .name("sentinel-ui-api".into())
         .spawn(move || {
             let mut session = LocalSession::new(port);
-            if let Some(code) = initial_bootstrap {
-                if !code.trim().is_empty() {
-                    if let Err(err) = session.exchange_bootstrap(&code) {
-                        handle.update(move |s, _| {
-                            s.auth_error = Some(err);
-                            s.modal = ModalState::SessionAuth;
-                        });
-                    }
-                }
+            if let Some(code) = initial_bootstrap
+                && !code.trim().is_empty()
+                && let Err(err) = session.exchange_bootstrap(&code)
+            {
+                handle.update(move |s, _| {
+                    s.auth_error = Some(err);
+                    s.modal = ModalState::SessionAuth;
+                });
             }
             session.poll_all(&handle);
 
@@ -438,10 +437,10 @@ fn decode_chunked(mut src: &[u8]) -> Vec<u8> {
 
 fn extract_cookie_token(header_val: &str, name: &str) -> Option<String> {
     for part in header_val.split(';') {
-        if let Some((k, v)) = part.trim().split_once('=') {
-            if k.trim() == name {
-                return Some(v.trim().to_owned());
-            }
+        if let Some((k, v)) = part.trim().split_once('=')
+            && k.trim() == name
+        {
+            return Some(v.trim().to_owned());
         }
     }
     None

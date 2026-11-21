@@ -3,7 +3,6 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +25,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use sentinel_cdr::policy::SanitizationPolicy;
 use sentinel_cdr::worker::{WorkerLauncher, WorkerRequest};
 use sentinel_core::enterprise::falcon::{CrowdStrikeFalconBridge, FalconTelemetryEvent};
-use sentinel_core::enterprise::intune::{IntunePolicyManager, SignedPolicyBundle};
+use sentinel_core::enterprise::intune::{
+    default_break_glass_nonce_store_path, default_enterprise_root_public_keys, BreakGlassToken,
+    IntunePolicyManager, SignedPolicyBundle,
+};
 use sentinel_core::enterprise::kiosk::{verify_kiosk_passport, AirGappedKioskManager};
 use sentinel_core::enterprise::ledger::{
     default_unified_ledger_path, get_or_init_global_shared_ledger, tokenize_path_for_ledger,
@@ -36,7 +38,9 @@ use sentinel_core::error::SentinelMetrics;
 use sentinel_core::interceptor::drive_watcher::DriveWatcher;
 use sentinel_core::interceptor::PendingDeviceConfirmationManager;
 use sentinel_core::scanner::quarantine::QuarantineVault;
-use sentinel_core::scanner::secure_shredder::{SecureShredder, ShredMethod, ShredReceipt};
+use sentinel_core::scanner::secure_shredder::{
+    validate_shred_receipt_fail_closed, SecureShredder, ShredMethod, ShredReceipt,
+};
 use sentinel_core::scanner::tier0_yara::Tier0YaraScanner;
 use sentinel_core::scanner::tier3_sandbox::{SandboxDetonationRequest, Tier3SandboxConnector};
 use sentinel_core::scanner::universal_scanner::{UniversalScanner, UniversalThreat};
@@ -141,6 +145,10 @@ enum Commands {
         /// Start the localhost API server without auto-launching a browser or native window
         #[arg(long, default_value_t = false)]
         no_browser: bool,
+
+        /// Optional explicitly allowlisted read-only kiosk intake root for POST /api/v1/scan (`CSE-17`)
+        #[arg(long)]
+        kiosk_intake_root: Option<PathBuf>,
     },
     /// Manage Microsoft Intune OMA-URI deployment profiles
     Intune {
@@ -158,13 +166,23 @@ enum Commands {
         #[arg(long)]
         endpoint: Option<String>,
     },
-    /// Run an Air-Gapped Kiosk session with posture verification, NIST SP 800-88 Rev. 2 shredding & signed CDR Passport
+    /// Manage the AEAD-encrypted SIEM CEF telemetry spool (`CSE-23`)
+    Siem {
+        #[command(subcommand)]
+        action: SiemAction,
+    },
+    /// Run an Air-Gapped Kiosk session with posture verification, real scan + isolated CDR disarm,
+    /// NIST SP 800-88 Rev. 2 session wipe & signed CDR Passport (`CSE-17`, `F-01`)
     Kiosk {
         /// Media serial number or identifier
         #[arg(short, long, default_value = "USB-MEDIA-SCADA-01")]
         media: String,
 
-        /// Optional sanitized export directory in which to emit signed .sentinel-passport.json
+        /// Read-only untrusted intake directory to scan and disarm through isolated CDR (`CSE-17`)
+        #[arg(long)]
+        intake_dir: Option<PathBuf>,
+
+        /// Optional sanitized export directory in which to write CDR-rebuilt outputs and .sentinel-passport.json
         #[arg(long)]
         export_dir: Option<PathBuf>,
     },
@@ -201,6 +219,24 @@ enum Commands {
         /// 128-bit hex user-presence confirmation challenge code or path to local .token file
         #[arg(long)]
         challenge: String,
+    },
+    /// Verify an ECDSA P-256 signed emergency break-glass token with expiry & nonce replay guard (`CSE-26`)
+    BreakGlass {
+        /// Path to ECDSA P-256 signed BreakGlassToken JSON file
+        #[arg(short, long)]
+        token: PathBuf,
+
+        /// Optional custom pinned enterprise root public key file (raw ECS1/SEC1 or hex; defaults to pinned enterprise roots)
+        #[arg(long)]
+        root_key: Option<PathBuf>,
+
+        /// Optional path to persistent break-glass nonce replay store
+        #[arg(long)]
+        nonce_store: Option<PathBuf>,
+
+        /// Optional path to AuditLedger JSONL file (defaults to unified global ledger)
+        #[arg(long)]
+        ledger: Option<PathBuf>,
     },
     /// Verify an enterprise signed policy bundle against pinned root public keys (Master Plan v2 §4.2 Sub-Phase 0.4)
     PolicyVerify {
@@ -261,7 +297,7 @@ enum VaultAction {
         #[arg(long, default_value = "keep")]
         action: String,
     },
-    /// Crypto-erase and shred a quarantined artifact from the vault (Master Plan v2 §1.1 #5)
+    /// Overwrite wrapped DEK and clear a quarantined artifact from the vault (NIST SP 800-88 Rev. 2 Clear)
     Purge {
         /// Quarantine entry UUID
         #[arg(short, long)]
@@ -301,6 +337,26 @@ enum VaultAction {
         #[arg(long)]
         hybrid_priv_key: PathBuf,
     },
+    /// Recover a broken TPM/DPAPI vault by decrypting `vault_kek.escrow` and atomically re-sealing `vault_kek.sealed` (`CSE-16`)
+    RecoverEscrow {
+        /// Vault directory path
+        #[arg(long, default_value = ".sentinel_vault")]
+        vault_dir: PathBuf,
+
+        /// Path to the offline SOC RSA-3072+ private key file
+        #[arg(long)]
+        soc_priv_key: PathBuf,
+    },
+    /// Recover a broken TPM/DPAPI vault via Hybrid Post-Quantum OCESCROW3 (`RSA-3072` + `ML-KEM-768`) and atomically re-seal `vault_kek.sealed` (`CSE-16`)
+    RecoverHybridEscrowV3 {
+        /// Vault directory path
+        #[arg(long, default_value = ".sentinel_vault")]
+        vault_dir: PathBuf,
+
+        /// Path to HybridSocPrivateKeyBundle JSON file
+        #[arg(long)]
+        hybrid_priv_key: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -310,6 +366,36 @@ enum LedgerAction {
         /// Path to audit ledger JSONL file (defaults to unified system audit ledger)
         #[arg(short, long)]
         path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SiemAction {
+    /// Drain undelivered SIEM CEF records from the encrypted on-disk spool over RFC 5425 TLS 1.3 / mTLS (`CSE-23`)
+    Flush {
+        /// RFC 5425 TLS 1.3 syslog endpoint (`tls://host:6514`; defaults to SENTINEL_SIEM_ENDPOINT)
+        #[arg(long)]
+        endpoint: Option<String>,
+
+        /// Optional explicit path to the encrypted SIEM spool file (`siem_spool.sealed`)
+        #[arg(long)]
+        spool_path: Option<PathBuf>,
+
+        /// Operator-pinned internal RFC 1918 / IPv6 ULA SIEM CIDR(s) permitted for egress
+        #[arg(long = "allow-private-cidr")]
+        allow_private_cidrs: Vec<String>,
+
+        /// Optional PEM client certificate path for TLS 1.3 mTLS
+        #[arg(long)]
+        client_cert_pem: Option<PathBuf>,
+
+        /// Optional PEM client private key path for TLS 1.3 mTLS
+        #[arg(long)]
+        client_key_pem: Option<PathBuf>,
+
+        /// Optional custom CA certificate PEM path for internal SIEM PKI
+        #[arg(long)]
+        custom_ca_pem: Option<PathBuf>,
     },
 }
 
@@ -408,8 +494,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let launcher = WorkerLauncher::new();
             let inspection = launcher.inspect_isolated(&bytes, file_name)?;
-            let yara =
-                Tier0YaraScanner::new().with_shared_ledger(get_or_init_global_shared_ledger(None));
+            let yara = Tier0YaraScanner::new_with_persisted_offline_packs()
+                .with_shared_ledger(get_or_init_global_shared_ledger(None));
             let yara_res = yara.scan_bytes(&bytes, &path.to_string_lossy());
             let threats = UniversalScanner::scan_file_checked(&path)?;
 
@@ -645,58 +731,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             passes,
             fill_free_space,
         } => {
-            println!("===========================================================");
-            println!("      OMNICONNECT SENTINEL: ANTI-FORENSIC SECURE SHREDDER  ");
-            println!("===========================================================");
-            println!("Target Path: {path:?}");
-            println!("Standard:    NIST SP 800-88 Rev. 2 Clear (Logical Overwrite + TRIM)");
-            println!(
-                "Overwrites:  {passes} Passes (0x00, 0xFF, CSPRNG + Read-Back Verification)\n"
-            );
-
-            let parent_dir = path.parent().map(|p| p.to_path_buf());
             let shared_ledger = get_or_init_global_shared_ledger(None);
-            match SecureShredder::shred_file_with_shared_ledger(
-                &path,
-                ShredMethod::ClearMultiPass { passes },
-                Some(&shared_ledger),
-            ) {
-                Ok(receipt) => {
-                    println!("⚡ [SHREDDING COMPLETE]");
-                    println!("   NIST Standard:        {}", receipt.nist_standard);
-                    println!("   Rev. 2 Category:      {:?}", receipt.rev2_category);
-                    println!("   Sanitization Level:   {}", receipt.sanitization_level);
-                    println!("   Media Type:           {}", receipt.media_type);
-                    println!("   Original File Size:   {} bytes", receipt.file_size_bytes);
-                    println!(
-                        "   Overwrites Completed: {} passes",
-                        receipt.passes_completed
-                    );
-                    println!(
-                        "   MFT Scramble Cycles:  {} cycles",
-                        receipt.rename_cycles_completed
-                    );
-                    println!("   Hardware Flushed:     {}", receipt.flush_succeeded);
-                    println!("   Verification Passed:  {}", receipt.verify_read_ok);
-                    println!(
-                        "   Verification Hash:    SHA256[{}]",
-                        receipt.final_pass_sha256
-                    );
-                    if fill_free_space {
-                        if let Some(dir) = parent_dir {
-                            if let Ok(filled) = SecureShredder::fill_free_space(&dir, 0) {
-                                println!(
-                                    "   Free-Space Fill:      {filled} bytes (best-effort logical fill)"
-                                );
-                            }
-                        }
-                    }
-                    println!("\n✅ File {path:?} overwritten, verified, and unlinked.");
-                }
-                Err(e) => {
-                    println!("❌ Shredding failed: {e}");
-                }
-            }
+            execute_shred_command(&path, passes, fill_free_space, Some(&shared_ledger), 0)?;
         }
         Commands::Watch { interval_ms } => {
             println!("===========================================================");
@@ -745,9 +781,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             demo,
             native,
             no_browser,
+            kiosk_intake_root,
         } => {
             // Serve the dashboard over localhost (127.0.0.1:{port}) with session auth & live /api/v1/status (`BUG-CLI-02` #2)
-            serve_dashboard_ui(port, demo, native, no_browser).await?;
+            serve_dashboard_ui(port, demo, native, no_browser, kiosk_intake_root).await?;
         }
         Commands::Intune { export } => {
             let shared_ledger = get_or_init_global_shared_ledger(None);
@@ -847,8 +884,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     format!("Rejected insecure SIEM endpoint '{trimmed_ep}': {err}").into(),
                 );
             }
+            let mut parsed_cidrs = Vec::new();
+            for c in sentinel_core::config::default_siem_allowed_private_cidrs() {
+                parsed_cidrs.push(
+                    sentinel_core::enterprise::falcon::AllowedCidr::parse(&c)
+                        .map_err(|e| format!("Invalid SIEM allowed private CIDR '{c}': {e}"))?,
+                );
+            }
             let shared_ledger = get_or_init_global_shared_ledger(None);
-            let bridge = CrowdStrikeFalconBridge::new(trimmed_ep).with_shared_ledger(shared_ledger);
+            let mut bridge = CrowdStrikeFalconBridge::new(trimmed_ep)
+                .with_shared_ledger(shared_ledger)
+                .with_allowed_private_cidrs(parsed_cidrs);
+            if let Some(ca_path) = sentinel_core::config::default_siem_ca_cert_path() {
+                sentinel_sys::ensure_not_symlink_or_reparse_point(&ca_path)?;
+                bridge = bridge.with_custom_ca(fs::read(&ca_path)?);
+            }
+            match (
+                sentinel_core::config::default_siem_client_cert_path(),
+                sentinel_core::config::default_siem_client_key_path(),
+            ) {
+                (Some(cert_path), Some(key_path)) => {
+                    sentinel_sys::ensure_not_symlink_or_reparse_point(&cert_path)?;
+                    sentinel_sys::ensure_not_symlink_or_reparse_point(&key_path)?;
+                    bridge = bridge.with_client_mtls(fs::read(&cert_path)?, fs::read(&key_path)?);
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(
+                        "MTLS_CONFIG_ERROR: Both SENTINEL_SIEM_CLIENT_CERT_PEM and SENTINEL_SIEM_CLIENT_KEY_PEM must be supplied together"
+                            .into(),
+                    );
+                }
+                (None, None) => {}
+            }
             let ev = FalconTelemetryEvent {
                 severity: 9,
                 signature_id: format!("SENTINEL-{}", event.to_uppercase()),
@@ -869,7 +936,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("CEF v0 Payload:\n{}\n", bridge.format_cef_payload(&ev));
             bridge.emit_alert(&ev)?;
         }
-        Commands::Kiosk { media, export_dir } => {
+        Commands::Siem { action } => match action {
+            SiemAction::Flush {
+                endpoint,
+                spool_path,
+                allow_private_cidrs,
+                client_cert_pem,
+                client_key_pem,
+                custom_ca_pem,
+            } => {
+                let resolved_ep =
+                    endpoint.unwrap_or_else(sentinel_core::config::default_siem_syslog_endpoint);
+                let trimmed_ep = resolved_ep.trim();
+                if let Err(err) = CrowdStrikeFalconBridge::validate_syslog_endpoint(trimmed_ep) {
+                    return Err(
+                        format!("Rejected insecure SIEM endpoint '{trimmed_ep}': {err}").into(),
+                    );
+                }
+
+                let mut parsed_cidrs = Vec::new();
+                let raw_cidrs = if allow_private_cidrs.is_empty() {
+                    sentinel_core::config::default_siem_allowed_private_cidrs()
+                } else {
+                    allow_private_cidrs
+                };
+                for c in &raw_cidrs {
+                    parsed_cidrs.push(
+                        sentinel_core::enterprise::falcon::AllowedCidr::parse(c)
+                            .map_err(|e| format!("Invalid --allow-private-cidr '{c}': {e}"))?,
+                    );
+                }
+
+                let shared_ledger = get_or_init_global_shared_ledger(None);
+                let mut bridge = match spool_path {
+                    Some(sp) => CrowdStrikeFalconBridge::with_spool_path(trimmed_ep, sp),
+                    None => CrowdStrikeFalconBridge::new(trimmed_ep),
+                }
+                .with_shared_ledger(shared_ledger)
+                .with_allowed_private_cidrs(parsed_cidrs);
+
+                if let Some(ca_path) =
+                    custom_ca_pem.or_else(sentinel_core::config::default_siem_ca_cert_path)
+                {
+                    sentinel_sys::ensure_not_symlink_or_reparse_point(&ca_path)?;
+                    bridge = bridge.with_custom_ca(fs::read(&ca_path)?);
+                }
+                let cert_opt =
+                    client_cert_pem.or_else(sentinel_core::config::default_siem_client_cert_path);
+                let key_opt =
+                    client_key_pem.or_else(sentinel_core::config::default_siem_client_key_path);
+                match (cert_opt, key_opt) {
+                    (Some(cert_path), Some(key_path)) => {
+                        sentinel_sys::ensure_not_symlink_or_reparse_point(&cert_path)?;
+                        sentinel_sys::ensure_not_symlink_or_reparse_point(&key_path)?;
+                        bridge =
+                            bridge.with_client_mtls(fs::read(&cert_path)?, fs::read(&key_path)?);
+                    }
+                    (Some(_), None) | (None, Some(_)) => {
+                        return Err(
+                            "MTLS_CONFIG_ERROR: Both --client-cert-pem and --client-key-pem must be supplied together"
+                                .into(),
+                        );
+                    }
+                    (None, None) => {}
+                }
+
+                let flushed = bridge.flush_spool()?;
+                println!("\n===========================================================");
+                println!("              SIEM SPOOL FLUSH COMPLETE (`CSE-23`)          ");
+                println!("===========================================================");
+                println!("Endpoint:        {trimmed_ep}");
+                println!("mTLS Enforced:   {}", bridge.is_mtls_enforced());
+                println!("Flushed Records: {flushed}");
+            }
+        },
+        Commands::Kiosk {
+            media,
+            intake_dir,
+            export_dir,
+        } => {
             if !sentinel_core::enterprise::kiosk::is_valid_media_id(&media) {
                 return Err(format!(
                     "Invalid media_id '{media}': must match ^[A-Za-z0-9_-]{{1,64}}$"
@@ -894,7 +1039,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_shared_ledger(shared_ledger.clone());
 
             println!("\n===========================================================");
-            println!("       AIR-GAPPED INDUSTRIAL KIOSK SESSION (IEC 62443)     ");
+            println!("          AIR-GAPPED INDUSTRIAL KIOSK SESSION              ");
             println!("===========================================================");
             let posture = kiosk.verify_posture();
             println!(
@@ -904,6 +1049,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     "NOT SET IN REGISTRY (Non-Compliant)"
                 }
+            );
+            println!(
+                "{}",
+                AirGappedKioskManager::format_hardware_write_blocker_banner(
+                    &posture.hardware_write_blocker
+                )
             );
 
             // Enforce strict endpoint posture gate before starting session (`Row 22`, `High #18`)
@@ -917,30 +1068,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("Session ID:                     {session_id}");
             println!("Ephemeral Session Workspace:    {session_dir:?}");
-            println!("Status:                         Executing Offline YARA & Deep CDR disarm...");
 
-            if let Some(exp_dir) = export_dir {
-                let mut intune = IntunePolicyManager::new().with_shared_ledger(shared_ledger);
+            if intake_dir.is_some() || export_dir.is_some() {
+                let mut intune =
+                    IntunePolicyManager::new().with_shared_ledger(shared_ledger.clone());
                 let pol = intune.load_active_policy();
-                let passport = kiosk.generate_passport_for_directory(
-                    &exp_dir,
-                    &media,
-                    &pol.policy_id,
-                    pol.version as u64,
-                    "DEEP_CDR_SANITIZED",
-                )?;
+                let vault = QuarantineVault::open(PathBuf::from(".sentinel_vault"))?
+                    .with_shared_ledger(shared_ledger.clone());
+                let launcher = WorkerLauncher::new();
+                let pipeline_res = execute_kiosk_intake_and_export(
+                    &kiosk,
+                    &vault,
+                    &launcher,
+                    &KioskPipelineParams {
+                        intake_dir: intake_dir.as_deref(),
+                        export_dir: export_dir.as_deref(),
+                        media_id: &media,
+                        policy_id: &pol.policy_id,
+                        policy_sequence: pol.version as u64,
+                        max_files: 2000,
+                    },
+                );
+                let wiped_files = kiosk.end_session_and_shred()?;
                 println!(
-                    "Signed CDR Passport Emitted:    {} ({} sanitized files)",
-                    passport.passport_id,
-                    passport.sanitized_files.len()
+                    "NIST SP 800-88 Rev. 2 Wipe:     COMPLETED ({wiped_files} session files shredded)"
+                );
+                let summary = pipeline_res?;
+                println!(
+                    "Files Scanned & CDR-Rebuilt:    {} file(s) (0 threats)",
+                    summary.files_sanitized
+                );
+                if let Some(passport) = summary.passport {
+                    println!(
+                        "Signed CDR Passport Emitted:    {} ({} sanitized files)",
+                        passport.passport_id,
+                        passport.sanitized_files.len()
+                    );
+                }
+            } else {
+                let wiped_files = kiosk.end_session_and_shred()?;
+                println!(
+                    "NIST SP 800-88 Rev. 2 Wipe:     COMPLETED ({wiped_files} session files shredded)"
                 );
             }
 
-            let wiped_files = kiosk.end_session_and_shred()?;
             println!(
-                "NIST SP 800-88 Rev. 2 Wipe:     COMPLETED ({wiped_files} session files shredded)"
+                "Kiosk Posture State:            {}",
+                format_honest_kiosk_posture_label(&posture)
             );
-            println!("IEC 62443 Compliance State:     SL-3 ENFORCED\n");
+            println!();
         }
         Commands::VerifyPassport {
             target,
@@ -975,6 +1151,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!(
                         "NTP Clock Sync:    {} ({})",
                         passport.ntp_sync.ntp_synchronized, passport.ntp_sync.clock_source
+                    );
+                    println!("Binary Exe SHA256: {}", passport.binary_exe_sha256);
+                    println!(
+                        "Binary .dep-v0:    {}",
+                        passport
+                            .binary_dep_v0_sha256
+                            .as_deref()
+                            .unwrap_or("NONE (non-auditable build)")
                     );
                     println!(
                         "Verified Files:    {} file(s) intact (ECDSA-P256-SHA256 valid)",
@@ -1052,7 +1236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let vault = QuarantineVault::open(vault_dir)?.with_shared_ledger(shared_ledger);
                 vault.purge(&id)?;
                 println!(
-                    "✅ Crypto-erased wrapped DEK and shredded quarantine entry '{id}' from vault."
+                    "✅ Overwrote wrapped DEK and cleared quarantine entry '{id}' (NIST SP 800-88 Rev. 2 Clear)."
                 );
             }
             VaultAction::VerifyEscrow {
@@ -1145,6 +1329,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     escrow_v3.soc_mlkem768_fingerprint
                 );
             }
+            VaultAction::RecoverEscrow {
+                vault_dir,
+                soc_priv_key,
+            } => {
+                let shared_ledger = get_or_init_global_shared_ledger(None);
+                execute_recover_escrow(&vault_dir, &soc_priv_key, Some(shared_ledger))?;
+            }
+            VaultAction::RecoverHybridEscrowV3 {
+                vault_dir,
+                hybrid_priv_key,
+            } => {
+                let shared_ledger = get_or_init_global_shared_ledger(None);
+                execute_recover_hybrid_escrow_v3(
+                    &vault_dir,
+                    &hybrid_priv_key,
+                    Some(shared_ledger),
+                )?;
+            }
         },
         Commands::Ledger { action } => match action {
             LedgerAction::Verify { path } => {
@@ -1187,6 +1389,116 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "✅ Physical user-presence challenge verified. Re-enabled USB device node: {device_id}"
             );
         }
+        Commands::BreakGlass {
+            token,
+            root_key,
+            nonce_store,
+            ledger,
+        } => {
+            let token_file =
+                sentinel_sys::open_untrusted_readonly_nofollow(&token).map_err(|e| {
+                    format!(
+                        "Failed opening break-glass token '{}': {e}",
+                        token.display()
+                    )
+                })?;
+            let mut token_file = token_file;
+            let token_bytes =
+                sentinel_sys::read_untrusted_to_end_bounded(&mut token_file, 256 * 1024).map_err(
+                    |e| {
+                        format!(
+                            "Failed reading break-glass token '{}': {e}",
+                            token.display()
+                        )
+                    },
+                )?;
+            let parsed_token: BreakGlassToken = serde_json::from_slice(&token_bytes)
+                .map_err(|e| format!("Invalid BreakGlassToken JSON: {e}"))?;
+
+            let trusted_roots = if let Some(rk_path) = root_key {
+                let raw_rk = fs::read(&rk_path).map_err(|e| {
+                    format!(
+                        "Failed reading break-glass root public key '{}': {e}",
+                        rk_path.display()
+                    )
+                })?;
+                // Support both raw 72-byte ECS1 / 65-byte SEC1 binary blobs and hex-encoded public key files
+                let decoded_rk = if raw_rk.len() == 72 || raw_rk.len() == 65 {
+                    raw_rk
+                } else {
+                    let trimmed_hex = String::from_utf8_lossy(&raw_rk).trim().to_string();
+                    hex::decode(&trimmed_hex).map_err(|e| {
+                        format!(
+                            "Root public key '{}' is neither raw ECS1/SEC1 nor valid hex: {e}",
+                            rk_path.display()
+                        )
+                    })?
+                };
+                vec![decoded_rk]
+            } else {
+                default_enterprise_root_public_keys()
+            };
+
+            let resolved_nonce_store =
+                nonce_store.unwrap_or_else(default_break_glass_nonce_store_path);
+            let now_unix = chrono::Utc::now().timestamp();
+            let shared_ledger = if let Some(ledger_path) = ledger {
+                sentinel_core::enterprise::ledger::create_shared_audit_ledger(&ledger_path)?
+            } else {
+                get_or_init_global_shared_ledger(None)
+            };
+
+            match parsed_token.verify(&trusted_roots, &resolved_nonce_store, now_unix) {
+                Ok(outcome) => {
+                    if let Some(ref dev_id) = outcome.target_device_id {
+                        sentinel_sys::enable_device_node(dev_id).map_err(|e| {
+                            format!(
+                                "Break-glass token '{}' verified, but OS enable_device_node('{dev_id}') failed: {e}",
+                                outcome.token_id
+                            )
+                        })?;
+                    }
+                    if let Ok(mut guard) = shared_ledger.lock() {
+                        let _ = guard.append_subsystem_event(
+                            AuditSubsystem::System,
+                            "BREAK_GLASS_ACTIVATED",
+                            serde_json::json!({
+                                "token_id": outcome.token_id,
+                                "operator_id": outcome.operator_id,
+                                "incident_ticket": outcome.incident_ticket,
+                                "scope": outcome.scope,
+                                "target_device_id": outcome.target_device_id,
+                                "expires_at_unix": outcome.expires_at_unix,
+                                "nonce_sha256": outcome.nonce_sha256,
+                            }),
+                        );
+                    }
+                    println!(
+                        "✅ Break-glass token '{}' verified and activated for operator '{}' (ticket: {}, scope: {}, expires_at_unix: {}).",
+                        outcome.token_id,
+                        outcome.operator_id,
+                        outcome.incident_ticket,
+                        outcome.scope,
+                        outcome.expires_at_unix
+                    );
+                }
+                Err(err) => {
+                    if let Ok(mut guard) = shared_ledger.lock() {
+                        let _ = guard.append_subsystem_event(
+                            AuditSubsystem::System,
+                            "BREAK_GLASS_REJECTED",
+                            serde_json::json!({
+                                "token_id": parsed_token.token_id,
+                                "operator_id": parsed_token.operator_id,
+                                "reason": err.to_string(),
+                            }),
+                        );
+                    }
+                    eprintln!("❌ [BREAK-GLASS REJECTED]: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1226,63 +1538,507 @@ fn execute_verify_escrow(
     Ok(())
 }
 
-/// Interactive Threat Remediation (`BUG-CLI-01`, `BUG-CORE-02`, `BUG-CORE-06`):
-/// 1. Reuses a single `QuarantineVault` instance (`BUG-CORE-02`).
-/// 2. Routes NTFS Alternate Data Stream threats (`threat.stream_name.is_some()`) to
-///    `SecureShredder::shred_ntfs_stream` so the host file is preserved (`BUG-CLI-01` #1).
-/// 3. Shreds the original plaintext file (`quarantine_file` calls `SecureShredder::shred_file`
-///    and we also ensure any ADS stream is shredded) so plaintext never remains on the USB volume (`BUG-CLI-01` #2).
-fn prompt_remediation(threat: &UniversalThreat, vault: &QuarantineVault) -> Result<(), String> {
-    println!("\n================================================================================");
-    println!("🚨 [THREAT IDENTIFIED]: {:?}", threat.file_path);
-    if let Some(stream) = &threat.stream_name {
-        println!("   NTFS Stream:  {stream}");
+/// Executes `sentinel vault recover-escrow`, decrypting `vault_kek.escrow` with the offline SOC
+/// RSA-3072+ private key, atomically re-sealing `vault_kek.sealed` on this host, zeroizing key
+/// buffers unconditionally, and recording `VAULT_ESCROW_RECOVERED` in the audit ledger (`CSE-16`).
+fn execute_recover_escrow(
+    vault_dir: &Path,
+    soc_priv_key: &Path,
+    shared_ledger: Option<sentinel_core::enterprise::ledger::SharedAuditLedger>,
+) -> Result<(String, sentinel_sys::KeyProtectionPosture), String> {
+    let mut priv_bytes = fs::read(soc_priv_key).map_err(|e| {
+        format!(
+            "Failed reading offline SOC RSA private key '{}': {e}",
+            soc_priv_key.display()
+        )
+    })?;
+    let recover_res = QuarantineVault::recover_from_soc_escrow_with_shared_ledger(
+        vault_dir.to_path_buf(),
+        &priv_bytes,
+        shared_ledger,
+    );
+    sentinel_sys::zeroize_slice(&mut priv_bytes);
+    let vault = recover_res?;
+    let kek_id = vault.kek_id().to_string();
+    let posture = vault.key_posture();
+    println!("✅ Quarantine Vault recovered via offline SOC RSA-3072+ escrow and re-sealed!");
+    println!("   Vault Dir:   {}", vault_dir.display());
+    println!("   KEK ID:      {kek_id}");
+    println!("   Key Posture: {posture:?}");
+    Ok((kek_id, posture))
+}
+
+/// Executes `sentinel vault recover-hybrid-escrow-v3`, decapsulating `OCESCROW3` (`RSA-3072` +
+/// `ML-KEM-768`), atomically re-sealing `vault_kek.sealed`, zeroizing raw key material, and
+/// recording `VAULT_HYBRID_PQC_ESCROW_V3_RECOVERED` in the audit ledger (`CSE-16`).
+fn execute_recover_hybrid_escrow_v3(
+    vault_dir: &Path,
+    hybrid_priv_key: &Path,
+    shared_ledger: Option<sentinel_core::enterprise::ledger::SharedAuditLedger>,
+) -> Result<(String, sentinel_sys::KeyProtectionPosture), String> {
+    let mut raw_priv = fs::read(hybrid_priv_key).map_err(|e| {
+        format!(
+            "Failed reading HybridSocPrivateKeyBundle '{}': {e}",
+            hybrid_priv_key.display()
+        )
+    })?;
+    let parse_res: Result<sentinel_sys::HybridSocPrivateKeyBundle, _> =
+        serde_json::from_slice(&raw_priv);
+    sentinel_sys::zeroize_slice(&mut raw_priv);
+    let priv_bundle =
+        parse_res.map_err(|e| format!("Invalid HybridSocPrivateKeyBundle JSON: {e}"))?;
+    let vault = QuarantineVault::recover_from_hybrid_soc_escrow_v3_with_shared_ledger(
+        vault_dir.to_path_buf(),
+        &priv_bundle,
+        shared_ledger,
+    )?;
+    let kek_id = vault.kek_id().to_string();
+    let posture = vault.key_posture();
+    println!("✅ Quarantine Vault recovered via Hybrid PQC OCESCROW3 escrow and re-sealed!");
+    println!("   Vault Dir:   {}", vault_dir.display());
+    println!("   KEK ID:      {kek_id}");
+    println!("   Key Posture: {posture:?}");
+    Ok((kek_id, posture))
+}
+
+/// Summary returned by real Kiosk intake scanning + isolated CDR sanitization (`CSE-17`, `F-01`).
+struct KioskPipelineSummary {
+    files_sanitized: usize,
+    passport: Option<sentinel_core::enterprise::kiosk::KioskSanitizationPassport>,
+}
+
+/// Formats an honest posture status derived directly from `PostureReport` (`CSE-17`, `F-01`).
+/// Never prints `"SL-3 ENFORCED"` without physical hardware write-blocker attestation.
+fn format_honest_kiosk_posture_label(posture: &sentinel_sys::PostureReport) -> String {
+    if posture.is_compliant() {
+        "SOFTWARE_POSTURE_VERIFIED (Hardware Write-Blocker: NOT_DETECTED; IEC 62443 SL-3 requires physical hardware controls)".to_string()
+    } else {
+        "NON_COMPLIANT (Software Posture Gates Incomplete)".to_string()
     }
-    println!("   Carrier:      {:?}", threat.carrier_category);
-    println!("   Threat Name:  {}", threat.threat_name);
-    println!(
+}
+
+fn collect_kiosk_intake_files_recursive(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<(), String> {
+    sentinel_sys::ensure_not_symlink_or_reparse_point(dir).map_err(|e| {
+        format!(
+            "KIOSK_INTAKE_SYMLINK_REJECTED: '{}' is a symlink or reparse point: {e}",
+            dir.display()
+        )
+    })?;
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for item in fs::read_dir(dir).map_err(|e| {
+        format!(
+            "Failed reading kiosk intake directory '{}': {e}",
+            dir.display()
+        )
+    })? {
+        let entry = item.map_err(|e| format!("Kiosk intake walk error: {e}"))?;
+        entries.push(entry.path());
+    }
+    entries.sort();
+
+    for path in entries {
+        sentinel_sys::ensure_not_symlink_or_reparse_point(&path).map_err(|e| {
+            format!(
+                "KIOSK_INTAKE_SYMLINK_REJECTED: '{}' is a symlink or reparse point: {e}",
+                path.display()
+            )
+        })?;
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|e| format!("Failed reading metadata for '{}': {e}", path.display()))?;
+        if sentinel_sys::is_reparse_point_or_symlink(&meta) {
+            return Err(format!(
+                "KIOSK_INTAKE_SYMLINK_REJECTED: '{}' is a symlink or reparse point",
+                path.display()
+            ));
+        }
+        if meta.is_dir() {
+            collect_kiosk_intake_files_recursive(root, &path, out)?;
+        } else if meta.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| format!("Failed stripping intake prefix: {e}"))?
+                .to_path_buf();
+            out.push((rel, path));
+        }
+    }
+    Ok(())
+}
+
+/// Parameters for real Kiosk intake scanning + isolated CDR sanitization (`CSE-17`, `F-01`).
+struct KioskPipelineParams<'a> {
+    intake_dir: Option<&'a Path>,
+    export_dir: Option<&'a Path>,
+    media_id: &'a str,
+    policy_id: &'a str,
+    policy_sequence: u64,
+    max_files: usize,
+}
+
+/// Real Air-Gapped Kiosk intake scan + isolated CDR disarm + fail-closed passport issuance (`CSE-17`, `F-01`).
+///
+/// Guarantees:
+/// - Refuses to sign `--export-dir` unless `--intake-dir` is supplied and scanned.
+/// - Refuses empty intake directories (0 files scanned) or incomplete scans (`!scan_report.complete`).
+/// - Quarantines every detected threat or CDR-rejected file via `quarantine_readonly_evidence`
+///   and aborts without writing any file or `.sentinel-passport.json` into `--export-dir`.
+/// - Writes **only** CDR-rebuilt bytes returned by `WorkerLauncher::sanitize_isolated` (Invariant I3).
+fn execute_kiosk_intake_and_export(
+    kiosk: &AirGappedKioskManager,
+    vault: &QuarantineVault,
+    launcher: &WorkerLauncher,
+    params: &KioskPipelineParams<'_>,
+) -> Result<KioskPipelineSummary, String> {
+    let Some(in_dir) = params.intake_dir else {
+        return Err(
+            "KIOSK_INTAKE_REQUIRED: --export-dir requires --intake-dir; refusing to sign unscanned files"
+                .to_string(),
+        );
+    };
+
+    sentinel_sys::ensure_not_symlink_or_reparse_point(in_dir).map_err(|e| {
+        format!(
+            "KIOSK_INTAKE_SYMLINK_REJECTED: Intake directory '{}' is a symlink or reparse point: {e}",
+            in_dir.display()
+        )
+    })?;
+    let intake_meta = fs::symlink_metadata(in_dir).map_err(|e| {
+        format!(
+            "KIOSK_INTAKE_INVALID: Cannot read intake directory '{}': {e}",
+            in_dir.display()
+        )
+    })?;
+    if sentinel_sys::is_reparse_point_or_symlink(&intake_meta) || !intake_meta.is_dir() {
+        return Err(format!(
+            "KIOSK_INTAKE_INVALID: '{}' is not a regular non-symlink directory",
+            in_dir.display()
+        ));
+    }
+
+    let scan_limit = params.max_files.max(1);
+    let scan_report = UniversalScanner::scan_directory_detailed(in_dir, scan_limit);
+    if !scan_report.complete {
+        return Err(format!(
+            "KIOSK_SCAN_INCOMPLETE: Intake scan did not complete cleanly ({} error(s)); passport refused",
+            scan_report.errors.len()
+        ));
+    }
+    if scan_report.files_scanned == 0 {
+        return Err(
+            "KIOSK_INTAKE_EMPTY: 0 files found in --intake-dir; refusing to certify empty media"
+                .to_string(),
+        );
+    }
+    if !scan_report.threats.is_empty() {
+        let mut quarantined_count = 0usize;
+        let mut quarantine_errors: Vec<String> = Vec::new();
+        for threat in &scan_report.threats {
+            match vault.quarantine_readonly_evidence(
+                &threat.file_path,
+                &threat.threat_name,
+                threat.risk_score,
+            ) {
+                Ok(_) => quarantined_count += 1,
+                Err(q_err) => quarantine_errors.push(q_err),
+            }
+        }
+        let err_suffix = if quarantine_errors.is_empty() {
+            String::new()
+        } else {
+            format!("; quarantine_errors={:?}", quarantine_errors)
+        };
+        return Err(format!(
+            "KIOSK_THREATS_DETECTED: {} threat(s) detected on intake media ({quarantined_count} quarantined{err_suffix}); export and passport refused",
+            scan_report.threats.len()
+        ));
+    }
+
+    let mut intake_files = Vec::new();
+    collect_kiosk_intake_files_recursive(in_dir, in_dir, &mut intake_files)?;
+    if intake_files.is_empty() {
+        return Err(
+            "KIOSK_INTAKE_EMPTY: 0 regular files collected from --intake-dir; passport refused"
+                .to_string(),
+        );
+    }
+
+    let policy = SanitizationPolicy::default();
+    let mut sanitized_batch: Vec<(PathBuf, Vec<u8>, String)> =
+        Vec::with_capacity(intake_files.len());
+    for (rel_path, abs_path) in &intake_files {
+        let mut f = sentinel_sys::open_untrusted_readonly_nofollow(abs_path).map_err(|e| {
+            format!(
+                "KIOSK_INTAKE_READ_ERROR: Failed opening '{}': {e}",
+                abs_path.display()
+            )
+        })?;
+        let raw_bytes = sentinel_sys::read_untrusted_to_end_bounded(&mut f, 64 * 1024 * 1024)
+            .map_err(|e| {
+                format!(
+                    "KIOSK_INTAKE_READ_ERROR: Failed reading '{}': {e}",
+                    abs_path.display()
+                )
+            })?;
+        let file_name = abs_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("intake.bin")
+            .to_string();
+
+        match launcher.sanitize_isolated(WorkerRequest {
+            file_name,
+            policy: policy.clone(),
+            raw_bytes,
+        }) {
+            Ok(outcome) => {
+                let cdr_action = format!("DEEP_CDR_RECONSTRUCTED:{:?}", outcome.detected_format);
+                sanitized_batch.push((rel_path.clone(), outcome.clean_bytes, cdr_action));
+            }
+            Err(cdr_err) => {
+                let q_note = match vault.quarantine_readonly_evidence(
+                    abs_path,
+                    &format!("CDR.Rejected: {cdr_err}"),
+                    90,
+                ) {
+                    Ok(entry) => format!("quarantined={}", entry.entry_id),
+                    Err(q_err) => format!("quarantine_error={q_err}"),
+                };
+                return Err(format!(
+                    "KIOSK_CDR_REJECTED: Isolated CDR rejected '{}' ({q_note}): {cdr_err}; export and passport refused",
+                    rel_path.display()
+                ));
+            }
+        }
+    }
+
+    let files_sanitized = sanitized_batch.len();
+    let passport = if let Some(exp_dir) = params.export_dir {
+        Some(kiosk.export_sanitized_batch_with_passport(
+            exp_dir,
+            params.media_id,
+            params.policy_id,
+            params.policy_sequence,
+            &sanitized_batch,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(KioskPipelineSummary {
+        files_sanitized,
+        passport,
+    })
+}
+
+/// Executes `sentinel shred` with fail-closed receipt verification and explicit error propagation
+/// for both shredding and `--fill-free-space` (`CSE-15`, `I6`).
+fn execute_shred_command(
+    path: &Path,
+    passes: u8,
+    fill_free_space: bool,
+    shared_ledger: Option<&sentinel_core::enterprise::ledger::SharedAuditLedger>,
+    max_free_space_bytes: u64,
+) -> Result<ShredReceipt, String> {
+    println!("===========================================================");
+    println!("      OMNICONNECT SENTINEL: ANTI-FORENSIC SECURE SHREDDER  ");
+    println!("===========================================================");
+    println!("Target Path: {path:?}");
+    println!("Standard:    NIST SP 800-88 Rev. 2 Clear (Logical Overwrite + TRIM)");
+    println!("Overwrites:  {passes} Passes (0x00, 0xFF, CSPRNG + Read-Back Verification)\n");
+
+    let parent_dir = path.parent().map(|p| p.to_path_buf());
+    match SecureShredder::shred_file_with_shared_ledger(
+        path,
+        ShredMethod::ClearMultiPass { passes },
+        shared_ledger,
+    ) {
+        Ok(receipt) => {
+            if let Err(verify_err) = validate_shred_receipt_fail_closed(&receipt) {
+                eprintln!("⚠️ [SHRED INCOMPLETE / UNVERIFIED]: {verify_err}");
+                return Err(verify_err);
+            }
+            println!("⚡ [SHREDDING COMPLETE]");
+            println!("   NIST Standard:        {}", receipt.nist_standard);
+            println!("   Rev. 2 Category:      {:?}", receipt.rev2_category);
+            println!("   Sanitization Level:   {}", receipt.sanitization_level);
+            println!("   Media Type:           {}", receipt.media_type);
+            println!("   Original File Size:   {} bytes", receipt.file_size_bytes);
+            println!(
+                "   Overwrites Completed: {} passes",
+                receipt.passes_completed
+            );
+            println!(
+                "   MFT Scramble Cycles:  {} cycles",
+                receipt.rename_cycles_completed
+            );
+            println!("   Hardware Flushed:     {}", receipt.flush_succeeded);
+            println!("   Verification Passed:  {}", receipt.verify_read_ok);
+            println!(
+                "   Verification Hash:    SHA256[{}]",
+                receipt.final_pass_sha256
+            );
+            if fill_free_space {
+                if let Some(dir) = parent_dir {
+                    let filled = SecureShredder::fill_free_space(&dir, max_free_space_bytes)
+                        .map_err(|e| format!("Free-space fill failed after shredding: {e}"))?;
+                    println!("   Free-Space Fill:      {filled} bytes (best-effort logical fill)");
+                }
+            }
+            println!("\n✅ File {path:?} overwritten, verified, and unlinked.");
+            Ok(receipt)
+        }
+        Err(e) => {
+            eprintln!("❌ Shredding failed: {e}");
+            Err(format!("Shredding failed: {e}"))
+        }
+    }
+}
+
+/// Outcome returned by interactive threat remediation (`CSE-15`, `F-13`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemediationOutcome {
+    Shredded,
+    Quarantined,
+    Skipped,
+    ShredAborted,
+}
+
+/// Interactive Threat Remediation helper (`BUG-CLI-01`, `CSE-15`, `F-13`):
+/// 1. Reuses a single `QuarantineVault` instance (`BUG-CORE-02`).
+/// 2. Defaults empty Enter / unrecognized input to safe `[3] SKIP` and fails closed on EOF
+///    so accidental Enter presses or closed stdin never trigger irreversible shredding (`CSE-15`).
+/// 3. Requires explicit secondary `"SHRED"` confirmation before running `SecureShredder`,
+///    and gates success reporting on `validate_shred_receipt_fail_closed(&receipt)` (`I6`).
+/// 4. Routes NTFS Alternate Data Stream threats (`threat.stream_name.is_some()`) to
+///    `SecureShredder::shred_ntfs_stream` so the host file is preserved (`BUG-CLI-01` #1).
+fn prompt_remediation(threat: &UniversalThreat, vault: &QuarantineVault) -> Result<(), String> {
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let mut stdout = std::io::stdout();
+    prompt_remediation_with_io(threat, vault, &mut reader, &mut stdout).map(|_| ())
+}
+
+fn prompt_remediation_with_io<R: std::io::BufRead, W: std::io::Write>(
+    threat: &UniversalThreat,
+    vault: &QuarantineVault,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<RemediationOutcome, String> {
+    let _ = writeln!(
+        writer,
+        "\n================================================================================"
+    );
+    let _ = writeln!(writer, "🚨 [THREAT IDENTIFIED]: {:?}", threat.file_path);
+    if let Some(stream) = &threat.stream_name {
+        let _ = writeln!(writer, "   NTFS Stream:  {stream}");
+    }
+    let _ = writeln!(writer, "   Carrier:      {:?}", threat.carrier_category);
+    let _ = writeln!(writer, "   Threat Name:  {}", threat.threat_name);
+    let _ = writeln!(
+        writer,
         "   Severity:     {:?} (Risk Score: {}/100)",
         threat.severity, threat.risk_score
     );
-    println!("   MITRE ATT&CK: {}", threat.mitre_technique);
-    println!("   Details:      {}", threat.technical_details);
-    println!("--------------------------------------------------------------------------------");
-    println!("REMEDIATION CHOICES:");
-    println!("  [1] PERMANENT ANTI-FORENSIC SHRED (NIST 800-88 Clear (logical))");
-    println!("  [2] QUARANTINE TO ENCRYPTED VAULT (AES-256-GCM + Shred Original Plaintext)");
-    println!("  [3] SKIP / LEAVE UNTOUCHED");
-    print!("Select action [1-3] (Default: 1): ");
-    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let _ = writeln!(writer, "   MITRE ATT&CK: {}", threat.mitre_technique);
+    let _ = writeln!(writer, "   Details:      {}", threat.technical_details);
+    let _ = writeln!(
+        writer,
+        "--------------------------------------------------------------------------------"
+    );
+    let _ = writeln!(writer, "REMEDIATION CHOICES:");
+    let _ = writeln!(
+        writer,
+        "  [1] PERMANENT ANTI-FORENSIC SHRED (NIST 800-88 Clear (logical) — requires 'SHRED' confirmation)"
+    );
+    let _ = writeln!(
+        writer,
+        "  [2] QUARANTINE TO ENCRYPTED VAULT (AES-256-GCM + Clear Original Plaintext)"
+    );
+    let _ = writeln!(writer, "  [3] SKIP / LEAVE UNTOUCHED (Safe Default)");
+    write!(writer, "Select action [1-3] (Default: 3 - SKIP): ").map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
 
     let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|e| e.to_string())?;
+    let bytes_read = reader.read_line(&mut input).map_err(|e| e.to_string())?;
+    if bytes_read == 0 {
+        let _ = writeln!(
+            writer,
+            "⚠️ Interactive remediation aborted on EOF (fail-closed: file untouched)."
+        );
+        return Err(
+            "Interactive remediation aborted on EOF (fail-closed: no file modified)".into(),
+        );
+    }
     let choice = input.trim();
 
-    if choice.is_empty() || choice == "1" {
+    if choice == "1" {
+        write!(
+            writer,
+            "Type 'SHRED' to confirm irreversible NIST 800-88 Clear (anything else aborts): "
+        )
+        .map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())?;
+
+        let mut confirm = String::new();
+        let confirm_bytes = reader.read_line(&mut confirm).map_err(|e| e.to_string())?;
+        if confirm_bytes == 0 {
+            let _ = writeln!(
+                writer,
+                "⚠️ Shred confirmation aborted on EOF (fail-closed: file untouched)."
+            );
+            return Err("Shred confirmation aborted on EOF (fail-closed: no file modified)".into());
+        }
+        if confirm.trim() != "SHRED" {
+            let _ = writeln!(
+                writer,
+                "⚠️ Shred confirmation did not match 'SHRED'; file left untouched."
+            );
+            return Ok(RemediationOutcome::ShredAborted);
+        }
+
         if let Some(stream_name) = &threat.stream_name {
-            println!(
+            let _ = writeln!(
+                writer,
                 "⚡ Surgically shredding NTFS Alternate Data Stream '{stream_name}' while preserving host file..."
             );
             let receipt = vault.shred_ads_to_vault_ledger(&threat.file_path, stream_name)?;
-            println!(
+            if let Err(verify_err) = validate_shred_receipt_fail_closed(&receipt) {
+                let _ = writeln!(writer, "⚠️ [SHRED INCOMPLETE / UNVERIFIED]: {verify_err}");
+                return Err(verify_err);
+            }
+            let _ = writeln!(
+                writer,
                 "✅ [ADS STREAM ERADICATED]: {} ({} bytes overwritten, {}). Host file preserved!",
                 receipt.original_path, receipt.file_size_bytes, receipt.sanitization_level
             );
         } else {
-            println!("⚡ Executing NIST 800-88 Clear (logical) multi-pass shredding...");
+            let _ = writeln!(
+                writer,
+                "⚡ Executing NIST 800-88 Clear (logical) multi-pass shredding..."
+            );
             let receipt = vault.shred_file_to_vault_ledger(
                 &threat.file_path,
                 ShredMethod::ClearMultiPass { passes: 3 },
             )?;
-            println!(
+            if let Err(verify_err) = validate_shred_receipt_fail_closed(&receipt) {
+                let _ = writeln!(writer, "⚠️ [SHRED INCOMPLETE / UNVERIFIED]: {verify_err}");
+                return Err(verify_err);
+            }
+            let _ = writeln!(
+                writer,
                 "✅ [PERMANENTLY ERADICATED]: {} ({} bytes overwritten, {}).",
                 receipt.original_path, receipt.file_size_bytes, receipt.sanitization_level
             );
         }
+        Ok(RemediationOutcome::Shredded)
     } else if choice == "2" {
-        println!("🔒 Quarantining to encrypted vault, verifying copy on disk (I4), and shredding source...");
+        let _ = writeln!(
+            writer,
+            "🔒 Quarantining to encrypted vault, verifying copy on disk (I4), and clearing source..."
+        );
         let q = if let Some(stream_name) = &threat.stream_name {
             vault.quarantine_ntfs_stream(
                 &threat.file_path,
@@ -1297,14 +2053,16 @@ fn prompt_remediation(threat: &UniversalThreat, vault: &QuarantineVault) -> Resu
                 threat.risk_score,
             )?
         };
-        println!("✅ Quarantined to: {}", q.vault_file_path);
-        println!(
+        let _ = writeln!(writer, "✅ Quarantined to: {}", q.vault_file_path);
+        let _ = writeln!(
+            writer,
             "✅ Source plaintext verified in vault and overwritten/unlinked via SecureShredder."
         );
+        Ok(RemediationOutcome::Quarantined)
     } else {
-        println!("⚠️ Threat skipped per user request.");
+        let _ = writeln!(writer, "⚠️ Threat skipped (safe default — file untouched).");
+        Ok(RemediationOutcome::Skipped)
     }
-    Ok(())
 }
 
 /// Strict CSP for the local Web Dashboard (`Row 177`):
@@ -1313,15 +2071,20 @@ fn prompt_remediation(threat: &UniversalThreat, vault: &QuarantineVault) -> Resu
 pub const STRICT_DASHBOARD_CSP: &str =
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'";
 
+/// Maximum TTL (seconds) for one-time restricted bootstrap handoff files (`CSE-22`).
+const BOOTSTRAP_HANDOFF_TTL_SECS: u64 = 30;
+
 /// Shared state for the Axum Web Dashboard router (`Sub-Phase 5.1`, `Rows 172–185, 206, 227`).
 pub struct DashboardAppState {
     pub port: u16,
     pub demo_mode: bool,
     pub bootstrap_token: Mutex<Option<(String, std::time::Instant)>>,
+    pub bootstrap_handoff_files: Mutex<Vec<PathBuf>>,
     pub session_id: String,
     pub csrf_token: String,
     pub dashboard_dir: PathBuf,
     pub ui_staging_root: PathBuf,
+    pub kiosk_intake_root: Option<PathBuf>,
     pub shred_scan_semaphore: Arc<Semaphore>,
     pub last_scan_complete: AtomicBool,
     pub last_scan_errors: Mutex<Vec<String>>,
@@ -1351,16 +2114,55 @@ impl DashboardAppState {
             port,
             demo_mode,
             bootstrap_token: Mutex::new(Some((bootstrap_token, std::time::Instant::now()))),
+            bootstrap_handoff_files: Mutex::new(Vec::new()),
             session_id,
             csrf_token,
             dashboard_dir,
             ui_staging_root,
+            kiosk_intake_root: None,
             shred_scan_semaphore: Arc::new(Semaphore::new(2)),
             last_scan_complete: AtomicBool::new(true),
             last_scan_errors: Mutex::new(Vec::new()),
             recent_events: Mutex::new(events),
             last_shred_receipt: Mutex::new(None),
         }
+    }
+
+    /// Registers a short-lived bootstrap handoff/redirect file for immediate cleanup upon exchange (`CSE-22`).
+    pub fn register_bootstrap_handoff_file(&self, path: PathBuf) {
+        let mut guard = match self.bootstrap_handoff_files.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.push(path);
+    }
+
+    /// Overwrites and deletes all registered bootstrap handoff/redirect files immediately (`CSE-22`).
+    pub fn cleanup_bootstrap_handoff_files(&self) {
+        let paths: Vec<PathBuf> = {
+            let mut guard = match self.bootstrap_handoff_files.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::take(&mut *guard)
+        };
+        for p in paths {
+            shred_and_remove_handoff_file(&p);
+        }
+    }
+}
+
+impl Drop for DashboardAppState {
+    fn drop(&mut self) {
+        self.cleanup_bootstrap_handoff_files();
+    }
+}
+
+impl DashboardAppState {
+    /// Configures an explicitly allowlisted read-only kiosk intake root for `POST /api/v1/scan` (`CSE-17`).
+    pub fn with_kiosk_intake_root(mut self, kiosk_intake_root: Option<PathBuf>) -> Self {
+        self.kiosk_intake_root = kiosk_intake_root;
+        self
     }
 
     #[cfg(test)]
@@ -1621,8 +2423,10 @@ async fn handle_session_exchange(
         Err(poisoned) => poisoned.into_inner(),
     };
 
+    let mut expired = false;
     let valid = if let Some((ref expected, created_at)) = *guard {
         if created_at.elapsed().as_secs() > 120 {
+            expired = true;
             false
         } else {
             let provided = req.bootstrap_token.trim().as_bytes();
@@ -1638,6 +2442,11 @@ async fn handle_session_exchange(
     };
 
     if !valid {
+        if expired {
+            let _ = guard.take();
+            drop(guard);
+            state.cleanup_bootstrap_handoff_files();
+        }
         return with_security_headers(
             StatusCode::UNAUTHORIZED,
             "application/json; charset=utf-8",
@@ -1645,8 +2454,10 @@ async fn handle_session_exchange(
         );
     }
 
-    // Single-use: consume it immediately
+    // Single-use: consume bootstrap token and delete any on-disk handoff/redirect files immediately (`CSE-22`)
     let _ = guard.take();
+    drop(guard);
+    state.cleanup_bootstrap_handoff_files();
 
     let cookie_val = format!(
         "sentinel_sid={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400",
@@ -1668,6 +2479,59 @@ async fn handle_session_exchange(
     resp
 }
 
+fn is_prohibited_vault_infra_path(raw_lower: &str) -> bool {
+    raw_lower.contains(".sentinel_vault")
+        || raw_lower.contains(".sentinel_audit")
+        || raw_lower.contains(".sentinel_shadow_cache")
+        || raw_lower.contains("audit.jsonl")
+        || raw_lower.contains("vault_kek")
+        || raw_lower.contains("ledger_key.sealed")
+        || raw_lower.contains("privacy_hmac.sealed")
+        || raw_lower.contains("head.sig")
+        || raw_lower.contains("spool_key.sealed")
+        || raw_lower.contains("siem_spool")
+        || raw_lower.contains("sentinel_unified_audit")
+}
+
+/// Validates that a configured scan root (`ui_staging_root` or `--kiosk-intake-root`) is neither
+/// vault infrastructure nor a symlink/reparse point, and returns its canonical directory path (`CSE-17`).
+fn validate_safe_scan_root(root: &Path) -> Result<PathBuf, (StatusCode, &'static str)> {
+    let root_lower = root.to_string_lossy().to_lowercase();
+    if is_prohibited_vault_infra_path(&root_lower) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Access to Sentinel vault infrastructure is prohibited",
+        ));
+    }
+    if sentinel_sys::ensure_not_symlink_or_reparse_point(root).is_err() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Reparse points and symbolic links are prohibited",
+        ));
+    }
+    let meta = fs::symlink_metadata(root).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Scan root directory does not exist",
+        )
+    })?;
+    if sentinel_sys::is_reparse_point_or_symlink(&meta) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Reparse points and symbolic links are prohibited",
+        ));
+    }
+    if !meta.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, "Scan root path is not a directory"));
+    }
+    root.canonicalize().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed resolving scan root directory",
+        )
+    })
+}
+
 pub fn resolve_contained_ui_target(
     user_path: &Path,
     staging_root: &Path,
@@ -1683,16 +2547,7 @@ pub fn resolve_contained_ui_target(
         ));
     }
     let raw_lower = raw_str.to_lowercase();
-    if raw_lower.contains(".sentinel_vault")
-        || raw_lower.contains("audit.jsonl")
-        || raw_lower.contains("vault_kek")
-        || raw_lower.contains("ledger_key.sealed")
-        || raw_lower.contains("privacy_hmac.sealed")
-        || raw_lower.contains("head.sig")
-        || raw_lower.contains("spool_key.sealed")
-        || raw_lower.contains("siem_spool")
-        || raw_lower.contains("sentinel_unified_audit")
-    {
+    if is_prohibited_vault_infra_path(&raw_lower) {
         return Err((
             StatusCode::FORBIDDEN,
             "Access to Sentinel vault infrastructure is prohibited",
@@ -1746,15 +2601,7 @@ pub fn resolve_contained_ui_target(
         ));
     }
 
-    let canonical_root = match staging_root.canonicalize() {
-        Ok(r) => r,
-        Err(_) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed resolving UI staging root",
-            ))
-        }
-    };
+    let canonical_root = validate_safe_scan_root(staging_root)?;
 
     // 4. Absolute path containment check: verify boundary BEFORE probing exists()
     let candidate = if user_path.is_absolute() {
@@ -2055,7 +2902,42 @@ async fn handle_api_scan(
 
     let req: ScanApiRequest = serde_json::from_slice(&body).unwrap_or_default();
     let target_path = if let Some(ref p) = req.path {
-        match resolve_contained_ui_target(&PathBuf::from(p), &state.ui_staging_root) {
+        let candidate = PathBuf::from(p);
+        let primary = resolve_contained_ui_target(&candidate, &state.ui_staging_root);
+        let resolved = match primary {
+            Ok(t) => Ok(t),
+            Err(primary_err) => {
+                // Only fall back to `--kiosk-intake-root` when the primary check was NOT a hard
+                // symlink/traversal/vault violation inside `ui_staging_root`:
+                // - relative path missing in `ui_staging_root` (`404`), OR
+                // - absolute path outside `ui_staging_root` (`403` boundary mismatch).
+                let allow_intake_fallback = primary_err.0 == StatusCode::NOT_FOUND
+                    || (candidate.is_absolute()
+                        && primary_err.0 == StatusCode::FORBIDDEN
+                        && primary_err.1
+                            == "Target path is outside the designated UI staging root");
+                if allow_intake_fallback {
+                    if let Some(ref intake_root) = state.kiosk_intake_root {
+                        match resolve_contained_ui_target(&candidate, intake_root) {
+                            Ok(t) => Ok(t),
+                            Err(intake_err) => {
+                                // Never downgrade a primary 403 external-path rejection to 400/404/500 (zero oracle)
+                                if primary_err.0 == StatusCode::FORBIDDEN {
+                                    Err(primary_err)
+                                } else {
+                                    Err(intake_err)
+                                }
+                            }
+                        }
+                    } else {
+                        Err(primary_err)
+                    }
+                } else {
+                    Err(primary_err)
+                }
+            }
+        };
+        match resolved {
             Ok(t) => t,
             Err((status, msg)) => {
                 return with_security_headers(
@@ -2069,8 +2951,40 @@ async fn handle_api_scan(
                 );
             }
         }
+    } else if let Some(ref intake_root) = state.kiosk_intake_root {
+        match validate_safe_scan_root(intake_root) {
+            Ok(canonical_intake) => canonical_intake,
+            Err((status, msg)) => {
+                state.last_scan_complete.store(false, Ordering::Relaxed);
+                return with_security_headers(
+                    status,
+                    "application/json; charset=utf-8",
+                    serde_json::to_vec(&serde_json::json!({
+                        "error": "INVALID_KIOSK_INTAKE_ROOT",
+                        "complete": false,
+                        "message": msg,
+                    }))
+                    .unwrap_or_default(),
+                );
+            }
+        }
     } else {
-        state.ui_staging_root.clone()
+        match validate_safe_scan_root(&state.ui_staging_root) {
+            Ok(canonical_staging) => canonical_staging,
+            Err((status, msg)) => {
+                state.last_scan_complete.store(false, Ordering::Relaxed);
+                return with_security_headers(
+                    status,
+                    "application/json; charset=utf-8",
+                    serde_json::to_vec(&serde_json::json!({
+                        "error": "INVALID_STAGING_ROOT",
+                        "complete": false,
+                        "message": msg,
+                    }))
+                    .unwrap_or_default(),
+                );
+            }
+        }
     };
     let max_files = req.max_files.unwrap_or(500).clamp(1, 5000);
 
@@ -2105,6 +3019,23 @@ async fn handle_api_scan(
             );
         }
     };
+
+    // Fail closed if 0 files were scanned so empty staging folders can never certify USB media clean (`CSE-17`, `F-01`)
+    if report.files_scanned == 0 {
+        state.last_scan_complete.store(false, Ordering::Relaxed);
+        return with_security_headers(
+            StatusCode::BAD_REQUEST,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&serde_json::json!({
+                "error": "EMPTY_SCAN_TARGET",
+                "complete": false,
+                "files_scanned": 0,
+                "threats": [],
+                "message": "0 files scanned — configure --kiosk-intake-root or stage files before scanning",
+            }))
+            .unwrap_or_default(),
+        );
+    }
 
     state
         .last_scan_complete
@@ -2151,6 +3082,20 @@ async fn handle_api_scan(
 struct ShredApiRequest {
     path: Option<String>,
     create_ephemeral_canary: Option<bool>,
+}
+
+/// Maps a `SecureShredder` error message to the appropriate HTTP status and error code (`CSE-15`).
+/// Verification or hardware-flush failures return HTTP 500 (`SHRED_VERIFICATION_FAILED`);
+/// caller/input failures return HTTP 400 (`SHRED_OPERATION_FAILED`).
+fn classify_shred_error_http(err: &str) -> (StatusCode, &'static str) {
+    if err.starts_with("SHRED_VERIFICATION_FAILED") {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SHRED_VERIFICATION_FAILED",
+        )
+    } else {
+        (StatusCode::BAD_REQUEST, "SHRED_OPERATION_FAILED")
+    }
 }
 
 async fn handle_api_shred(
@@ -2237,11 +3182,12 @@ async fn handle_api_shred(
     let receipt = match shred_result {
         Ok(Ok(r)) => r,
         Ok(Err(err)) => {
+            let (status, error_code) = classify_shred_error_http(&err);
             return with_security_headers(
-                StatusCode::BAD_REQUEST,
+                status,
                 "application/json; charset=utf-8",
                 serde_json::to_vec(&serde_json::json!({
-                    "error": "SHRED_OPERATION_FAILED",
+                    "error": error_code,
                     "message": err,
                 }))
                 .unwrap_or_default(),
@@ -2259,6 +3205,18 @@ async fn handle_api_shred(
             );
         }
     };
+
+    if let Err(verify_err) = validate_shred_receipt_fail_closed(&receipt) {
+        return with_security_headers(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&serde_json::json!({
+                "error": "SHRED_VERIFICATION_FAILED",
+                "message": verify_err,
+            }))
+            .unwrap_or_default(),
+        );
+    }
 
     if let Ok(mut guard) = state.last_shred_receipt.lock() {
         *guard = Some(receipt.clone());
@@ -2467,11 +3425,120 @@ fn resolve_native_rune_ui_binary() -> Option<PathBuf> {
     None
 }
 
+/// Safely overwrites (via no-follow handle) and deletes a short-lived bootstrap handoff/redirect
+/// file, refusing to follow symlinks or NTFS reparse points (`CSE-22`).
+fn shred_and_remove_handoff_file(path: &Path) {
+    if sentinel_sys::ensure_not_symlink_or_reparse_point(path).is_err() {
+        return;
+    }
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.is_file() || sentinel_sys::is_reparse_point_or_symlink(&meta) {
+        return;
+    }
+    if let Ok(mut file) = sentinel_sys::open_write_through(path) {
+        let len = (meta.len() as usize).clamp(64, 4096);
+        let zeros = vec![0u8; len];
+        let _ = std::io::Write::write_all(&mut file, &zeros);
+        let _ = file.set_len(0);
+        let _ = file.sync_all();
+    }
+    let _ = fs::remove_file(path);
+}
+
+/// Writes a short-lived, ACL-restricted (`0600` / user-only DACL) JSON handoff file containing
+/// the one-time bootstrap token and a 30-second expiry timestamp for native `sentinel-ui` (`CSE-22`).
+fn write_native_bootstrap_handoff_file(
+    staging_root: &Path,
+    bootstrap_token: &str,
+    ttl_secs: u64,
+) -> std::io::Result<PathBuf> {
+    let handoff_path = staging_root.join(format!(
+        "bootstrap_handoff_{}.json",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let expires_unix = chrono::Utc::now().timestamp() + (ttl_secs as i64);
+    let payload = serde_json::json!({
+        "bootstrap_token": bootstrap_token,
+        "expires_unix": expires_unix,
+    })
+    .to_string();
+    sentinel_sys::create_restricted_file_atomic(&handoff_path, payload.as_bytes())?;
+    Ok(handoff_path)
+}
+
+/// Writes a short-lived, ACL-restricted (`0600` / user-only DACL) local HTML one-time redirect file
+/// so `rundll32`/`open`/`xdg-open` process command lines NEVER contain `#bootstrap=<token>` (`CSE-22`).
+fn write_browser_redirect_handoff_file(
+    staging_root: &Path,
+    actual_port: u16,
+    bootstrap_token: &str,
+) -> std::io::Result<PathBuf> {
+    let target_url = format!("http://127.0.0.1:{actual_port}/#bootstrap={bootstrap_token}");
+    if !is_valid_dashboard_launch_url(&target_url) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Refusing to write browser redirect: URL failed strict loopback validation",
+        ));
+    }
+    let html_path = staging_root.join(format!(
+        "bootstrap_launch_{}.html",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let html = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0;url={target_url}\"><title>OmniConnect Sentinel</title></head><body>Redirecting to local OmniConnect Sentinel station...</body></html>"
+    );
+    sentinel_sys::create_restricted_file_atomic(&html_path, html.as_bytes())?;
+    Ok(html_path)
+}
+
+/// Builds the CLI argument vector for launching native `sentinel-ui` strictly via `--bootstrap-file`
+/// (guaranteeing zero secret bootstrap token on process command lines, `CSE-22`, `T50`).
+fn build_native_ui_launch_args(
+    actual_port: u16,
+    handoff_file: &Path,
+    demo_mode: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "--port".to_string(),
+        actual_port.to_string(),
+        "--bootstrap-file".to_string(),
+        handoff_file.to_string_lossy().into_owned(),
+    ];
+    if demo_mode {
+        args.push("--demo".to_string());
+    }
+    args
+}
+
+/// Builds the OS browser launcher binary + argument vector targeting the local one-time redirect file
+/// (guaranteeing zero `#bootstrap=` or token on `rundll32`/`open`/`xdg-open` command lines, `CSE-22`, `T50`).
+fn build_browser_launch_command(handoff_html_path: &Path) -> (&'static str, Vec<String>) {
+    let path_str = handoff_html_path.to_string_lossy().into_owned();
+    #[cfg(target_os = "windows")]
+    {
+        (
+            "rundll32.exe",
+            vec!["url.dll,FileProtocolHandler".to_string(), path_str],
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ("open", vec![path_str])
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        ("xdg-open", vec![path_str])
+    }
+}
+
 async fn serve_dashboard_ui(
     port: u16,
     demo_mode: bool,
     native_rune: bool,
     no_browser: bool,
+    kiosk_intake_root: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = SocketAddr::from(([127, 0, 0, 1], port));
     let std_listener = std::net::TcpListener::bind(bind_addr)?;
@@ -2495,10 +3562,19 @@ async fn serve_dashboard_ui(
     };
     let _ = sentinel_sys::create_restricted_dir_atomic(&ui_staging_root);
 
-    let launch_url = format!("http://127.0.0.1:{actual_port}/#bootstrap={bootstrap_token}");
-    if !is_valid_dashboard_launch_url(&launch_url) {
-        return Err("Refusing to launch browser: URL failed strict ^http://127\\.0\\.0\\.1:\\d+/ validation".into());
-    }
+    let dashboard_dir = resolve_dashboard_dir();
+    let state = Arc::new(
+        DashboardAppState::new(
+            actual_port,
+            demo_mode,
+            bootstrap_token.clone(),
+            session_id,
+            csrf_token,
+            dashboard_dir,
+            ui_staging_root.clone(),
+        )
+        .with_kiosk_intake_root(kiosk_intake_root),
+    );
 
     info!("===========================================================");
     info!("   OmniConnect Sentinel - Localhost Defense Station Server ");
@@ -2506,29 +3582,35 @@ async fn serve_dashboard_ui(
     println!("\n🖥️ [SENTINEL DASHBOARD SERVER ACTIVE (AXUM)]");
     println!("   Bound Address:  http://127.0.0.1:{actual_port}/");
     println!("   Bootstrap Code: {bootstrap_token}");
-    println!("   One-Time URL:   {launch_url}");
     println!(
-        "   Auth Model:     Single-Use Bootstrap (#bootstrap=...) -> HttpOnly Cookie + CSRF Header"
+        "   Auth Model:     Single-Use Restricted Handoff File (30s TTL) -> HttpOnly Cookie + CSRF Header"
     );
     println!("   Staging Root:   {}", ui_staging_root.display());
 
     if native_rune {
         if let Some(rune_bin) = resolve_native_rune_ui_binary() {
+            let handoff_file = write_native_bootstrap_handoff_file(
+                &ui_staging_root,
+                &bootstrap_token,
+                BOOTSTRAP_HANDOFF_TTL_SECS,
+            )?;
+            state.register_bootstrap_handoff_file(handoff_file.clone());
+            let ttl_path = handoff_file.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(BOOTSTRAP_HANDOFF_TTL_SECS))
+                    .await;
+                shred_and_remove_handoff_file(&ttl_path);
+            });
+
             println!(
                 "   UI Surface:     Native RUNE Framework GPU App ({})",
                 rune_bin.display()
             );
+            let launch_args = build_native_ui_launch_args(actual_port, &handoff_file, demo_mode);
             let mut cmd = std::process::Command::new(&rune_bin);
-            cmd.args([
-                "--port",
-                &actual_port.to_string(),
-                "--bootstrap",
-                &bootstrap_token,
-            ]);
-            if demo_mode {
-                cmd.arg("--demo");
-            }
+            cmd.args(&launch_args);
             if let Err(err) = cmd.spawn() {
+                state.cleanup_bootstrap_handoff_files();
                 tracing::warn!(
                     "Failed spawning native Rune UI ({}): {err}",
                     rune_bin.display()
@@ -2537,38 +3619,30 @@ async fn serve_dashboard_ui(
         } else {
             println!("   UI Surface:     Native RUNE binary not built yet.");
             println!("   Build Hint:     cargo build --manifest-path sentinel-ui/Cargo.toml");
-            println!("   Fallback URL:   {launch_url}");
+            println!("   Local Station:  http://127.0.0.1:{actual_port}/");
         }
     } else if !no_browser {
-        #[cfg(target_os = "windows")]
+        // Launch default browser via short-lived restricted HTML redirect file so no
+        // `#bootstrap=<token>` ever appears in process command-line arguments (`CSE-22`, `T50`).
+        let redirect_html =
+            write_browser_redirect_handoff_file(&ui_staging_root, actual_port, &bootstrap_token)?;
+        state.register_bootstrap_handoff_file(redirect_html.clone());
+        let ttl_path = redirect_html.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(BOOTSTRAP_HANDOFF_TTL_SECS)).await;
+            shred_and_remove_handoff_file(&ttl_path);
+        });
+
+        let (launcher_bin, launcher_args) = build_browser_launch_command(&redirect_html);
+        if let Err(err) = std::process::Command::new(launcher_bin)
+            .args(&launcher_args)
+            .spawn()
         {
-            // Launch default browser via rundll32 FileProtocolHandler without invoking cmd.exe (`BUG-CLI-02`, `Row 179`)
-            let _ = std::process::Command::new("rundll32.exe")
-                .args(["url.dll,FileProtocolHandler", &launch_url])
-                .spawn();
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("open").arg(&launch_url).spawn();
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let _ = std::process::Command::new("xdg-open")
-                .arg(&launch_url)
-                .spawn();
+            state.cleanup_bootstrap_handoff_files();
+            tracing::warn!("Failed launching browser via {launcher_bin}: {err}");
         }
     }
 
-    let dashboard_dir = resolve_dashboard_dir();
-    let state = Arc::new(DashboardAppState::new(
-        actual_port,
-        demo_mode,
-        bootstrap_token,
-        session_id,
-        csrf_token,
-        dashboard_dir,
-        ui_staging_root,
-    ));
     let app = build_dashboard_router(state);
 
     let listener = tokio::net::TcpListener::from_std(std_listener)?;
@@ -3354,6 +4428,1028 @@ mod tests {
         assert!(is_restricted_runtime_dir_writable(&staging_root));
 
         let _ = fs::remove_dir_all(&staging_root);
+        Ok(())
+    }
+
+    #[test]
+    fn t37_prompt_remediation_safe_default_eof_abort_and_shred_confirmation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sentinel_core::scanner::universal_scanner::{CarrierCategory, ThreatSeverity};
+        use std::io::Cursor;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "sentinel_t37_cli_remediation_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&test_root)?;
+        let vault_dir = test_root.join("vault");
+        let vault = QuarantineVault::open(vault_dir)?;
+
+        let sample_path = test_root.join("critical_backup_2026.enc");
+        fs::write(&sample_path, b"CRITICAL_CUSTOMER_BACKUP_DO_NOT_LOSE")?;
+
+        let threat = UniversalThreat {
+            file_path: sample_path.clone(),
+            carrier_category: CarrierCategory::Executable,
+            threat_name: "Heuristic.HighEntropy.FalsePositive".to_string(),
+            severity: ThreatSeverity::High,
+            risk_score: 96,
+            mitre_technique: "T1027".to_string(),
+            technical_details: "Simulated false-positive encrypted backup".to_string(),
+            overlay_offset: None,
+            stream_name: None,
+            can_disarm_via_cdr: false,
+        };
+
+        // 1. Empty Enter press MUST default to safe SKIP (file untouched)
+        let mut out = Vec::new();
+        let mut empty_enter = Cursor::new(b"\n".as_slice());
+        let outcome = prompt_remediation_with_io(&threat, &vault, &mut empty_enter, &mut out)?;
+        assert_eq!(outcome, RemediationOutcome::Skipped);
+        assert!(
+            sample_path.exists(),
+            "Empty Enter press must NEVER shred the file"
+        );
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(out_str.contains("Default: 3 - SKIP"));
+
+        // 1b. Unrecognized non-empty input MUST also default safely to SKIP (file untouched)
+        for bad_input in [b"9\n".as_slice(), b"abc\n".as_slice()] {
+            out.clear();
+            let mut bad_reader = Cursor::new(bad_input);
+            let bad_outcome =
+                prompt_remediation_with_io(&threat, &vault, &mut bad_reader, &mut out)?;
+            assert_eq!(bad_outcome, RemediationOutcome::Skipped);
+            assert!(
+                sample_path.exists(),
+                "Unrecognized input must leave file intact"
+            );
+        }
+
+        // 1c. Verify POST /api/v1/shred HTTP error classification (`CSE-15`)
+        assert_eq!(
+            classify_shred_error_http(
+                "SHRED_VERIFICATION_FAILED: verification_passed=false, flush_succeeded=true"
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SHRED_VERIFICATION_FAILED"
+            )
+        );
+        assert_eq!(
+            classify_shred_error_http("Target file does not exist: foo.bin"),
+            (StatusCode::BAD_REQUEST, "SHRED_OPERATION_FAILED")
+        );
+
+        // 2. Closed stdin (EOF) MUST fail closed and leave file untouched
+        out.clear();
+        let mut eof_reader = Cursor::new(b"".as_slice());
+        let eof_res = prompt_remediation_with_io(&threat, &vault, &mut eof_reader, &mut out);
+        assert!(eof_res.is_err(), "EOF must fail closed");
+        assert!(sample_path.exists(), "EOF must NEVER shred the file");
+
+        // 3. Selecting [1] without typing exact uppercase 'SHRED' confirmation MUST abort safely
+        for wrong in [b"1\nyes\n".as_slice(), b"1\nshred\n".as_slice()] {
+            out.clear();
+            let mut wrong_confirm = Cursor::new(wrong);
+            let abort_outcome =
+                prompt_remediation_with_io(&threat, &vault, &mut wrong_confirm, &mut out)?;
+            assert_eq!(abort_outcome, RemediationOutcome::ShredAborted);
+            assert!(
+                sample_path.exists(),
+                "Missing exact uppercase 'SHRED' confirmation must leave file intact"
+            );
+        }
+
+        // 4. Selecting [1] + EOF on confirmation MUST fail closed
+        out.clear();
+        let mut confirm_eof = Cursor::new(b"1\n".as_slice());
+        let confirm_eof_res =
+            prompt_remediation_with_io(&threat, &vault, &mut confirm_eof, &mut out);
+        assert!(confirm_eof_res.is_err());
+        assert!(sample_path.exists());
+
+        // 5. Selecting [1] + exact 'SHRED' executes verified NIST 800-88 Clear
+        out.clear();
+        let mut explicit_shred = Cursor::new(b"1\nSHRED\n".as_slice());
+        let shred_outcome =
+            prompt_remediation_with_io(&threat, &vault, &mut explicit_shred, &mut out)?;
+        assert_eq!(shred_outcome, RemediationOutcome::Shredded);
+        assert!(
+            !sample_path.exists(),
+            "Explicit '1' + 'SHRED' must overwrite, verify, and unlink the target"
+        );
+
+        // 6. On Windows NTFS, verify ADS branch of `prompt_remediation_with_io` removes only the stream
+        #[cfg(windows)]
+        {
+            let ads_host = test_root.join("ads_host_doc.txt");
+            fs::write(&ads_host, b"BENIGN_HOST_DATA_T37")?;
+            let ads_stream_path = format!("{}:hidden_payload", ads_host.display());
+            if fs::write(&ads_stream_path, b"HIDDEN_ADS_PAYLOAD_T37").is_ok() {
+                let ads_threat = UniversalThreat {
+                    file_path: ads_host.clone(),
+                    carrier_category: CarrierCategory::FilesystemHidden,
+                    threat_name: "NTFS.ADS.Test".to_string(),
+                    severity: ThreatSeverity::High,
+                    risk_score: 92,
+                    mitre_technique: "T1564.004".to_string(),
+                    technical_details: "Test NTFS ADS stream".to_string(),
+                    overlay_offset: None,
+                    stream_name: Some("hidden_payload".to_string()),
+                    can_disarm_via_cdr: false,
+                };
+                out.clear();
+                let mut ads_shred = Cursor::new(b"1\nSHRED\n".as_slice());
+                let ads_outcome =
+                    prompt_remediation_with_io(&ads_threat, &vault, &mut ads_shred, &mut out)?;
+                assert_eq!(ads_outcome, RemediationOutcome::Shredded);
+                assert!(
+                    ads_host.exists(),
+                    "Host file must remain intact after ADS shred"
+                );
+                assert_eq!(fs::read(&ads_host)?, b"BENIGN_HOST_DATA_T37");
+                assert!(
+                    fs::metadata(&ads_stream_path).is_err(),
+                    "ADS stream must be unlinked after shred"
+                );
+            }
+        }
+
+        // 7. Verify `execute_shred_command` fails closed (non-zero CLI exit) on missing file
+        //    and succeeds with bounded `--fill-free-space` on an existing file
+        let ledger_path = test_root.join("t37_cmd_ledger.jsonl");
+        let shared_ledger = Arc::new(Mutex::new(AuditLedger::open_result(&ledger_path)?));
+        let missing_target = test_root.join("does_not_exist_t37.bin");
+        assert!(
+            execute_shred_command(&missing_target, 3, false, Some(&shared_ledger), 0).is_err(),
+            "Commands::Shred must propagate Err for missing target"
+        );
+        let cmd_target = test_root.join("cmd_shred_target.bin");
+        fs::write(&cmd_target, vec![0xAAu8; 4096])?;
+        let cmd_receipt = execute_shred_command(&cmd_target, 3, true, Some(&shared_ledger), 65536)?;
+        assert!(cmd_receipt.verification_passed && cmd_receipt.flush_succeeded);
+        assert!(!cmd_target.exists());
+
+        // 8. Verify live `POST /api/v1/shred` router hits `classify_shred_error_http` and returns
+        //    HTTP 400 `SHRED_OPERATION_FAILED` when shredding a directory inside staging root
+        let staging_root = test_root.join("ui_staging");
+        let staging_subdir = staging_root.join("non_file_dir");
+        fs::create_dir_all(&staging_subdir)?;
+        let bootstrap_token = "t37_bootstrap_token_fixed_0123456789abcdef".to_string();
+        let session_id = "t37_session_id_fixed_0123456789abcdef".to_string();
+        let csrf_token = "t37_csrf_token_fixed_0123456789abcdef".to_string();
+        let state = Arc::new(DashboardAppState::new(
+            8091,
+            false,
+            bootstrap_token,
+            session_id.clone(),
+            csrf_token.clone(),
+            staging_root.clone(),
+            staging_root.clone(),
+        ));
+        let router = build_dashboard_router(state);
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let bad_shred_req = Request::builder()
+                .method("POST")
+                .uri("/api/v1/shred")
+                .header(header::HOST, "127.0.0.1:8091")
+                .header(header::ORIGIN, "http://127.0.0.1:8091")
+                .header(header::COOKIE, format!("sentinel_sid={session_id}"))
+                .header("x-sentinel-csrf", &csrf_token)
+                .body(Body::from(
+                    serde_json::json!({ "path": "non_file_dir" }).to_string(),
+                ))?;
+            let bad_resp = router.clone().oneshot(bad_shred_req).await?;
+            assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+            let bad_body = axum::body::to_bytes(bad_resp.into_body(), 1024 * 64).await?;
+            let bad_json: serde_json::Value = serde_json::from_slice(&bad_body)?;
+            assert_eq!(bad_json["error"], "SHRED_OPERATION_FAILED");
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })?;
+
+        let _ = fs::remove_dir_all(&test_root);
+        Ok(())
+    }
+
+    #[test]
+    fn t39_cli_vault_recover_escrow_and_hybrid_v3_end_to_end(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_root = std::env::temp_dir().join(format!(
+            "sentinel_t39_cli_escrow_recover_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&test_root)?;
+
+        // 1. Classical RSA-3072 escrow recovery end-to-end via `execute_recover_escrow`
+        let rsa_vault_dir = test_root.join("rsa_vault");
+        let rsa_ledger_path = test_root.join("rsa_ledger.jsonl");
+        let rsa_ledger = Arc::new(Mutex::new(AuditLedger::open_result(&rsa_ledger_path)?));
+        let (rsa_pub, rsa_priv) = sentinel_sys::generate_soc_rsa_keypair()?;
+        let (_, wrong_rsa_priv) = sentinel_sys::generate_soc_rsa_keypair()?;
+
+        let rsa_priv_path = test_root.join("soc_rsa_priv.der");
+        let wrong_priv_path = test_root.join("wrong_rsa_priv.der");
+        fs::write(&rsa_priv_path, &rsa_priv)?;
+        fs::write(&wrong_priv_path, &wrong_rsa_priv)?;
+
+        let sample_payload = b"CRITICAL_OT_CALIBRATION_RECIPE_T39_RSA";
+        let sample_file = test_root.join("turbine_recipe_rsa.bin");
+        fs::write(&sample_file, sample_payload)?;
+
+        let vault = QuarantineVault::open_with_soc_public_key(rsa_vault_dir.clone(), &rsa_pub)?
+            .with_shared_ledger(rsa_ledger.clone());
+        let expected_kek_id = vault.kek_id().to_string();
+        let entry = vault.quarantine_file(&sample_file, "T39.FalsePositive.RSA")?;
+        drop(vault);
+
+        // Corrupt host `vault_kek.sealed` to simulate dead TPM/motherboard
+        let sealed_path = rsa_vault_dir.join("vault_kek.sealed");
+        fs::write(&sealed_path, b"CORRUPTED_TPM_SEALED_BLOB")?;
+        assert!(
+            QuarantineVault::open(rsa_vault_dir.clone()).is_err(),
+            "Corrupted vault_kek.sealed must fail closed before recovery"
+        );
+
+        // Wrong SOC private key MUST fail closed without overwriting `vault_kek.sealed`
+        assert!(
+            execute_recover_escrow(&rsa_vault_dir, &wrong_priv_path, Some(rsa_ledger.clone()))
+                .is_err()
+        );
+        assert_eq!(fs::read(&sealed_path)?, b"CORRUPTED_TPM_SEALED_BLOB");
+
+        // Correct SOC private key recovers, re-seals `vault_kek.sealed`, logs event, and restores file
+        let (rec_kek_id, _) =
+            execute_recover_escrow(&rsa_vault_dir, &rsa_priv_path, Some(rsa_ledger.clone()))?;
+        assert_eq!(rec_kek_id, expected_kek_id);
+        let reopened = QuarantineVault::open(rsa_vault_dir.clone())?;
+        let restored_path = test_root.join("restored_rsa.bin");
+        reopened.restore_file(&entry.entry_id, &restored_path)?;
+        assert_eq!(fs::read(&restored_path)?, sample_payload);
+        let rsa_log = fs::read_to_string(&rsa_ledger_path)?;
+        assert!(rsa_log.contains("VAULT_ESCROW_RECOVERED"));
+
+        // 2. Hybrid PQC OCESCROW3 recovery end-to-end via `execute_recover_hybrid_escrow_v3`
+        let pqc_vault_dir = test_root.join("pqc_vault");
+        let pqc_ledger_path = test_root.join("pqc_ledger.jsonl");
+        let pqc_ledger = Arc::new(Mutex::new(AuditLedger::open_result(&pqc_ledger_path)?));
+        let (pub_b, priv_b) = sentinel_sys::generate_hybrid_soc_keypair_with_bits(3072)?;
+        let (_, wrong_priv_b) = sentinel_sys::generate_hybrid_soc_keypair_with_bits(3072)?;
+
+        let pqc_priv_path = test_root.join("soc_hybrid_priv.json");
+        let wrong_pqc_path = test_root.join("wrong_hybrid_priv.json");
+        fs::write(&pqc_priv_path, serde_json::to_vec_pretty(&priv_b)?)?;
+        fs::write(&wrong_pqc_path, serde_json::to_vec_pretty(&wrong_priv_b)?)?;
+
+        let pqc_payload = b"CRITICAL_SUBSTATION_FW_T39_OCESCROW3";
+        let pqc_file = test_root.join("substation_fw_pqc.bin");
+        fs::write(&pqc_file, pqc_payload)?;
+
+        let pqc_vault =
+            QuarantineVault::open(pqc_vault_dir.clone())?.with_shared_ledger(pqc_ledger.clone());
+        let pqc_expected_kek = pqc_vault.kek_id().to_string();
+        pqc_vault.provision_hybrid_soc_escrow_v3(&pub_b)?;
+        let pqc_entry = pqc_vault.quarantine_file(&pqc_file, "T39.FalsePositive.PQC")?;
+        drop(pqc_vault);
+
+        // Delete `vault_kek.sealed` completely to simulate total disk/TPM replacement
+        let pqc_sealed = pqc_vault_dir.join("vault_kek.sealed");
+        fs::remove_file(&pqc_sealed)?;
+        assert!(!pqc_sealed.exists());
+
+        // Wrong hybrid bundle must fail closed without creating `vault_kek.sealed`
+        assert!(execute_recover_hybrid_escrow_v3(
+            &pqc_vault_dir,
+            &wrong_pqc_path,
+            Some(pqc_ledger.clone())
+        )
+        .is_err());
+        assert!(!pqc_sealed.exists());
+
+        // Correct hybrid bundle recovers, re-seals, logs event, and restores exact plaintext
+        let (rec_pqc_kek, _) = execute_recover_hybrid_escrow_v3(
+            &pqc_vault_dir,
+            &pqc_priv_path,
+            Some(pqc_ledger.clone()),
+        )?;
+        assert_eq!(rec_pqc_kek, pqc_expected_kek);
+        assert!(pqc_sealed.exists());
+        let pqc_reopened = QuarantineVault::open(pqc_vault_dir.clone())?;
+        let pqc_restored = test_root.join("restored_pqc.bin");
+        pqc_reopened.restore_file(&pqc_entry.entry_id, &pqc_restored)?;
+        assert_eq!(fs::read(&pqc_restored)?, pqc_payload);
+        let pqc_log = fs::read_to_string(&pqc_ledger_path)?;
+        assert!(pqc_log.contains("VAULT_HYBRID_PQC_ESCROW_V3_RECOVERED"));
+
+        // Verify Clap CLI parses both new recovery subcommands cleanly
+        let parsed_rsa = Cli::try_parse_from([
+            "sentinel",
+            "vault",
+            "recover-escrow",
+            "--vault-dir",
+            "my_vault",
+            "--soc-priv-key",
+            "soc.der",
+        ])?;
+        assert!(matches!(
+            parsed_rsa.command,
+            Commands::Vault {
+                action: VaultAction::RecoverEscrow { .. }
+            }
+        ));
+        let parsed_pqc = Cli::try_parse_from([
+            "sentinel",
+            "vault",
+            "recover-hybrid-escrow-v3",
+            "--vault-dir",
+            "my_vault",
+            "--hybrid-priv-key",
+            "soc_pqc.json",
+        ])?;
+        assert!(matches!(
+            parsed_pqc.command,
+            Commands::Vault {
+                action: VaultAction::RecoverHybridEscrowV3 { .. }
+            }
+        ));
+
+        let _ = fs::remove_dir_all(&test_root);
+        Ok(())
+    }
+
+    #[test]
+    fn t41_kiosk_pipeline_runs_real_scanner_and_cdr_and_rejects_unscanned_or_empty(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sentinel_core::enterprise::kiosk::{
+            KioskConfig, PASSPORT_MANIFEST_FILENAME, PASSPORT_PUBKEY_FILENAME,
+        };
+
+        let test_root = std::env::temp_dir().join(format!(
+            "sentinel_t41_kiosk_pipeline_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&test_root)?;
+        let scratch_dir = test_root.join("kiosk_scratch");
+        let vault_dir = test_root.join("vault");
+        let export_dir = test_root.join("export");
+        let empty_intake = test_root.join("empty_intake");
+        let dirty_intake = test_root.join("dirty_intake");
+        let unsupported_intake = test_root.join("unsupported_intake");
+        let clean_intake = test_root.join("clean_intake");
+        fs::create_dir_all(&empty_intake)?;
+        fs::create_dir_all(&dirty_intake)?;
+        fs::create_dir_all(&unsupported_intake)?;
+        fs::create_dir_all(&clean_intake)?;
+
+        let kiosk = AirGappedKioskManager::new(KioskConfig::default(), scratch_dir);
+        let vault = QuarantineVault::open(vault_dir)?;
+
+        // Resolve `sentinel-cdr-worker` from the active build profile (`target/<profile>/`) — auto-building
+        // offline if absent so isolated CDR assertions NEVER silently skip on clean/release/custom target runs.
+        let active_profile_dir = std::env::current_exe()?
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or("active Cargo profile directory unavailable")?
+            .to_path_buf();
+        let worker_name = if cfg!(windows) {
+            "sentinel-cdr-worker.exe"
+        } else {
+            "sentinel-cdr-worker"
+        };
+        let worker_bin = active_profile_dir.join(worker_name);
+        if !worker_bin.is_file() {
+            let mut build_cmd = std::process::Command::new("cargo");
+            build_cmd.args([
+                "build",
+                "-p",
+                "sentinel-cdr",
+                "--bin",
+                "sentinel-cdr-worker",
+                "--offline",
+            ]);
+            if active_profile_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
+                build_cmd.arg("--release");
+            }
+            let status = build_cmd.status()?;
+            assert!(
+                status.success(),
+                "Building sentinel-cdr-worker for T41 failed"
+            );
+        }
+        let base_launcher = WorkerLauncher::new().with_worker_bin(worker_bin.clone());
+        assert!(
+            base_launcher.has_worker_binary(),
+            "T41 requires compiled sentinel-cdr-worker binary (no silent skip)"
+        );
+        let launcher = {
+            let probe = base_launcher.sanitize_isolated(WorkerRequest {
+                file_name: "probe.txt".to_string(),
+                policy: SanitizationPolicy::default(),
+                raw_bytes: b"probe".to_vec(),
+            });
+            match probe {
+                Err(sentinel_cdr::CdrError::SandboxFailure(ref msg))
+                    if msg.contains("os error 87") =>
+                {
+                    let cfg = sentinel_sys::JobSandboxConfig {
+                        enable_appcontainer: false,
+                        ..Default::default()
+                    };
+                    WorkerLauncher::new()
+                        .with_worker_bin(worker_bin)
+                        .with_sandbox_config(cfg)
+                }
+                _ => base_launcher,
+            }
+        };
+
+        // 1. `--export-dir` without `--intake-dir` MUST fail closed (`KIOSK_INTAKE_REQUIRED`)
+        let no_intake = execute_kiosk_intake_and_export(
+            &kiosk,
+            &vault,
+            &launcher,
+            &KioskPipelineParams {
+                intake_dir: None,
+                export_dir: Some(&export_dir),
+                media_id: "USB-T41-01",
+                policy_id: "POL-T41",
+                policy_sequence: 1,
+                max_files: 2000,
+            },
+        );
+        assert!(no_intake
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("KIOSK_INTAKE_REQUIRED")));
+        assert!(!export_dir.join(PASSPORT_MANIFEST_FILENAME).exists());
+
+        // 2. Empty `--intake-dir` MUST fail closed (`KIOSK_INTAKE_EMPTY`)
+        let empty_res = execute_kiosk_intake_and_export(
+            &kiosk,
+            &vault,
+            &launcher,
+            &KioskPipelineParams {
+                intake_dir: Some(&empty_intake),
+                export_dir: Some(&export_dir),
+                media_id: "USB-T41-02",
+                policy_id: "POL-T41",
+                policy_sequence: 1,
+                max_files: 2000,
+            },
+        );
+        assert!(empty_res
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("KIOSK_INTAKE_EMPTY")));
+        assert!(!export_dir.join(PASSPORT_MANIFEST_FILENAME).exists());
+
+        // 2b. Incomplete scan (`max_files: 1` on a 2-file intake dir) MUST fail closed (`KIOSK_SCAN_INCOMPLETE`)
+        let truncated_intake = test_root.join("truncated_intake");
+        fs::create_dir_all(&truncated_intake)?;
+        fs::write(truncated_intake.join("a.txt"), b"file one")?;
+        fs::write(truncated_intake.join("b.txt"), b"file two")?;
+        let inc_res = execute_kiosk_intake_and_export(
+            &kiosk,
+            &vault,
+            &launcher,
+            &KioskPipelineParams {
+                intake_dir: Some(&truncated_intake),
+                export_dir: Some(&export_dir),
+                media_id: "USB-T41-02B",
+                policy_id: "POL-T41",
+                policy_sequence: 1,
+                max_files: 1,
+            },
+        );
+        assert!(inc_res
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("KIOSK_SCAN_INCOMPLETE")));
+        assert!(!export_dir.join(PASSPORT_MANIFEST_FILENAME).exists());
+
+        // 2c. Symlink / NTFS directory junction as `--intake-dir` MUST fail closed (`KIOSK_INTAKE_SYMLINK_REJECTED`)
+        let link_intake = test_root.join("link_intake");
+        let link_created = {
+            #[cfg(windows)]
+            {
+                std::process::Command::new("cmd")
+                    .args([
+                        "/C",
+                        "mklink",
+                        "/J",
+                        &link_intake.to_string_lossy(),
+                        &truncated_intake.to_string_lossy(),
+                    ])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+            }
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&truncated_intake, &link_intake).is_ok()
+            }
+        };
+        if link_created {
+            let link_res = execute_kiosk_intake_and_export(
+                &kiosk,
+                &vault,
+                &launcher,
+                &KioskPipelineParams {
+                    intake_dir: Some(&link_intake),
+                    export_dir: Some(&export_dir),
+                    media_id: "USB-T41-02C",
+                    policy_id: "POL-T41",
+                    policy_sequence: 1,
+                    max_files: 2000,
+                },
+            );
+            assert!(link_res
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.contains("KIOSK_INTAKE_SYMLINK_REJECTED")));
+            assert!(!export_dir.join(PASSPORT_MANIFEST_FILENAME).exists());
+        }
+
+        // 3. Infected/prohibited `--intake-dir` (.lnk shell shortcut magic bytes) MUST quarantine evidence
+        //    into vault and refuse export/passport without mutating read-only intake media
+        let lnk_payload = b"\x4C\x00\x00\x00\x01\x14\x02\x00\x00\x00\x00\x00\xC0\x00\x00\x00\x00\x00\x00\x46SHORTCUT_PAYLOAD_T41";
+        fs::write(dirty_intake.join("invoice_shortcut.lnk"), lnk_payload)?;
+        let dirty_res = execute_kiosk_intake_and_export(
+            &kiosk,
+            &vault,
+            &launcher,
+            &KioskPipelineParams {
+                intake_dir: Some(&dirty_intake),
+                export_dir: Some(&export_dir),
+                media_id: "USB-T41-03",
+                policy_id: "POL-T41",
+                policy_sequence: 1,
+                max_files: 2000,
+            },
+        );
+        let dirty_err = dirty_res.as_ref().err().cloned().unwrap_or_default();
+        assert!(
+            dirty_err.contains("KIOSK_THREATS_DETECTED"),
+            "Expected KIOSK_THREATS_DETECTED, got: {dirty_err}"
+        );
+        assert!(!export_dir.join(PASSPORT_MANIFEST_FILENAME).exists());
+        let vault_count_after_threat = vault.list()?.len();
+        assert!(
+            vault_count_after_threat >= 1,
+            "Detected intake threat must be quarantined into vault as read-only evidence (err={dirty_err})"
+        );
+        assert!(
+            dirty_intake.join("invoice_shortcut.lnk").exists(),
+            "Read-only intake media file must not be mutated during read-only quarantine"
+        );
+
+        // 4. Unconditional isolated CDR assertions (NO silent skip):
+        // 4a. Unsupported binary rejected by default-deny CDR allowlist -> quarantined + fails closed with no passport
+        fs::write(
+            unsupported_intake.join("mystery.xyz"),
+            b"\x00\x01\x02\x03UNSUPPORTED",
+        )?;
+        let unsup_res = execute_kiosk_intake_and_export(
+            &kiosk,
+            &vault,
+            &launcher,
+            &KioskPipelineParams {
+                intake_dir: Some(&unsupported_intake),
+                export_dir: Some(&export_dir),
+                media_id: "USB-T41-04",
+                policy_id: "POL-T41",
+                policy_sequence: 1,
+                max_files: 2000,
+            },
+        );
+        assert!(unsup_res
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("KIOSK_CDR_REJECTED")));
+        assert!(!export_dir.join(PASSPORT_MANIFEST_FILENAME).exists());
+        assert!(
+            vault.list()?.len() > vault_count_after_threat,
+            "CDR-rejected intake file must be persisted as read-only quarantine evidence"
+        );
+
+        // 4b. Clean text file passes scanner + isolated CDR and yields a verified passport
+        let clean_txt = clean_intake.join("operator_notes.txt");
+        fs::write(&clean_txt, b"SCADA shift handover: turbine 2 nominal.\n")?;
+        let ok_summary = execute_kiosk_intake_and_export(
+            &kiosk,
+            &vault,
+            &launcher,
+            &KioskPipelineParams {
+                intake_dir: Some(&clean_intake),
+                export_dir: Some(&export_dir),
+                media_id: "USB-T41-05",
+                policy_id: "POL-T41",
+                policy_sequence: 7,
+                max_files: 2000,
+            },
+        )?;
+        assert_eq!(ok_summary.files_sanitized, 1);
+        let passport = ok_summary.passport.ok_or("expected signed passport")?;
+        assert_eq!(passport.sanitized_files.len(), 1);
+        assert!(passport.sanitized_files[0]
+            .cdr_action
+            .starts_with("DEEP_CDR_RECONSTRUCTED:"));
+        let pub_bytes = fs::read(export_dir.join(PASSPORT_PUBKEY_FILENAME))?;
+        let verified = verify_kiosk_passport(&export_dir, Some(&pub_bytes))?;
+        assert_eq!(verified.passport_id, passport.passport_id);
+
+        // 5. Honest posture label NEVER claims `"SL-3 ENFORCED"` (both compliant and non-compliant)
+        let compliant_posture = sentinel_sys::PostureReport {
+            automount_disabled: true,
+            removable_volumes_offline: vec![],
+            user_deny_policy_present: true,
+            install_restrictions_active: true,
+            write_protect_active: true,
+            autoplay_suppressed: true,
+            linux_authorized_default_zero: Some(true),
+            hardware_write_blocker: sentinel_sys::HardwareWriteBlockerState::NotDetected,
+        };
+        let label = format_honest_kiosk_posture_label(&compliant_posture);
+        assert!(!label.contains("SL-3 ENFORCED"));
+        assert!(label.contains("SOFTWARE_POSTURE_VERIFIED"));
+
+        let noncompliant_posture = sentinel_sys::PostureReport {
+            automount_disabled: false,
+            removable_volumes_offline: vec![],
+            user_deny_policy_present: false,
+            install_restrictions_active: false,
+            write_protect_active: false,
+            autoplay_suppressed: false,
+            linux_authorized_default_zero: Some(false),
+            hardware_write_blocker: sentinel_sys::HardwareWriteBlockerState::NotDetected,
+        };
+        let nc_label = format_honest_kiosk_posture_label(&noncompliant_posture);
+        assert!(!nc_label.contains("SL-3 ENFORCED"));
+        assert!(nc_label.contains("NON_COMPLIANT"));
+
+        // 6. Live `POST /api/v1/scan` containment, empty-target fail-closed, and `--kiosk-intake-root` checks
+        let staging_empty = test_root.join("ui_staging_empty");
+        let intake_for_api = test_root.join("ui_kiosk_intake");
+        let intake_subdir = intake_for_api.join("batch_01");
+        fs::create_dir_all(&staging_empty)?;
+        fs::create_dir_all(&intake_subdir)?;
+        fs::write(intake_subdir.join("log.txt"), b"benign intake file")?;
+
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let sid = "t41_sid_0123456789abcdef".to_string();
+            let csrf = "t41_csrf_0123456789abcdef".to_string();
+
+            // 6a. Empty staging root without kiosk intake -> HTTP 400 `EMPTY_SCAN_TARGET`
+            let state_empty = Arc::new(DashboardAppState::new(
+                8092,
+                false,
+                "boot_t41".to_string(),
+                sid.clone(),
+                csrf.clone(),
+                staging_empty.clone(),
+                staging_empty.clone(),
+            ));
+            let router_empty = build_dashboard_router(state_empty.clone());
+            let req_empty = Request::builder()
+                .method("POST")
+                .uri("/api/v1/scan")
+                .header(header::HOST, "127.0.0.1:8092")
+                .header(header::ORIGIN, "http://127.0.0.1:8092")
+                .header(header::COOKIE, format!("sentinel_sid={sid}"))
+                .header("x-sentinel-csrf", &csrf)
+                .body(Body::from(r#"{"max_files":50}"#))?;
+            let resp_empty = router_empty.oneshot(req_empty).await?;
+            assert_eq!(resp_empty.status(), StatusCode::BAD_REQUEST);
+            let body_empty = axum::body::to_bytes(resp_empty.into_body(), 64 * 1024).await?;
+            let json_empty: serde_json::Value = serde_json::from_slice(&body_empty)?;
+            assert_eq!(json_empty["error"], "EMPTY_SCAN_TARGET");
+            assert_eq!(json_empty["complete"], false);
+            assert!(!state_empty.last_scan_complete.load(Ordering::Relaxed));
+
+            // 6b. Configured `--kiosk-intake-root` -> default scan AND explicit relative path inside intake return 200 OK
+            let state_intake = Arc::new(
+                DashboardAppState::new(
+                    8093,
+                    false,
+                    "boot_t41_intake".to_string(),
+                    sid.clone(),
+                    csrf.clone(),
+                    staging_empty.clone(),
+                    staging_empty.clone(),
+                )
+                .with_kiosk_intake_root(Some(intake_for_api.clone())),
+            );
+            let router_intake = build_dashboard_router(state_intake);
+            let req_intake = Request::builder()
+                .method("POST")
+                .uri("/api/v1/scan")
+                .header(header::HOST, "127.0.0.1:8093")
+                .header(header::ORIGIN, "http://127.0.0.1:8093")
+                .header(header::COOKIE, format!("sentinel_sid={sid}"))
+                .header("x-sentinel-csrf", &csrf)
+                .body(Body::from(r#"{"max_files":50}"#))?;
+            let resp_intake = router_intake.clone().oneshot(req_intake).await?;
+            assert_eq!(resp_intake.status(), StatusCode::OK);
+            let body_intake = axum::body::to_bytes(resp_intake.into_body(), 64 * 1024).await?;
+            let json_intake: serde_json::Value = serde_json::from_slice(&body_intake)?;
+            assert_eq!(json_intake["files_scanned"], 1);
+            assert_eq!(json_intake["complete"], true);
+
+            // 6c. Explicit relative `{"path": "batch_01"}` resolves cleanly inside `kiosk_intake_root`
+            let req_rel = Request::builder()
+                .method("POST")
+                .uri("/api/v1/scan")
+                .header(header::HOST, "127.0.0.1:8093")
+                .header(header::ORIGIN, "http://127.0.0.1:8093")
+                .header(header::COOKIE, format!("sentinel_sid={sid}"))
+                .header("x-sentinel-csrf", &csrf)
+                .body(Body::from(r#"{"path":"batch_01","max_files":50}"#))?;
+            let resp_rel = router_intake.clone().oneshot(req_rel).await?;
+            assert_eq!(resp_rel.status(), StatusCode::OK);
+
+            // 6d. Traversal & external host path MUST still return uniform HTTP 403 (even with missing intake root)
+            let state_missing_intake = Arc::new(
+                DashboardAppState::new(
+                    8094,
+                    false,
+                    "boot_t41_missing".to_string(),
+                    sid.clone(),
+                    csrf.clone(),
+                    staging_empty.clone(),
+                    staging_empty.clone(),
+                )
+                .with_kiosk_intake_root(Some(test_root.join("nonexistent_intake_root"))),
+            );
+            let router_missing = build_dashboard_router(state_missing_intake);
+            for bad_path in [
+                "../escape",
+                "C:\\Windows\\System32\\cmd.exe",
+                ".sentinel_vault",
+            ] {
+                let req_bad = Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/scan")
+                    .header(header::HOST, "127.0.0.1:8094")
+                    .header(header::ORIGIN, "http://127.0.0.1:8094")
+                    .header(header::COOKIE, format!("sentinel_sid={sid}"))
+                    .header("x-sentinel-csrf", &csrf)
+                    .body(Body::from(format!(
+                        r#"{{"path":"{}"}}"#,
+                        bad_path.replace('\\', "\\\\")
+                    )))?;
+                let resp_bad = router_missing.clone().oneshot(req_bad).await?;
+                assert_eq!(
+                    resp_bad.status(),
+                    StatusCode::FORBIDDEN,
+                    "Bad path '{bad_path}' must return uniform 403 Forbidden"
+                );
+            }
+
+            // 6e. Vault-named `--kiosk-intake-root` and symlinked `--kiosk-intake-root` MUST return 403 Forbidden
+            let vault_named_intake = test_root.join(".sentinel_vault");
+            fs::create_dir_all(&vault_named_intake)?;
+            let state_vault_intake = Arc::new(
+                DashboardAppState::new(
+                    8095,
+                    false,
+                    "boot_t41_vault".to_string(),
+                    sid.clone(),
+                    csrf.clone(),
+                    staging_empty.clone(),
+                    staging_empty.clone(),
+                )
+                .with_kiosk_intake_root(Some(vault_named_intake)),
+            );
+            let req_vault = Request::builder()
+                .method("POST")
+                .uri("/api/v1/scan")
+                .header(header::HOST, "127.0.0.1:8095")
+                .header(header::ORIGIN, "http://127.0.0.1:8095")
+                .header(header::COOKIE, format!("sentinel_sid={sid}"))
+                .header("x-sentinel-csrf", &csrf)
+                .body(Body::from(r#"{"max_files":50}"#))?;
+            let resp_vault = build_dashboard_router(state_vault_intake)
+                .oneshot(req_vault)
+                .await?;
+            assert_eq!(resp_vault.status(), StatusCode::FORBIDDEN);
+
+            if link_created {
+                let state_link_intake = Arc::new(
+                    DashboardAppState::new(
+                        8096,
+                        false,
+                        "boot_t41_link".to_string(),
+                        sid.clone(),
+                        csrf.clone(),
+                        staging_empty.clone(),
+                        staging_empty.clone(),
+                    )
+                    .with_kiosk_intake_root(Some(link_intake.clone())),
+                );
+                let router_link = build_dashboard_router(state_link_intake);
+                // Both omitted path AND explicit absolute path through symlinked intake root must return 403
+                let req_link_none = Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/scan")
+                    .header(header::HOST, "127.0.0.1:8096")
+                    .header(header::ORIGIN, "http://127.0.0.1:8096")
+                    .header(header::COOKIE, format!("sentinel_sid={sid}"))
+                    .header("x-sentinel-csrf", &csrf)
+                    .body(Body::from(r#"{"max_files":50}"#))?;
+                assert_eq!(
+                    router_link.clone().oneshot(req_link_none).await?.status(),
+                    StatusCode::FORBIDDEN
+                );
+                let canonical_target_file = truncated_intake.canonicalize()?.join("a.txt");
+                let req_link_abs = Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/scan")
+                    .header(header::HOST, "127.0.0.1:8096")
+                    .header(header::ORIGIN, "http://127.0.0.1:8096")
+                    .header(header::COOKIE, format!("sentinel_sid={sid}"))
+                    .header("x-sentinel-csrf", &csrf)
+                    .body(Body::from(format!(
+                        r#"{{"path":"{}"}}"#,
+                        canonical_target_file
+                            .to_string_lossy()
+                            .replace('\\', "\\\\")
+                    )))?;
+                assert_eq!(
+                    router_link.oneshot(req_link_abs).await?.status(),
+                    StatusCode::FORBIDDEN
+                );
+            }
+
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })?;
+
+        let _ = fs::remove_dir_all(&test_root);
+        Ok(())
+    }
+
+    #[test]
+    fn t50_ui_launch_command_line_contains_zero_bootstrap_token(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_root = std::env::temp_dir().join(format!(
+            "sentinel_t50_handoff_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        sentinel_sys::create_restricted_dir_atomic(&test_root)?;
+
+        let secret_token = format!("boot_secret_{}", uuid::Uuid::new_v4().simple());
+        let port = 8099u16;
+
+        // 1. Native Rune UI launch args must use `--bootstrap-file` and contain ZERO bootstrap token
+        let native_handoff = write_native_bootstrap_handoff_file(
+            &test_root,
+            &secret_token,
+            BOOTSTRAP_HANDOFF_TTL_SECS,
+        )?;
+        assert!(native_handoff.is_file());
+        let native_args = build_native_ui_launch_args(port, &native_handoff, false);
+        assert!(
+            native_args.iter().any(|a| a == "--bootstrap-file"),
+            "Native UI must receive --bootstrap-file: {native_args:?}"
+        );
+        for arg in &native_args {
+            assert!(
+                !arg.contains(&secret_token) && !arg.contains("#bootstrap="),
+                "Native UI launch argument leaked bootstrap secret: {arg}"
+            );
+        }
+
+        // Verify restricted permissions/DACL on handoff file
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&native_handoff)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "Handoff file must be mode 0600 on Unix");
+        }
+        #[cfg(windows)]
+        {
+            let sddl = sentinel_sys::query_path_dacl_sddl(&native_handoff)?;
+            assert!(
+                !sddl.contains(";;;AU)") && !sddl.contains(";;;WD)"),
+                "Handoff file DACL must exclude AU and WD: {sddl}"
+            );
+        }
+
+        // Verify JSON contents include exact token and 30s TTL window
+        let handoff_json: serde_json::Value = serde_json::from_slice(&fs::read(&native_handoff)?)?;
+        assert_eq!(
+            handoff_json["bootstrap_token"].as_str(),
+            Some(secret_token.as_str())
+        );
+        let now = chrono::Utc::now().timestamp();
+        let exp = handoff_json["expires_unix"].as_i64().unwrap_or(0);
+        assert!(
+            exp >= now && exp <= now + (BOOTSTRAP_HANDOFF_TTL_SECS as i64) + 2,
+            "Handoff expiry must enforce 30s TTL (now={now}, exp={exp})"
+        );
+
+        // 2. Browser launch command (`rundll32`/`open`/`xdg-open`) must contain ZERO `#bootstrap=` or token
+        let browser_html = write_browser_redirect_handoff_file(&test_root, port, &secret_token)?;
+        assert!(browser_html.is_file());
+        let (launcher_bin, launcher_args) = build_browser_launch_command(&browser_html);
+        assert!(!launcher_bin.is_empty());
+        for arg in &launcher_args {
+            assert!(
+                !arg.contains(&secret_token) && !arg.contains("#bootstrap="),
+                "Browser launcher argument leaked bootstrap token: {arg}"
+            );
+        }
+        let html_body = fs::read_to_string(&browser_html)?;
+        assert!(
+            html_body.contains(&format!(
+                "http://127.0.0.1:{port}/#bootstrap={secret_token}"
+            )),
+            "Restricted local HTML redirect file must carry loopback redirect target"
+        );
+
+        // 3. Exchanging the bootstrap token via `/api/v1/session/exchange` must IMMEDIATELY delete
+        //    both registered handoff/redirect files from disk.
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let state = Arc::new(DashboardAppState::new(
+                port,
+                false,
+                secret_token.clone(),
+                "sid_t50_session".to_string(),
+                "csrf_t50_token".to_string(),
+                test_root.clone(),
+                test_root.clone(),
+            ));
+            state.register_bootstrap_handoff_file(native_handoff.clone());
+            state.register_bootstrap_handoff_file(browser_html.clone());
+
+            let router = build_dashboard_router(state);
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/v1/session/exchange")
+                .header(header::HOST, format!("127.0.0.1:{port}"))
+                .header(header::ORIGIN, format!("http://127.0.0.1:{port}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"bootstrap_token":"{secret_token}"}}"#
+                )))?;
+            let resp = router.oneshot(req).await?;
+            assert_eq!(resp.status(), StatusCode::OK);
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })?;
+
+        assert!(
+            !native_handoff.exists(),
+            "Native bootstrap handoff file must be deleted immediately after exchange"
+        );
+        assert!(
+            !browser_html.exists(),
+            "Browser redirect handoff file must be deleted immediately after exchange"
+        );
+
+        // 4. Dropping `DashboardAppState` before exchange MUST also delete registered handoff files
+        let drop_handoff = write_native_bootstrap_handoff_file(
+            &test_root,
+            "boot_drop_cleanup",
+            BOOTSTRAP_HANDOFF_TTL_SECS,
+        )?;
+        assert!(drop_handoff.is_file());
+        {
+            let drop_state = DashboardAppState::new(
+                port,
+                false,
+                "boot_drop_cleanup".to_string(),
+                "sid_drop".to_string(),
+                "csrf_drop".to_string(),
+                test_root.clone(),
+                test_root.clone(),
+            );
+            drop_state.register_bootstrap_handoff_file(drop_handoff.clone());
+        }
+        assert!(
+            !drop_handoff.exists(),
+            "DashboardAppState Drop must delete any remaining bootstrap handoff files"
+        );
+
+        // 5. Verify `sentinel siem flush` CLI parsing (`CSE-23`)
+        let parsed = Cli::try_parse_from([
+            "sentinel",
+            "siem",
+            "flush",
+            "--endpoint",
+            "tls://10.20.30.40:6514",
+            "--allow-private-cidr",
+            "10.20.0.0/16",
+        ])?;
+        assert!(matches!(
+            parsed.command,
+            Commands::Siem {
+                action: SiemAction::Flush { .. }
+            }
+        ));
+
+        let _ = fs::remove_dir_all(&test_root);
         Ok(())
     }
 }
