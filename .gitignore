@@ -13,6 +13,13 @@ sbom.cdx.json
 *.sealed
 *.escrow
 pending_challenge_*.token
+# Temporary personal DFIR notes & artifacts (excluded from repo)
+DFIR_FILE_RECOVERY_AND_FORENSIC_PIPELINE_PLAN.md
+DFIR_Recovery/
+recovery_manifest.jsonl
+Quarantine_Partial/
+*.dd
+*.E01
 
 # IDE and OS files
 .DS_Store
