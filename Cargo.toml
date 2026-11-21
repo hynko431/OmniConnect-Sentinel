@@ -26,7 +26,7 @@ async-trait = "0.1"
 
 # gRPC & Protocol Buffers
 tonic = { version = "0.13.1", default-features = false, features = ["codegen", "prost"] }
-prost = "0.13.5"
+prost = "0.14.6"
 
 # Serialization & Data
 serde = { version = "1.0", features = ["derive"] }
