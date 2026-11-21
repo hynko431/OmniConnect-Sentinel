@@ -170,16 +170,35 @@ pub enum WorkerCommand {
 }
 
 impl WorkerCommand {
+    /// Reads the next framed command, returning `Ok(None)` strictly on a clean 0-byte EOF
+    /// at a message boundary while propagating `Err(UnexpectedEof)` for any truncated mid-frame payload.
+    pub fn read_framed_opt<R: Read>(mut reader: R) -> std::io::Result<Option<Self>> {
+        let mut tag = [0u8; 1];
+        loop {
+            match reader.read(&mut tag) {
+                Ok(0) => return Ok(None),
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Self::read_framed_after_tag(tag[0], &mut reader).map(Some)
+    }
+
     pub fn read_framed<R: Read>(mut reader: R) -> std::io::Result<Self> {
         let mut tag = [0u8; 1];
         reader.read_exact(&mut tag)?;
-        match tag[0] {
+        Self::read_framed_after_tag(tag[0], &mut reader)
+    }
+
+    fn read_framed_after_tag<R: Read>(tag: u8, reader: &mut R) -> std::io::Result<Self> {
+        match tag {
             FRAME_TAG_DISARM => {
-                let req = WorkerRequest::read_framed_body(&mut reader)?;
+                let req = WorkerRequest::read_framed_body(reader)?;
                 Ok(WorkerCommand::Disarm(req))
             }
             FRAME_TAG_INSPECT => {
-                let proto_req: InspectRequest = read_prost_frame(&mut reader)?;
+                let proto_req: InspectRequest = read_prost_frame(reader)?;
                 Ok(WorkerCommand::Inspect {
                     file_name: proto_req.file_name,
                     raw_bytes: proto_req.header_bytes,
@@ -197,9 +216,12 @@ impl WorkerRequest {
     /// Writes a length-prefixed `prost::Message` (`DisarmRequest` metadata + chunk) stream (`Row 30`).
     pub fn write_framed<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
         writer.write_all(&[FRAME_TAG_DISARM])?;
+        let session_id = self
+            .policy
+            .encode_worker_session_meta(&uuid::Uuid::new_v4().to_string());
         let meta_req = DisarmRequest {
             payload: Some(disarm_request::Payload::Metadata(DisarmMetadata {
-                session_id: uuid::Uuid::new_v4().to_string(),
+                session_id,
                 file_name: self.file_name.clone(),
                 declared_format: FileFormatType::FormatUnknown as i32,
                 total_size_bytes: self.raw_bytes.len() as u64,
@@ -234,7 +256,7 @@ impl WorkerRequest {
         let (file_name, policy, declared_size) = match meta_frame.payload {
             Some(disarm_request::Payload::Metadata(meta)) => {
                 let pol = match meta.policy {
-                    Some(p) => SanitizationPolicy::from_worker_proto(p),
+                    Some(p) => SanitizationPolicy::from_worker_proto_with_meta(p, &meta.session_id),
                     None => SanitizationPolicy::default(),
                 };
                 (meta.file_name, pol, meta.total_size_bytes as usize)
@@ -356,7 +378,7 @@ impl WorkerResponse {
                             .and_then(|s| s.parse::<i32>().ok())
                             .unwrap_or(FileFormatType::FormatUnknown as i32);
                         let detected_format = map_proto_to_detected_format(fmt_code);
-                        let disarm_report = summary
+                        let disarm_report: Vec<DisarmReportItem> = summary
                             .sanitized_elements
                             .into_iter()
                             .map(|el| {
@@ -367,6 +389,12 @@ impl WorkerResponse {
                                 )
                             })
                             .collect();
+                        let recommended_extension =
+                            crate::sanitizers::openxml::OpenXmlSanitizer::derive_recommended_extension(
+                                detected_format,
+                                "",
+                                &disarm_report,
+                            );
                         Ok(Self {
                             success: true,
                             outcome: Some(SanitizationOutcome {
@@ -378,6 +406,7 @@ impl WorkerResponse {
                                 processing_time_ms: (summary.processing_duration_micros.max(0)
                                     as u64)
                                     / 1000,
+                                recommended_extension,
                             }),
                             error: None,
                         })
@@ -450,12 +479,106 @@ pub fn read_inspect_response_framed<R: Read>(
     })
 }
 
+/// Serves framed `sentinel-proto` `DisarmRequest` / `InspectRequest` commands over a local IPC
+/// reader/writer pair (Named Pipe, Unix Domain Socket, or explicit `--stdio` harness) by
+/// dispatching every file to an isolated per-file worker via `WorkerLauncher` (`CSE-22`, `Invariant I3`).
+pub fn serve_framed_ipc_io<R: Read, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    launcher: &WorkerLauncher,
+) -> std::io::Result<usize> {
+    let mut handled = 0usize;
+    while let Some(cmd) = WorkerCommand::read_framed_opt(&mut reader)? {
+        handled += 1;
+        match cmd {
+            WorkerCommand::Disarm(req) => {
+                let resp = match launcher.sanitize_isolated(req) {
+                    Ok(outcome) => WorkerResponse {
+                        success: true,
+                        outcome: Some(outcome),
+                        error: None,
+                    },
+                    Err(e) => WorkerResponse {
+                        success: false,
+                        outcome: None,
+                        error: Some(e.to_string()),
+                    },
+                };
+                resp.write_framed(&mut writer)?;
+            }
+            WorkerCommand::Inspect {
+                file_name,
+                raw_bytes,
+            } => match launcher.inspect_isolated(&raw_bytes, &file_name) {
+                Ok(assessment) => {
+                    write_inspect_response_framed(&mut writer, &assessment)?;
+                }
+                Err(e) => {
+                    let err_resp = WorkerResponse {
+                        success: false,
+                        outcome: None,
+                        error: Some(e.to_string()),
+                    };
+                    err_resp.write_framed(&mut writer)?;
+                }
+            },
+        }
+    }
+    Ok(handled)
+}
+
+/// Serves framed `sentinel-proto` IPC commands on a single duplex stream (`LocalIpcStream`, `CSE-22`).
+pub fn serve_framed_ipc_stream<S: Read + Write>(
+    stream: &mut S,
+    launcher: &WorkerLauncher,
+) -> std::io::Result<usize> {
+    let mut handled = 0usize;
+    while let Some(cmd) = WorkerCommand::read_framed_opt(&mut *stream)? {
+        handled += 1;
+        match cmd {
+            WorkerCommand::Disarm(req) => {
+                let resp = match launcher.sanitize_isolated(req) {
+                    Ok(outcome) => WorkerResponse {
+                        success: true,
+                        outcome: Some(outcome),
+                        error: None,
+                    },
+                    Err(e) => WorkerResponse {
+                        success: false,
+                        outcome: None,
+                        error: Some(e.to_string()),
+                    },
+                };
+                resp.write_framed(&mut *stream)?;
+            }
+            WorkerCommand::Inspect {
+                file_name,
+                raw_bytes,
+            } => match launcher.inspect_isolated(&raw_bytes, &file_name) {
+                Ok(assessment) => {
+                    write_inspect_response_framed(&mut *stream, &assessment)?;
+                }
+                Err(e) => {
+                    let err_resp = WorkerResponse {
+                        success: false,
+                        outcome: None,
+                        error: Some(e.to_string()),
+                    };
+                    err_resp.write_framed(&mut *stream)?;
+                }
+            },
+        }
+    }
+    Ok(handled)
+}
+
 /// Ephemeral Per-File Sandboxed CDR Worker Launcher (`BUG-CDR-10`, Phase 2.1, Invariant I3)
 ///
 /// Spawns one isolated `sentinel-cdr-worker` child process per file using `CreateProcessW`
 /// with `CREATE_SUSPENDED` + `STARTUPINFOEXW` mitigations and a 256 MB Job Object assigned
 /// before `ResumeThread`. Enforces a 30-second parent deadline covering both `stdin` write
 /// and `stdout` read, with zero in-process parsing fallback (`Invariant I3`).
+#[derive(Clone)]
 pub struct WorkerLauncher {
     worker_bin: Option<PathBuf>,
     wall_clock_timeout: Duration,

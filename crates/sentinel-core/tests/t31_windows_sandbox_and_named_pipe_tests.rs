@@ -4,7 +4,7 @@
 //! 1. Mandatory AppContainer: Zero unsandboxed `(false, false)` fallbacks; fails closed if profile cannot be derived.
 //! 2. Single-Process UI-Restricted Job Object: ProcessMemoryLimit = 256 MiB, ActiveProcessLimit = 1, UI limitations applied.
 //! 3. Squat-Proof Named Pipe: `FILE_FLAG_FIRST_PIPE_INSTANCE` prevents pre-binding squats with `ERROR_ACCESS_DENIED`.
-//! 4. Tightened SDDL: SYSTEM (SY), Admins (BA), and AppContainer (AC) permitted; Authenticated Users (AU) revoked.
+//! 4. Tightened SDDL: Strictly SYSTEM (SY) and Admins (BA) permitted; AppContainer (AC), Authenticated Users (AU), and Everyone (WD) revoked (`CSE-22`).
 //! 5. Handle-Locked Authenticode: Open locked file handle verified with `WTD_REVOKE_WHOLECHAIN`.
 
 #[cfg(windows)]
