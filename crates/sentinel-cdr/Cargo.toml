@@ -4,6 +4,7 @@ version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "High-performance, memory-safe Content Disarm and Reconstruction (CDR) engine in pure Rust"
 
 [[bin]]

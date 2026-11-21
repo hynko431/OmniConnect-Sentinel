@@ -2,7 +2,6 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Key, Nonce,
 };
-use chrono::Utc;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,10 +14,11 @@ use uuid::Uuid;
 use sentinel_sys::{
     create_restricted_dir_atomic, create_restricted_file_handle_atomic,
     decrypt_kek_from_soc_escrow, decrypt_kek_from_soc_escrow_hybrid_v3, encrypt_kek_for_soc_escrow,
-    encrypt_kek_for_soc_escrow_hybrid_v3, parse_rsa_public_key, seal_key_bytes, sync_directory,
-    to_verbatim_path, unseal_key_bytes, validate_fips203_mlkem768_encapsulation_key,
-    write_protected_key_file, zeroize_slice, HybridSocEscrowBlobV3, HybridSocPrivateKeyBundle,
-    HybridSocPublicKeyBundle, KeyProtectionPosture, SealedKeyBlob, SocEscrowBlob, ZeroizingBytes,
+    encrypt_kek_for_soc_escrow_hybrid_v3, now_unix_and_rfc3339_utc, parse_rsa_public_key,
+    seal_key_bytes, sync_directory, to_verbatim_path, unseal_key_bytes,
+    validate_fips203_mlkem768_encapsulation_key, write_protected_key_file, zeroize_slice,
+    HybridSocEscrowBlobV3, HybridSocPrivateKeyBundle, HybridSocPublicKeyBundle,
+    KeyProtectionPosture, SealedKeyBlob, SocEscrowBlob, ZeroizingBytes,
 };
 
 use crate::enterprise::ledger::{
@@ -1146,9 +1146,8 @@ impl QuarantineVault {
         let original_size = raw_bytes.len() as u64;
 
         let entry_id = Uuid::new_v4().to_string();
-        let now = Utc::now();
-        let quarantined_at_utc = now.to_rfc3339();
-        let quarantined_at_unix = now.timestamp().max(0) as u64;
+        let (now_unix, quarantined_at_utc) = now_unix_and_rfc3339_utc();
+        let quarantined_at_unix = now_unix.max(0) as u64;
 
         let mut file_salt = [0u8; 32];
         let mut nonce = [0u8; 12];

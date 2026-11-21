@@ -2,7 +2,6 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Key, Nonce,
 };
-use chrono::Utc;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,9 +17,9 @@ use walkdir::WalkDir;
 use sentinel_sys::{
     create_restricted_dir_atomic, create_restricted_file_atomic,
     ensure_not_symlink_or_reparse_point, enumerate_ntfs_ads, evaluate_strict_kiosk_key_posture,
-    is_reparse_point_or_symlink, open_untrusted_readonly_nofollow, query_ntp_sync_status,
-    validate_p256_uncompressed_point, verify_ecdsa_p256_digest, verify_system_posture,
-    zeroize_slice, KeyProtectionPosture, NtpSyncStatus, ZeroizingBytes,
+    is_reparse_point_or_symlink, now_rfc3339_utc, open_untrusted_readonly_nofollow,
+    query_ntp_sync_status, validate_p256_uncompressed_point, verify_ecdsa_p256_digest,
+    verify_system_posture, zeroize_slice, KeyProtectionPosture, NtpSyncStatus, ZeroizingBytes,
 };
 pub use sentinel_sys::{HardwareWriteBlockerState, PostureReport};
 
@@ -1108,7 +1107,7 @@ impl KioskEnforcer {
             .clone()
             .unwrap_or_else(|| format!("KSESS-EXPORT-{}", Uuid::new_v4()));
         let passport_id = format!("PASS-{}", Uuid::new_v4());
-        let issued_at_utc = Utc::now().to_rfc3339();
+        let issued_at_utc = now_rfc3339_utc();
         let ntp_sync = query_ntp_sync_status();
         let (binary_exe_sha256, binary_dep_v0_sha256) = compute_current_binary_provenance();
         let schema_version = "1.0".to_string();

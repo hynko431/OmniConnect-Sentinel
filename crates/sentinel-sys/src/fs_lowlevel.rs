@@ -2042,11 +2042,11 @@ pub fn query_path_dacl_sddl(path: &Path) -> io::Result<String> {
 
 /// Flushes OS and device buffers, returning the actual measured success status.
 pub fn flush_hardware_buffers(file: &File) -> bool {
-    if file.sync_all().is_err() {
-        return false;
-    }
     #[cfg(windows)]
     {
+        if file.sync_all().is_err() {
+            return false;
+        }
         use std::os::windows::io::AsRawHandle;
         let raw_handle = file.as_raw_handle() as isize;
         let ok = unsafe { FlushFileBuffers(raw_handle) };
@@ -2054,7 +2054,7 @@ pub fn flush_hardware_buffers(file: &File) -> bool {
     }
     #[cfg(not(windows))]
     {
-        true
+        file.sync_all().is_ok()
     }
 }
 
@@ -2158,18 +2158,17 @@ pub const IO_REPARSE_TAG_PROJFS: u32 = 0x9000_001C;
 
 /// Checks if a `Metadata` object represents a symlink or a Windows NTFS reparse point / junction (`FILE_ATTRIBUTE_REPARSE_POINT`).
 pub fn is_reparse_point_or_symlink(meta: &Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return true;
-        }
+        meta.file_type().is_symlink()
+            || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
     }
-    false
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
 }
 
 /// Returns `true` strictly when `path` is a Windows NTFS reparse point tagged with

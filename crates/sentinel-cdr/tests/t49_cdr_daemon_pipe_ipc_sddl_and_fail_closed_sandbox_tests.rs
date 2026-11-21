@@ -3,9 +3,12 @@
 
 use sentinel_cdr::worker::{serve_framed_ipc_io, WorkerCommand, WorkerLauncher};
 use sentinel_cdr::{SanitizationPolicy, WorkerRequest, WorkerResponse};
+#[cfg(windows)]
 use sentinel_sys::{
-    close_raw_kernel_handle, create_acl_named_pipe_server, evaluate_sandbox_enforcement_failure,
-    query_kernel_handle_dacl_sddl, JobSandboxConfig, LocalIpcServer, LocalIpcStream,
+    close_raw_kernel_handle, create_acl_named_pipe_server, query_kernel_handle_dacl_sddl,
+};
+use sentinel_sys::{
+    evaluate_sandbox_enforcement_failure, JobSandboxConfig, LocalIpcServer, LocalIpcStream,
     DEFAULT_CDR_NAMED_PIPE_ENDPOINT, DEFAULT_CDR_UNIX_SOCKET_PATH, NAMED_PIPE_SERVER_SDDL,
 };
 use std::io::{Cursor, Read, Write};

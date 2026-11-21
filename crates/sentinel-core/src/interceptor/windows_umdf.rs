@@ -184,7 +184,7 @@ impl DeviceInterceptor for WindowsUmdfInterceptor {
                     if dev.is_composite_hid_storage {
                         let event = DeviceConnectedEvent {
                             connection_id: uuid::Uuid::new_v4(),
-                            timestamp_utc: chrono::Utc::now(),
+                            timestamp_utc: sentinel_sys::now_rfc3339_utc(),
                             vector: ConnectionVector::WiredUsb {
                                 vid: dev.vid,
                                 pid: dev.pid,
@@ -285,7 +285,7 @@ impl DeviceInterceptor for WindowsUmdfInterceptor {
 
                     let event = DeviceConnectedEvent {
                         connection_id: uuid::Uuid::new_v4(),
-                        timestamp_utc: chrono::Utc::now(),
+                        timestamp_utc: sentinel_sys::now_rfc3339_utc(),
                         vector: ConnectionVector::WiredUsb {
                             vid,
                             pid,

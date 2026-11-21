@@ -421,7 +421,7 @@ impl OpenXmlSanitizer {
     }
 
     fn has_prohibited_binary_magic(bytes: &[u8]) -> bool {
-        if bytes.starts_with(b"MZ")
+        bytes.starts_with(b"MZ")
             || bytes.starts_with(b"\x7fELF")
             || bytes.starts_with(b"#!")
             || bytes.starts_with(&[0xD7, 0xCD, 0xC6, 0x9A]) // Aldus Placeable WMF
@@ -434,10 +434,6 @@ impl OpenXmlSanitizer {
             || (bytes.len() >= 8 && bytes[..8] == crate::sanitizers::ole2::OLE2_MAGIC)
             || bytes.starts_with(&[0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00])
         // LNK
-        {
-            return true;
-        }
-        false
     }
 
     pub fn has_prohibited_part_extension(lower_path: &str) -> bool {

@@ -1441,7 +1441,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let resolved_nonce_store =
                 nonce_store.unwrap_or_else(default_break_glass_nonce_store_path);
-            let now_unix = chrono::Utc::now().timestamp();
+            let now_unix = sentinel_sys::now_unix_secs();
             let shared_ledger = if let Some(ledger_path) = ledger {
                 sentinel_core::enterprise::ledger::create_shared_audit_ledger(&ledger_path)?
             } else {
@@ -2105,7 +2105,7 @@ impl DashboardAppState {
         let mut events = VecDeque::new();
         events.push_back(serde_json::json!({
             "event": "AGENT_STATUS_SYNC",
-            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "timestamp": sentinel_sys::now_rfc3339_utc(),
             "demo_mode": demo_mode,
             "complete": true,
             "detail": "Ring 3 Sentinel Agent initialized on 127.0.0.1",
@@ -3063,7 +3063,7 @@ async fn handle_api_scan(
     .unwrap_or_else(|_| "TOKEN_UNAVAILABLE".to_string());
     state.push_event(serde_json::json!({
         "event": "SCAN_COMPLETE",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "timestamp": sentinel_sys::now_rfc3339_utc(),
         "path_token": path_token,
         "files_scanned": report.files_scanned,
         "threats_found": report.threats.len(),
@@ -3229,7 +3229,7 @@ async fn handle_api_shred(
     .unwrap_or_else(|_| "TOKEN_UNAVAILABLE".to_string());
     state.push_event(serde_json::json!({
         "event": "SHRED_COMPLETE",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "timestamp": sentinel_sys::now_rfc3339_utc(),
         "path_token": path_token,
         "passes_completed": receipt.passes_completed,
         "rename_cycles_completed": receipt.rename_cycles_completed,
@@ -3458,7 +3458,7 @@ fn write_native_bootstrap_handoff_file(
         "bootstrap_handoff_{}.json",
         uuid::Uuid::new_v4().simple()
     ));
-    let expires_unix = chrono::Utc::now().timestamp() + (ttl_secs as i64);
+    let expires_unix = sentinel_sys::now_unix_secs() + (ttl_secs as i64);
     let payload = serde_json::json!({
         "bootstrap_token": bootstrap_token,
         "expires_unix": expires_unix,
@@ -5342,7 +5342,7 @@ mod tests {
             handoff_json["bootstrap_token"].as_str(),
             Some(secret_token.as_str())
         );
-        let now = chrono::Utc::now().timestamp();
+        let now = sentinel_sys::now_unix_secs();
         let exp = handoff_json["expires_unix"].as_i64().unwrap_or(0);
         assert!(
             exp >= now && exp <= now + (BOOTSTRAP_HANDOFF_TTL_SECS as i64) + 2,

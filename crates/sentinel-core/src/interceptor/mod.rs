@@ -145,7 +145,7 @@ impl PendingDeviceConfirmationManager {
         }
 
         let mut map = self.load_map()?;
-        let now = chrono::Utc::now().timestamp();
+        let now = sentinel_sys::now_unix_secs();
 
         // Purge any superseded `.token` file for the same `device_id` (e.g. USB bus re-enumeration)
         if let Some(prev) = map.remove(device_id) {
@@ -247,7 +247,7 @@ impl PendingDeviceConfirmationManager {
             return Ok(());
         }
 
-        let now = chrono::Utc::now().timestamp();
+        let now = sentinel_sys::now_unix_secs();
         // Unconditional fail-closed 300s TTL check (`expires_at_unix <= 0` or `created_at_unix <= 0` also rejected)
         let ttl_invalid_or_expired = entry.created_at_unix <= 0
             || entry.expires_at_unix <= 0

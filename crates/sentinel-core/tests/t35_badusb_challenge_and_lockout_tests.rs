@@ -45,7 +45,7 @@ fn test_128bit_challenge_generation_and_entropy() {
         "Challenge ID must have CHAL- prefix"
     );
     assert!(
-        issued.expires_at_unix > chrono::Utc::now().timestamp(),
+        issued.expires_at_unix > sentinel_sys::now_unix_secs(),
         "Challenge expiry must be in the future"
     );
 
@@ -186,7 +186,7 @@ fn test_300s_ttl_expiration_fails_closed() {
     let state_content = fs::read_to_string(&state_file).expect("read state file");
     let mut state_json: serde_json::Value =
         serde_json::from_str(&state_content).expect("parse json");
-    let expired_timestamp = chrono::Utc::now().timestamp() - 10;
+    let expired_timestamp = sentinel_sys::now_unix_secs() - 10;
     state_json[device_id]["expires_at_unix"] = serde_json::json!(expired_timestamp);
     fs::write(
         &state_file,
@@ -219,7 +219,7 @@ fn test_secret_token_never_in_telemetry_or_logs() {
     let challenge = IssuedBadUsbChallenge {
         challenge_id: "CHAL-A1B2C3D4".to_string(),
         challenge_token: "0123456789ABCDEF0123456789ABCDEF".to_string(),
-        expires_at_unix: chrono::Utc::now().timestamp() + 300,
+        expires_at_unix: sentinel_sys::now_unix_secs() + 300,
     };
 
     // Telemetry details template used in sentinel-core/src/main.rs

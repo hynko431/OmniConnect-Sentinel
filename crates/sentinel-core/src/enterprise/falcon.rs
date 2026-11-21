@@ -1,6 +1,5 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use chrono::Utc;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,9 +14,10 @@ use tracing::{info, warn};
 
 use sentinel_sys::{
     create_restricted_dir_atomic, create_restricted_file_atomic,
-    create_restricted_file_handle_atomic, ensure_not_symlink_or_reparse_point, seal_key_bytes,
-    sign_ecdsa_p256_with_private_blob, sync_directory, unseal_key_bytes, verify_ecdsa_p256_digest,
-    write_protected_key_file, zeroize_slice, SealedKeyBlob, ZeroizingBytes,
+    create_restricted_file_handle_atomic, ensure_not_symlink_or_reparse_point, now_rfc3339_utc,
+    now_unix_and_rfc3339_utc, now_unix_secs, seal_key_bytes, sign_ecdsa_p256_with_private_blob,
+    sync_directory, unseal_key_bytes, verify_ecdsa_p256_digest, write_protected_key_file,
+    zeroize_slice, SealedKeyBlob, ZeroizingBytes,
 };
 
 use crate::enterprise::ledger::{
@@ -243,7 +243,7 @@ impl SignedSpoolPruneOverride {
             operator_id: operator_id.into(),
             reason: reason.into(),
             retention_days,
-            issued_unix: Utc::now().timestamp(),
+            issued_unix: now_unix_secs(),
             nonce: uuid::Uuid::new_v4().to_string(),
             signer_public_key_hex: hex::encode(pub_key_bytes),
             signature_hex: String::new(),
@@ -271,7 +271,7 @@ impl SignedSpoolPruneOverride {
                 self.retention_days
             ));
         }
-        let now = Utc::now().timestamp();
+        let now = now_unix_secs();
         if now.saturating_sub(self.issued_unix) > OVERRIDE_MAX_AGE_SECS {
             return Err(format!(
                 "OVERRIDE_EXPIRED: Signed spool prune override exceeded {OVERRIDE_MAX_AGE_SECS}s TTL"
@@ -638,7 +638,7 @@ impl CrowdStrikeFalconBridge {
     }
 
     pub fn format_cef_payload(&self, event: &FalconTelemetryEvent) -> String {
-        let timestamp = Utc::now().to_rfc3339();
+        let timestamp = now_rfc3339_utc();
         let sha_val = event.file_sha256.as_deref().unwrap_or("N/A");
 
         let safe_sig_id = Self::escape_cef_header(&event.signature_id);
@@ -665,7 +665,7 @@ impl CrowdStrikeFalconBridge {
     /// Emits a CEF alert to the SIEM endpoint over RFC 5425 TLS 1.3, spools securely in `siem_spool.sealed`
     /// when offline (`CSE-13`, `T33`), enforces 180-day retention, and appends to the unified `AuditLedger`.
     pub fn emit_alert(&self, event: &FalconTelemetryEvent) -> Result<(), String> {
-        let now = Utc::now();
+        let (now_unix, now_rfc3339) = now_unix_and_rfc3339_utc();
         let cef_line = self.format_cef_payload(event);
         info!("SIEM CEF Telemetry: {}", cef_line);
 
@@ -685,8 +685,8 @@ impl CrowdStrikeFalconBridge {
         }
 
         let record = SiemSpoolRecord {
-            timestamp_unix: now.timestamp(),
-            timestamp_rfc3339: now.to_rfc3339(),
+            timestamp_unix: now_unix,
+            timestamp_rfc3339: now_rfc3339,
             cef_payload: cef_line.clone(),
             delivered,
         };
@@ -1398,7 +1398,7 @@ impl CrowdStrikeFalconBridge {
             Vec::new()
         };
 
-        let now = Utc::now().timestamp();
+        let now = now_unix_secs();
         let min_live_issued = now
             .saturating_sub(OVERRIDE_MAX_AGE_SECS)
             .saturating_sub(OVERRIDE_MAX_FUTURE_SKEW_SECS);
@@ -1473,7 +1473,7 @@ impl CrowdStrikeFalconBridge {
     }
 
     fn prune_records_locked(&self, retention_days: i64) -> Result<usize, String> {
-        let cutoff_unix = Utc::now().timestamp() - (retention_days.max(0) * 86_400);
+        let cutoff_unix = now_unix_secs() - (retention_days.max(0) * 86_400);
         let mut total_pruned = 0usize;
 
         // Prune expired records in rollover archives (delete archive only if 100% expired)
@@ -1531,7 +1531,7 @@ impl CrowdStrikeFalconBridge {
         let parent = self.spool_path.parent().unwrap_or_else(|| Path::new("."));
         let prefix = self.rollover_archive_prefix();
         let existing_count = self.list_rollover_archives_locked()?.len() as u64;
-        let ts = Utc::now().timestamp().max(0) as u64;
+        let ts = now_unix_secs().max(0) as u64;
 
         for _ in 0..64 {
             let seq = ROLLOVER_SEQ_COUNTER
@@ -1655,10 +1655,7 @@ fn is_siem_spool_dir_writable(dir: &Path) -> bool {
         return false;
     }
     let key_file = dir.join("siem_spool.sealed.spool_key.sealed");
-    if key_file.exists() && fs::read(&key_file).is_err() {
-        return false;
-    }
-    true
+    !(key_file.exists() && fs::read(&key_file).is_err())
 }
 
 fn default_siem_spool_dir() -> PathBuf {

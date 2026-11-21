@@ -689,7 +689,7 @@ fn test_intune_xml_escaping_and_falcon_cef_injection_immunity() {
     // Inject an expired record (185 days old) and verify 180-day pruning removes it while keeping recent record
     offline_bridge
         .append_spool_record(&sentinel_core::enterprise::falcon::SiemSpoolRecord {
-            timestamp_unix: chrono::Utc::now().timestamp() - (185 * 86_400),
+            timestamp_unix: sentinel_sys::now_unix_secs() - (185 * 86_400),
             timestamp_rfc3339: "2020-01-01T00:00:00Z".to_string(),
             cef_payload: "CEF:0|Old|Record".to_string(),
             delivered: true,
@@ -1005,7 +1005,7 @@ async fn test_interceptor_retains_channel_sender_and_vfs_shadow_cache() {
 
     let synthetic_event = DeviceConnectedEvent {
         connection_id: uuid::Uuid::new_v4(),
-        timestamp_utc: chrono::Utc::now(),
+        timestamp_utc: sentinel_sys::now_rfc3339_utc(),
         vector: ConnectionVector::WiredUsb {
             vid: 0x0781,
             pid: 0x5583,

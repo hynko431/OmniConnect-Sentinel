@@ -1,4 +1,3 @@
-use chrono::Utc;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,10 +9,10 @@ use tracing::warn;
 
 use sentinel_sys::{
     create_restricted_dir_atomic, create_restricted_file_handle_atomic,
-    create_sealed_ecdsa_p256_keypair, ensure_not_symlink_or_reparse_point, query_ntp_sync_status,
-    seal_key_bytes, sign_with_sealed_ecdsa_p256, sync_directory, unseal_key_bytes,
-    verify_ecdsa_p256_digest, write_protected_key_file, zeroize_slice, KeyProtectionPosture,
-    NtpSyncStatus, SealedEcdsaKeyPair, SealedKeyBlob, ZeroizingBytes,
+    create_sealed_ecdsa_p256_keypair, ensure_not_symlink_or_reparse_point, now_rfc3339_utc,
+    query_ntp_sync_status, seal_key_bytes, sign_with_sealed_ecdsa_p256, sync_directory,
+    unseal_key_bytes, verify_ecdsa_p256_digest, write_protected_key_file, zeroize_slice,
+    KeyProtectionPosture, NtpSyncStatus, SealedEcdsaKeyPair, SealedKeyBlob, ZeroizingBytes,
 };
 
 const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -94,16 +93,12 @@ pub fn is_restricted_ledger_dir_writable(dir: &Path, ledger_filename: &str) -> b
         return false;
     }
     let head_file = ledger_file.with_extension("head.sig");
-    if head_file.exists()
+    !(head_file.exists()
         && OpenOptions::new()
             .read(true)
             .write(true)
             .open(&head_file)
-            .is_err()
-    {
-        return false;
-    }
-    true
+            .is_err())
 }
 
 /// Resolves the default path for the unified single-root Audit Ledger.
@@ -605,7 +600,7 @@ impl AuditLedger {
         self.last_hash = disk_last_hash;
 
         let seq = self.next_seq;
-        let ts = Utc::now().to_rfc3339();
+        let ts = now_rfc3339_utc();
         let ntp: NtpSyncStatus = query_ntp_sync_status();
         let prev_hash = self.last_hash.clone();
         let hash = Self::compute_record_hash_v2(
@@ -770,7 +765,7 @@ impl AuditLedger {
             key_posture: keypair.posture,
             public_key_blob_hex: hex::encode(&keypair.public_key_blob),
             ecdsa_p256_signature_hex: hex::encode(&sig_bytes),
-            signed_at_utc: Utc::now().to_rfc3339(),
+            signed_at_utc: now_rfc3339_utc(),
         };
 
         let head_path = Self::head_sig_path(&self.ledger_path);

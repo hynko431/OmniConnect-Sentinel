@@ -6,15 +6,18 @@ use tracing::info;
 #[cfg(not(windows))]
 use tracing::warn;
 
+#[cfg(windows)]
+use sentinel_sys::read_registry_string;
 use sentinel_sys::{
     create_restricted_dir_atomic, create_restricted_file_atomic,
-    ensure_not_symlink_or_reparse_point, read_registry_string, sign_ecdsa_p256_with_private_blob,
+    ensure_not_symlink_or_reparse_point, sign_ecdsa_p256_with_private_blob,
     verify_ecdsa_p256_digest,
 };
 
 use crate::enterprise::ledger::{AuditLedger, AuditSubsystem, SharedAuditLedger};
 use crate::error::{DegradationEvent, SentinelError};
 
+#[cfg(windows)]
 const SENTINEL_POLICY_REG_SUBKEY: &str = r"SOFTWARE\Policies\OmniConnect\Sentinel";
 /// Windows PolicyManager CSP registry path populated by Microsoft Intune OMA-URI
 /// `./Device/Vendor/MSFT/Policy/Config/OmniConnectSentinel/SignedPolicyBundleJson` (`CSE-26`).

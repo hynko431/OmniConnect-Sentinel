@@ -642,7 +642,7 @@ fn t53_cse26_break_glass_token_cli_replay_expiry_intune_dynamic_reg_scm_and_sess
     let tmp = tempfile::tempdir().expect("tempdir");
     let (root_pub, root_priv) = generate_raw_ecdsa_p256_keypair().expect("root keypair");
     let (rogue_pub, rogue_priv) = generate_raw_ecdsa_p256_keypair().expect("rogue keypair");
-    let now_unix = chrono::Utc::now().timestamp();
+    let now_unix = sentinel_sys::now_unix_secs();
     let nonce_store = tmp.path().join("break_glass_nonces.json");
 
     // 1. Valid BreakGlassToken verification + replay prevention + expiry + TTL + untrusted signer + tamper

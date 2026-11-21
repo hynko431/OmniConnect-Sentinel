@@ -385,7 +385,7 @@ fn cea_phase2_defect04_badusb_zero_expiry_bypass_unknown_fields_and_orphan_token
     );
 
     // 2. Attack A: `created_at_unix = now - 3600`, `expires_at_unix = 0` MUST fail closed and purge `.token`!
-    let now = chrono::Utc::now().timestamp();
+    let now = sentinel_sys::now_unix_secs();
     let mut state_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&state_file).expect("read state"))
             .expect("parse json");

@@ -10,10 +10,8 @@ use sentinel_sys::{
 #[test]
 fn t54_cse26_honest_airgapped_ntp_w32tm_cmos_stale_and_irig_b_ptp() {
     // Fixed reference UTC timestamp: 2026-11-21 12:00:00 UTC -> 1795262400
-    // Let's compute exact timestamp via chrono to avoid any hand-calculation drift.
-    let now_utc = chrono::DateTime::parse_from_rfc3339("2026-11-21T12:00:00Z")
-        .expect("parse ref utc")
-        .timestamp();
+    let now_utc =
+        sentinel_sys::parse_rfc3339_utc_unix("2026-11-21T12:00:00Z").expect("parse ref utc");
 
     // 1. Air-gapped Windows kiosk running W32Time on Local CMOS Clock MUST report
     //    ntp_synchronized == false and stratum == None (NEVER fabricate stratum: Some(2)!)

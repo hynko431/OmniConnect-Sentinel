@@ -107,7 +107,7 @@ fn probe_phase3_cse24_cse25_topology_sysfs_and_udev_hardening() {
 fn probe_phase3_cse26_cse27_break_glass_smuggling_ntp_yara_icap_and_hw_wb() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (root_pub, root_priv) = generate_raw_ecdsa_p256_keypair().expect("root keypair");
-    let now_unix = chrono::Utc::now().timestamp();
+    let now_unix = sentinel_sys::now_unix_secs();
 
     // CSE-26 Attack A: Cross-field delimiter smuggling on BreakGlassToken MUST produce distinct digests
     let tok_a = BreakGlassToken {

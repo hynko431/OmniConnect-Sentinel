@@ -996,10 +996,7 @@ impl Tier0YaraScanner {
         }
         let pe_offset =
             u32::from_le_bytes([bytes[0x3C], bytes[0x3D], bytes[0x3E], bytes[0x3F]]) as usize;
-        if pe_offset + 4 <= bytes.len() && &bytes[pe_offset..pe_offset + 4] == b"PE\0\0" {
-            return true;
-        }
-        false
+        pe_offset + 4 <= bytes.len() && &bytes[pe_offset..pe_offset + 4] == b"PE\0\0"
     }
 
     /// Full PE32 / PE32+ structural parser (`Rows 154, 156, 228`):

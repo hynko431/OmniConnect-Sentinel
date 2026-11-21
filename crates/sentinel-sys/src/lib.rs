@@ -11,6 +11,7 @@ pub mod fs_lowlevel;
 pub mod mem_guard;
 pub mod mount_control;
 pub mod sandbox_worker;
+pub mod utc_time;
 pub mod windows_service;
 
 pub use bpf_sandbox::{
@@ -94,6 +95,10 @@ pub use sandbox_worker::{
     JobSandboxConfig, JobSandboxGuard, LocalIpcServer, LocalIpcStream, PeerCredentials,
     SandboxedChildProcess, DEFAULT_CDR_NAMED_PIPE_ENDPOINT, DEFAULT_CDR_UNIX_SOCKET_PATH,
     DEFAULT_NAMED_PIPE_ENDPOINT, NAMED_PIPE_SERVER_SDDL,
+};
+pub use utc_time::{
+    now_rfc3339_utc, now_unix_and_rfc3339_utc, now_unix_parts, now_unix_secs,
+    parse_rfc3339_utc_unix, unix_to_rfc3339_utc,
 };
 pub use windows_service::{
     build_scm_status, run_windows_service, scm_control_triggers_shutdown, ScmServiceStatusSnapshot,

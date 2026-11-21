@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceConnectedEvent {
     pub connection_id: uuid::Uuid,
-    pub timestamp_utc: chrono::DateTime<chrono::Utc>,
+    pub timestamp_utc: String,
     pub vector: ConnectionVector,
     pub raw_mount_point: Option<PathBuf>,
 }
