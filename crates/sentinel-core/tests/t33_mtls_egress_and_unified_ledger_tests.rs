@@ -637,6 +637,7 @@ fn test_t33_syslog_endpoint_validation_and_kiosk_ledger_redaction() {
         write_protect_active: true,
         autoplay_suppressed: true,
         linux_authorized_default_zero: Some(true),
+        hardware_write_blocker: Default::default(),
     };
     let (_sid, _subdir) = kiosk
         .start_kiosk_session("USB_SENSITIVE_01")

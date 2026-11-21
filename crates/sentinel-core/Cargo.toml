@@ -43,6 +43,7 @@ hmac = { workspace = true }
 [features]
 default = []
 vfs-winfsp = []
+vfs-fuse = []
 
 [dev-dependencies]
 tempfile = "3.10"
