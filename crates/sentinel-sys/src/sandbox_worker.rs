@@ -646,15 +646,11 @@ pub fn verify_appcontainer_sid_derivation() -> io::Result<bool> {
 #[cfg(windows)]
 fn obtain_zero_capability_appcontainer_sid() -> Option<*mut core::ffi::c_void> {
     use std::os::windows::ffi::OsStrExt;
+    use std::sync::Once;
+
+    static PROFILE_INIT: Once = Once::new();
+
     let name: Vec<u16> = std::ffi::OsStr::new("OmniConnect.Sentinel.CdrWorker")
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let display: Vec<u16> = std::ffi::OsStr::new("OmniConnect Sentinel CDR Sandbox")
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let desc: Vec<u16> = std::ffi::OsStr::new("Zero-capability AppContainer for CDR parsing")
         .encode_wide()
         .chain(Some(0))
         .collect();
@@ -678,36 +674,44 @@ fn obtain_zero_capability_appcontainer_sid() -> Option<*mut core::ffi::c_void> {
         }
     };
 
-    let create_profile = || -> Option<*mut core::ffi::c_void> {
-        let mut sid: *mut core::ffi::c_void = core::ptr::null_mut();
-        let hr = unsafe {
-            CreateAppContainerProfile(
-                name.as_ptr(),
-                display.as_ptr(),
-                desc.as_ptr(),
-                core::ptr::null_mut(),
-                0,
-                &mut sid,
-            )
-        };
-        if hr == 0 && !sid.is_null() && unsafe { IsValidSid(sid) } != 0 {
-            Some(sid)
-        } else {
+    let ensure_profile_once = || {
+        PROFILE_INIT.call_once(|| {
+            let display: Vec<u16> = std::ffi::OsStr::new("OmniConnect Sentinel CDR Sandbox")
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let desc: Vec<u16> =
+                std::ffi::OsStr::new("Zero-capability AppContainer for CDR parsing")
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect();
+            let mut sid: *mut core::ffi::c_void = core::ptr::null_mut();
+            let _hr = unsafe {
+                CreateAppContainerProfile(
+                    name.as_ptr(),
+                    display.as_ptr(),
+                    desc.as_ptr(),
+                    core::ptr::null_mut(),
+                    0,
+                    &mut sid,
+                )
+            };
             if !sid.is_null() {
                 unsafe {
                     let _ = FreeSid(sid);
                 }
             }
-            None
-        }
+        });
     };
 
     match strategy {
-        AppContainerSessionStrategy::DirectDeriveSessionZero => {
-            derive_direct().or_else(create_profile)
-        }
+        AppContainerSessionStrategy::DirectDeriveSessionZero => derive_direct().or_else(|| {
+            ensure_profile_once();
+            derive_direct()
+        }),
         AppContainerSessionStrategy::CreateOrDeriveInteractive => {
-            create_profile().or_else(derive_direct)
+            ensure_profile_once();
+            derive_direct()
         }
     }
 }
@@ -909,6 +913,17 @@ pub fn spawn_sandboxed_worker_process(
                     core::ptr::null_mut(),
                 )
             };
+            if ok_h == 0 {
+                let err = io::Error::last_os_error();
+                unsafe {
+                    DeleteProcThreadAttributeList(attr_ptr);
+                }
+                last_spawn_err = Some(io::Error::new(
+                    err.kind(),
+                    format!("UpdateProcThreadAttribute(HANDLE_LIST) failed: {err}"),
+                ));
+                continue;
+            }
 
             let ok_m = unsafe {
                 UpdateProcThreadAttribute(
@@ -921,6 +936,18 @@ pub fn spawn_sandboxed_worker_process(
                     core::ptr::null_mut(),
                 )
             };
+            if ok_m == 0 {
+                let err = io::Error::last_os_error();
+                unsafe {
+                    DeleteProcThreadAttributeList(attr_ptr);
+                }
+                last_spawn_err = Some(io::Error::new(
+                    err.kind(),
+                    format!("UpdateProcThreadAttribute(MITIGATION_POLICY) failed: {err}"),
+                ));
+                continue;
+            }
+
             let ok_c = unsafe {
                 UpdateProcThreadAttribute(
                     attr_ptr,
@@ -932,6 +959,18 @@ pub fn spawn_sandboxed_worker_process(
                     core::ptr::null_mut(),
                 )
             };
+            if ok_c == 0 {
+                let err = io::Error::last_os_error();
+                unsafe {
+                    DeleteProcThreadAttributeList(attr_ptr);
+                }
+                last_spawn_err = Some(io::Error::new(
+                    err.kind(),
+                    format!("UpdateProcThreadAttribute(CHILD_PROCESS_POLICY) failed: {err}"),
+                ));
+                continue;
+            }
+
             let ok_ac = if use_appcontainer {
                 unsafe {
                     UpdateProcThreadAttribute(
@@ -947,12 +986,15 @@ pub fn spawn_sandboxed_worker_process(
             } else {
                 1
             };
-
-            if ok_m == 0 || ok_c == 0 || ok_h == 0 || ok_ac == 0 {
-                last_spawn_err = Some(io::Error::last_os_error());
+            if ok_ac == 0 {
+                let err = io::Error::last_os_error();
                 unsafe {
                     DeleteProcThreadAttributeList(attr_ptr);
                 }
+                last_spawn_err = Some(io::Error::new(
+                    err.kind(),
+                    format!("UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed: {err}"),
+                ));
                 continue;
             }
 
@@ -1000,13 +1042,25 @@ pub fn spawn_sandboxed_worker_process(
                     &mut pi,
                 )
             };
+            let create_err = if created == 0 {
+                Some(io::Error::last_os_error())
+            } else {
+                None
+            };
 
             unsafe {
                 DeleteProcThreadAttributeList(attr_ptr);
             }
 
-            if created == 0 {
-                last_spawn_err = Some(io::Error::last_os_error());
+            if let Some(err) = create_err {
+                last_spawn_err = Some(io::Error::new(
+                    err.kind(),
+                    format!(
+                        "CreateProcessW failed for {} (exists={}): {err}",
+                        exe_path.display(),
+                        exe_path.exists()
+                    ),
+                ));
                 continue;
             }
 

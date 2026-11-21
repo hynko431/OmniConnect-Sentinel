@@ -2554,14 +2554,16 @@ pub fn resolve_contained_ui_target(
         ));
     }
 
-    // 2. Reject path traversal ('..') unconditionally BEFORE any disk access
-    for comp in user_path.components() {
-        if matches!(comp, Component::ParentDir) {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Path traversal ('..') is strictly prohibited",
-            ));
-        }
+    // 2. Reject path traversal ('..') across both POSIX '/' and Windows '\' separators unconditionally BEFORE any disk access
+    if raw_str.split(['/', '\\']).any(|seg| seg == "..")
+        || user_path
+            .components()
+            .any(|comp| matches!(comp, Component::ParentDir))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Path traversal ('..') is strictly prohibited",
+        ));
     }
 
     // 3. Reject Windows rooted (`\...`, `/...`), drive-relative (`C:...`), and ALL NTFS ADS colons
@@ -4805,11 +4807,20 @@ mod tests {
         let kiosk = AirGappedKioskManager::new(KioskConfig::default(), scratch_dir);
         let vault = QuarantineVault::open(vault_dir)?;
 
-        // Resolve `sentinel-cdr-worker` from the active build profile (`target/<profile>/`) — auto-building
-        // offline if absent so isolated CDR assertions NEVER silently skip on clean/release/custom target runs.
-        let active_profile_dir = std::env::current_exe()?
-            .parent()
-            .and_then(|p| p.parent())
+        // Resolve `sentinel-cdr-worker` from the active build profile (`target/<profile>/`) — works across
+        // both legacy `target/<profile>/deps/` and Rust 1.100+ `target/<profile>/build/<pkg>/<hash>/out/`
+        // layouts, auto-building offline if absent so isolated CDR assertions NEVER silently skip.
+        let current_exe = std::env::current_exe()?;
+        let active_profile_dir = current_exe
+            .ancestors()
+            .skip(1)
+            .find(|a| {
+                matches!(
+                    a.file_name().and_then(|n| n.to_str()),
+                    Some("debug" | "release")
+                )
+            })
+            .or_else(|| current_exe.parent().and_then(|p| p.parent()))
             .ok_or("active Cargo profile directory unavailable")?
             .to_path_buf();
         let worker_name = if cfg!(windows) {

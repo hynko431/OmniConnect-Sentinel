@@ -310,7 +310,11 @@ pub fn normalize_file_attributes(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = fs::symlink_metadata(&verbatim) {
             let mut perms = meta.permissions();
-            perms.set_mode(0o600);
+            if meta.is_dir() {
+                perms.set_mode(0o700);
+            } else {
+                perms.set_mode(0o600);
+            }
             let _ = fs::set_permissions(&verbatim, perms);
         }
     }
