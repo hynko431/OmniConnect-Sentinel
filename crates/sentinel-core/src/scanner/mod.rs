@@ -1,3 +1,4 @@
+pub mod av_adapter;
 pub mod content_scanner;
 pub mod ntfs_ads_scanner;
 pub mod polyglot_scanner;

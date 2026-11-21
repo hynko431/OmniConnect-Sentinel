@@ -1,12 +1,13 @@
-use std::fs::File;
-use std::io::{Read, Write};
 use std::path::Path;
 use uuid::Uuid;
 
 use sentinel_cdr::engine::InspectionAssessment;
 use sentinel_cdr::{SanitizationPolicy, WorkerLauncher, WorkerRequest};
 use sentinel_proto::SanitizationSummary;
-use sentinel_sys::{write_mark_of_the_web, DEFAULT_NAMED_PIPE_ENDPOINT};
+use sentinel_sys::{
+    create_restricted_file_atomic, open_untrusted_readonly_nofollow, read_untrusted_to_end_bounded,
+    write_mark_of_the_web, DEFAULT_NAMED_PIPE_ENDPOINT,
+};
 
 #[derive(Debug, Clone)]
 pub struct CdrClientConfig {
@@ -55,10 +56,9 @@ impl Tier1CdrClient {
     pub async fn inspect_file(&self, source_path: &Path) -> Result<InspectionAssessment, String> {
         let src = source_path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let mut raw_bytes = Vec::new();
-            File::open(&src)
-                .map_err(|e| format!("Failed opening source file for CDR inspect: {e}"))?
-                .read_to_end(&mut raw_bytes)
+            let mut file = open_untrusted_readonly_nofollow(&src)
+                .map_err(|e| format!("Failed opening source file for CDR inspect: {e}"))?;
+            let raw_bytes = read_untrusted_to_end_bounded(&mut file, 512 * 1024 * 1024)
                 .map_err(|e| format!("Failed reading source file for CDR inspect: {e}"))?;
 
             let file_name = src
@@ -85,10 +85,9 @@ impl Tier1CdrClient {
         let dst = dest_path.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
-            let mut raw_bytes = Vec::new();
-            File::open(&src)
-                .map_err(|e| format!("Failed opening source file for CDR: {e}"))?
-                .read_to_end(&mut raw_bytes)
+            let mut file = open_untrusted_readonly_nofollow(&src)
+                .map_err(|e| format!("Failed opening source file for CDR: {e}"))?;
+            let raw_bytes = read_untrusted_to_end_bounded(&mut file, 512 * 1024 * 1024)
                 .map_err(|e| format!("Failed reading source file for CDR: {e}"))?;
 
             let original_size_bytes = raw_bytes.len() as u64;
@@ -107,22 +106,9 @@ impl Tier1CdrClient {
                 })
                 .map_err(|e| format!("Sandboxed CDR worker rejected file: {e}"))?;
 
-            if let Some(parent) = dst.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        format!("Failed creating destination parent directory for CDR output: {e}")
-                    })?;
-                }
-            }
-            let mut out_file = File::create(&dst)
-                .map_err(|e| format!("Failed creating destination file for CDR output: {e}"))?;
-            out_file
-                .write_all(&outcome.clean_bytes)
-                .map_err(|e| format!("Failed writing disarmed output: {e}"))?;
-            out_file
-                .sync_all()
-                .map_err(|e| format!("Failed syncing disarmed output: {e}"))?;
-            drop(out_file);
+            create_restricted_file_atomic(&dst, &outcome.clean_bytes).map_err(|e| {
+                format!("Failed creating restricted destination file for CDR output: {e}")
+            })?;
 
             write_mark_of_the_web(&dst, 3)
                 .map_err(|e| format!("Failed applying Mark-of-the-Web to CDR output: {e}"))?;

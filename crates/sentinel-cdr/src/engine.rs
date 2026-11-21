@@ -64,6 +64,8 @@ pub struct SanitizationReport {
     pub stripped_elements: Vec<DisarmReportItem>,
     pub was_modified: bool,
     pub duration_micros: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_extension: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +76,8 @@ pub struct SanitizationOutcome {
     pub detected_format: DetectedFormat,
     pub disarm_report: Vec<DisarmReportItem>,
     pub processing_time_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_extension: Option<String>,
 }
 
 /// Real forensic assessment returned by `CdrEngine::inspect_bytes` (`BUG-CDR-09`)
@@ -247,6 +251,7 @@ impl CdrEngine {
             stripped_elements: outcome.disarm_report,
             was_modified,
             duration_micros: start.elapsed().as_micros() as u64,
+            recommended_extension: outcome.recommended_extension,
         };
 
         Ok((outcome.clean_bytes, report))
@@ -333,6 +338,8 @@ impl CdrEngine {
 
         let sanitized_sha256 = Self::compute_sha256(&clean_bytes);
         let processing_time_ms = start_time.elapsed().as_millis() as u64;
+        let recommended_extension =
+            OpenXmlSanitizer::derive_recommended_extension(format, file_name, &disarm_report);
 
         info!(
             "CDR complete for {:?}. Original: {} -> Clean: {} ({} ms, {} actions)",
@@ -350,6 +357,7 @@ impl CdrEngine {
             detected_format: format,
             disarm_report,
             processing_time_ms,
+            recommended_extension,
         })
     }
 
@@ -506,6 +514,34 @@ impl CdrEngine {
                         )));
                     }
                     let lower = normalized_name.to_ascii_lowercase();
+                    let is_ooxml_xml_or_rels = !is_generic_zip
+                        && (lower == "[content_types].xml"
+                            || lower.ends_with(".rels")
+                            || lower.ends_with(".xml"));
+                    if !entry.is_dir() && !is_ooxml_xml_or_rels {
+                        let mut probe = Vec::with_capacity(64);
+                        std::io::Read::read_to_end(
+                            &mut std::io::Read::take(&mut entry, 64),
+                            &mut probe,
+                        )
+                        .map_err(|e| {
+                            CdrError::OutputRejected(format!(
+                                "CDR_OUTPUT_REJECTED: Failed reading binary probe for entry '{lower}': {e}"
+                            ))
+                        })?;
+                        if let Some((elem_type, reason)) =
+                            OpenXmlSanitizer::classify_disallowed_binary_part(
+                                &normalized_name,
+                                &probe,
+                                is_generic_zip,
+                                policy,
+                            )
+                        {
+                            return Err(CdrError::OutputRejected(format!(
+                                "CDR_OUTPUT_REJECTED: Residual disallowed part '{lower}' ({elem_type}): {reason}"
+                            )));
+                        }
+                    }
                     if !is_generic_zip
                         && policy.strip_office_macros
                         && (lower.ends_with("vbaproject.bin")
@@ -580,6 +616,17 @@ impl CdrEngine {
                         {
                             return Err(CdrError::OutputRejected(format!(
                                 "CDR_OUTPUT_REJECTED: Residual DDE/ENTITY marker in OOXML entry {lower}"
+                            )));
+                        }
+                        if OpenXmlSanitizer::has_residual_dde_or_field_code(&xml_bytes).map_err(
+                            |e| {
+                                CdrError::OutputRejected(format!(
+                                    "CDR_OUTPUT_REJECTED: Malformed XML in sanitized OOXML entry {lower}: {e}"
+                                ))
+                            },
+                        )? {
+                            return Err(CdrError::OutputRejected(format!(
+                                "CDR_OUTPUT_REJECTED: Residual split-run or inline DDE/field-code in OOXML entry {lower}"
                             )));
                         }
                     }
@@ -802,16 +849,7 @@ impl CdrEngine {
                     ));
                 }
                 if format == DetectedFormat::Csv && policy.strip_office_dde {
-                    for line in text.lines() {
-                        for cell in line.split(',') {
-                            if TextCsvSanitizer::is_dangerous_csv_cell(cell) {
-                                return Err(CdrError::OutputRejected(
-                                    "CDR_OUTPUT_REJECTED: Residual unneutralized formula cell in sanitized CSV"
-                                        .to_string(),
-                                ));
-                            }
-                        }
-                    }
+                    TextCsvSanitizer::verify_csv_fields_clean(text)?;
                 }
             }
             DetectedFormat::Unknown => {
@@ -858,9 +896,17 @@ impl CdrEngine {
                     .to_string(),
             ));
         }
-        if policy.strip_pdf_attachments && dict.has(b"EmbeddedFiles") {
+        if policy.strip_pdf_attachments
+            && (dict.has(b"EmbeddedFiles") || dict.has(b"EF") || dict.has(b"AF"))
+        {
             return Err(CdrError::OutputRejected(
-                "CDR_OUTPUT_REJECTED: Residual /EmbeddedFiles in sanitized PDF".to_string(),
+                "CDR_OUTPUT_REJECTED: Residual /EmbeddedFiles, /EF, or /AF in sanitized PDF"
+                    .to_string(),
+            ));
+        }
+        if policy.strip_pdf_scripts && dict.has(b"XFA") {
+            return Err(CdrError::OutputRejected(
+                "CDR_OUTPUT_REJECTED: Residual /XFA in sanitized PDF".to_string(),
             ));
         }
         if let Ok(s_name) = dict.get(b"S").and_then(|o| o.as_name()) {
@@ -924,7 +970,12 @@ impl CdrEngine {
                         let mut rel_type = String::new();
                         for attr in validated_attrs {
                             let k = attr.key.local_name().into_inner().to_ascii_lowercase();
-                            let v = attr.value.into_owned();
+                            let v = crate::sanitizers::unescape_xml_attribute_value(&attr)
+                                .map_err(|err| {
+                                    CdrError::OutputRejected(format!(
+                                        "CDR_OUTPUT_REJECTED: Malformed .rels XML entity: {err}"
+                                    ))
+                                })?;
                             if k == "target" {
                                 target = v;
                             } else if k == "targetmode" {
@@ -934,19 +985,15 @@ impl CdrEngine {
                             }
                         }
                         let is_external = target_mode.trim().eq_ignore_ascii_case("external");
-                        let target_lower = target.trim().to_ascii_lowercase();
-                        let has_dangerous_scheme = target_lower.starts_with("ms-msdt:")
-                            || target_lower.starts_with("javascript:")
-                            || target_lower.starts_with("vbscript:")
-                            || target_lower.starts_with("mhtml:")
-                            || target_lower.starts_with("file:")
-                            || target_lower.starts_with("data:")
-                            || target_lower.starts_with("\\\\");
+                        let target_allowed = OpenXmlSanitizer::is_allowed_ooxml_relationship_target(
+                            &target,
+                            is_external,
+                        );
                         let is_benign_hyperlink =
                             rel_type.to_ascii_lowercase().ends_with("/hyperlink")
-                                && !has_dangerous_scheme
+                                && target_allowed
                                 && !policy.strip_external_hyperlinks;
-                        if has_dangerous_scheme || (is_external && !is_benign_hyperlink) {
+                        if !target_allowed || (is_external && !is_benign_hyperlink) {
                             return Err(CdrError::OutputRejected(format!(
                                 "CDR_OUTPUT_REJECTED: Residual external/unsafe relationship targeting '{target}'"
                             )));
@@ -973,7 +1020,12 @@ impl CdrEngine {
                         let mut rel_type = String::new();
                         for attr in validated_attrs {
                             let k = attr.key.local_name().into_inner().to_ascii_lowercase();
-                            let v = attr.value.into_owned();
+                            let v = crate::sanitizers::unescape_xml_attribute_value(&attr)
+                                .map_err(|err| {
+                                    CdrError::OutputRejected(format!(
+                                        "CDR_OUTPUT_REJECTED: Malformed .rels XML entity: {err}"
+                                    ))
+                                })?;
                             if k == "target" {
                                 target = v;
                             } else if k == "targetmode" {
@@ -983,19 +1035,15 @@ impl CdrEngine {
                             }
                         }
                         let is_external = target_mode.trim().eq_ignore_ascii_case("external");
-                        let target_lower = target.trim().to_ascii_lowercase();
-                        let has_dangerous_scheme = target_lower.starts_with("ms-msdt:")
-                            || target_lower.starts_with("javascript:")
-                            || target_lower.starts_with("vbscript:")
-                            || target_lower.starts_with("mhtml:")
-                            || target_lower.starts_with("file:")
-                            || target_lower.starts_with("data:")
-                            || target_lower.starts_with("\\\\");
+                        let target_allowed = OpenXmlSanitizer::is_allowed_ooxml_relationship_target(
+                            &target,
+                            is_external,
+                        );
                         let is_benign_hyperlink =
                             rel_type.to_ascii_lowercase().ends_with("/hyperlink")
-                                && !has_dangerous_scheme
+                                && target_allowed
                                 && !policy.strip_external_hyperlinks;
-                        if has_dangerous_scheme || (is_external && !is_benign_hyperlink) {
+                        if !target_allowed || (is_external && !is_benign_hyperlink) {
                             return Err(CdrError::OutputRejected(format!(
                                 "CDR_OUTPUT_REJECTED: Residual external/unsafe relationship targeting '{target}'"
                             )));

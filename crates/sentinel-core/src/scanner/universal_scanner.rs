@@ -6,6 +6,7 @@ use walkdir::WalkDir;
 
 use sentinel_sys::is_reparse_point_or_symlink;
 
+use crate::scanner::av_adapter::ExternalAvScannerAdapter;
 use crate::scanner::content_scanner::ContentScanner;
 use crate::scanner::ntfs_ads_scanner::NtfsAdsScanner;
 use crate::scanner::polyglot_scanner::PolyglotScanner;
@@ -72,8 +73,20 @@ pub struct UniversalScanner;
 
 impl UniversalScanner {
     /// Scans a single file using seekable stream handles in bounded O(64 KiB) memory (`BUG-CORE-03`, `Rows 69, 78`)
-    /// and returns an explicit `Err(std::io::Error)` if the file cannot be opened or read (`BUG-CORE-14`, `Row 79`).
+    /// with persisted ECDSA P-256 signed offline YARA packs (`CSE-27`) and returns an explicit
+    /// `Err(std::io::Error)` if the file cannot be opened or read (`BUG-CORE-14`, `Row 79`).
     pub fn scan_file(path: &Path) -> Result<Vec<UniversalThreat>, std::io::Error> {
+        let yara = Tier0YaraScanner::new_with_persisted_offline_packs();
+        Self::scan_file_with_scanner_and_av(path, &yara, &[])
+    }
+
+    /// Scans a single file using an explicit preloaded `Tier0YaraScanner` (with persisted signed
+    /// offline YARA packs) and optional pluggable external AV CLI / ICAP adapters (`CSE-27`).
+    pub fn scan_file_with_scanner_and_av(
+        path: &Path,
+        yara: &Tier0YaraScanner,
+        av_adapters: &[&dyn ExternalAvScannerAdapter],
+    ) -> Result<Vec<UniversalThreat>, std::io::Error> {
         let mut threats = Vec::new();
 
         // 0. Check path for Unicode BiDi / Zero-Width / Reserved DOS names / CLSID cloaking
@@ -191,8 +204,8 @@ impl UniversalScanner {
             threats.push(content_threat);
         }
 
-        // 5. Tier-0 YARA / Structural Executable Signature Inspection over 64 KiB streaming windows (`BUG-CORE-11`, `Rows 69, 78, 154, 156, 228, 229`)
-        let yara = Tier0YaraScanner::new();
+        // 5. Tier-0 YARA / Structural Executable Signature Inspection over 64 KiB streaming windows
+        //    using persisted ECDSA P-256 signed offline YARA packs (`BUG-CORE-11`, `CSE-27`)
         let yara_res = yara.scan_reader(&mut file, &path.to_string_lossy());
         if yara_res.matched {
             threats.push(UniversalThreat {
@@ -211,6 +224,52 @@ impl UniversalScanner {
                 stream_name: None,
                 can_disarm_via_cdr: false,
             });
+        }
+
+        // Release OS file handle before invoking optional external CLI/ICAP AV adapters (`CSE-27`)
+        drop(file);
+
+        // 6. Optional pluggable external AV CLI / ICAP adapters (`CSE-27`)
+        for adapter in av_adapters {
+            match adapter.scan_file_path(path) {
+                Ok(verdict) if verdict.infected => {
+                    threats.push(UniversalThreat {
+                        file_path: path.to_path_buf(),
+                        carrier_category: CarrierCategory::Executable,
+                        threat_name: format!(
+                            "EXTERNAL_AV_{}:{}",
+                            verdict.engine_name,
+                            verdict
+                                .signature_name
+                                .as_deref()
+                                .unwrap_or("MALWARE_DETECTED")
+                        ),
+                        severity: ThreatSeverity::Critical,
+                        risk_score: 100,
+                        mitre_technique: "T1204.002 (External AV Signature Match)".to_string(),
+                        technical_details: verdict.detail,
+                        overlay_offset: None,
+                        stream_name: None,
+                        can_disarm_via_cdr: false,
+                    });
+                }
+                Ok(_) => {}
+                Err(av_err) => {
+                    // Fail closed when a configured secondary AV adapter errors out
+                    threats.push(UniversalThreat {
+                        file_path: path.to_path_buf(),
+                        carrier_category: CarrierCategory::Executable,
+                        threat_name: format!("EXTERNAL_AV_FAIL_CLOSED:{}", adapter.engine_name()),
+                        severity: ThreatSeverity::High,
+                        risk_score: 90,
+                        mitre_technique: "T1562.001 (Secondary AV Scanner Failure)".to_string(),
+                        technical_details: av_err.to_string(),
+                        overlay_offset: None,
+                        stream_name: None,
+                        can_disarm_via_cdr: false,
+                    });
+                }
+            }
         }
 
         Ok(threats)
@@ -278,7 +337,8 @@ impl UniversalScanner {
         }
 
         // 5. Tier-0 YARA / Structural Executable Signature Inspection over Cursor (`Read + Seek`)
-        let yara = Tier0YaraScanner::new();
+        //    with persisted ECDSA P-256 signed offline YARA packs (`CSE-27`)
+        let yara = Tier0YaraScanner::new_with_persisted_offline_packs();
         let mut yara_cursor = std::io::Cursor::new(raw_bytes);
         let yara_res = yara.scan_reader(&mut yara_cursor, &path.to_string_lossy());
         if yara_res.matched {

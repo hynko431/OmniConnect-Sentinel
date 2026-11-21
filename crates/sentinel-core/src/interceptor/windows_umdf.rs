@@ -7,9 +7,10 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{info, warn};
 
 use sentinel_sys::{
-    apply_autoplay_suppression_policy, delete_volume_mount_point, disable_device_node,
-    enumerate_usb_pnp_devices, enumerate_usb_volumes, register_pnp_notification_watcher,
-    set_automount_disabled, PnpNotificationGuard, UsbPnpDeviceInfo,
+    apply_autoplay_suppression_policy, attribute_volume_to_pnp_device, delete_volume_mount_point,
+    disable_device_node, enumerate_usb_pnp_devices, enumerate_usb_volumes,
+    parse_windows_usb_vid_pid_serial, register_pnp_notification_watcher,
+    resolve_volume_usb_topology, set_automount_disabled, PnpNotificationGuard, UsbPnpDeviceInfo,
 };
 
 use crate::events::{ConnectionVector, DeviceConnectedEvent, UsbInterfaceDescriptor};
@@ -183,11 +184,12 @@ impl DeviceInterceptor for WindowsUmdfInterceptor {
                     if dev.is_composite_hid_storage {
                         let event = DeviceConnectedEvent {
                             connection_id: uuid::Uuid::new_v4(),
-                            timestamp_utc: chrono::Utc::now(),
+                            timestamp_utc: sentinel_sys::now_rfc3339_utc(),
                             vector: ConnectionVector::WiredUsb {
                                 vid: dev.vid,
                                 pid: dev.pid,
                                 serial: dev.serial.clone(),
+                                device_instance_id: Some(dev.instance_id.clone()),
                                 interfaces: Self::build_interfaces_for_pnp(dev, &dev.instance_id),
                             },
                             raw_mount_point: None,
@@ -198,21 +200,71 @@ impl DeviceInterceptor for WindowsUmdfInterceptor {
                     }
                 }
 
-                // Dispatch events for newly arrived USB volumes (both DRIVE_REMOVABLE & USB DRIVE_FIXED)
-                let primary_pnp = pnp_devices.first().cloned();
+                // Dispatch events for newly arrived USB volumes using EXACT SetupAPI + CM_Get_Parent
+                // topology attribution (`CSE-24` — NEVER guessing via `pnp_devices.first()`).
                 for vol in new_vols {
-                    let (vid, pid, serial, interfaces) = if let Some(ref dev) = primary_pnp {
+                    let attributed_pnp = attribute_volume_to_pnp_device(&vol, &pnp_devices);
+                    let (vid, pid, serial, device_instance_id, interfaces) = if let Some(ref dev) =
+                        attributed_pnp
+                    {
                         (
                             dev.vid,
                             dev.pid,
                             dev.serial.clone(),
+                            Some(dev.instance_id.clone()),
                             Self::build_interfaces_for_pnp(dev, &vol.volume_guid_path),
+                        )
+                    } else if let Some(ref inst_id) = vol.usb_device_instance_id {
+                        let (v, p, s) =
+                            parse_windows_usb_vid_pid_serial(inst_id).unwrap_or_else(|| {
+                                (
+                                    0x0000,
+                                    0x0000,
+                                    format!("VOL-{}", vol.volume_guid_path.trim_end_matches('\\')),
+                                )
+                            });
+                        let desc = vol
+                            .usb_device_desc
+                            .clone()
+                            .unwrap_or_else(|| format!("USB Volume ({inst_id})"));
+                        (
+                            v,
+                            p,
+                            s,
+                            Some(inst_id.clone()),
+                            vec![UsbInterfaceDescriptor {
+                                interface_number: 0,
+                                interface_class: 0x08,
+                                interface_subclass: 0x06,
+                                protocol: 0x50,
+                                description: desc,
+                            }],
+                        )
+                    } else if let Some(topo) =
+                        resolve_volume_usb_topology(std::path::Path::new(&vol.volume_guid_path))
+                    {
+                        let desc = topo
+                            .device_desc
+                            .unwrap_or_else(|| format!("USB Volume ({})", topo.instance_id));
+                        (
+                            topo.vid,
+                            topo.pid,
+                            topo.serial,
+                            Some(topo.instance_id),
+                            vec![UsbInterfaceDescriptor {
+                                interface_number: 0,
+                                interface_class: 0x08,
+                                interface_subclass: 0x06,
+                                protocol: 0x50,
+                                description: desc,
+                            }],
                         )
                     } else {
                         (
                             0x0000,
                             0x0000,
                             format!("VOL-{}", vol.volume_guid_path.trim_end_matches('\\')),
+                            None,
                             vec![UsbInterfaceDescriptor {
                                 interface_number: 0,
                                 interface_class: 0x08,
@@ -233,11 +285,12 @@ impl DeviceInterceptor for WindowsUmdfInterceptor {
 
                     let event = DeviceConnectedEvent {
                         connection_id: uuid::Uuid::new_v4(),
-                        timestamp_utc: chrono::Utc::now(),
+                        timestamp_utc: sentinel_sys::now_rfc3339_utc(),
                         vector: ConnectionVector::WiredUsb {
                             vid,
                             pid,
                             serial,
+                            device_instance_id,
                             interfaces,
                         },
                         raw_mount_point: Some(mount_path),

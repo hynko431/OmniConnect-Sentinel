@@ -1,0 +1,26 @@
+# OmniConnect Sentinel CDR Worker Falco Threat Detection & Containment Rules
+# Ref: Master Plan v2 §2.1, Sub-Phase 1.1 (CSE-05, Story 3.1)
+- rule: OmniConnect Sentinel CDR Worker Unauthorized Syscall
+  desc: Detects any unauthorized syscall execution or attempted sandbox escape from ephemeral sentinel_cdr_worker
+  condition: >
+    (proc.name = "sentinel_cdr_worker" or proc.name = "sentinel-cdr-worker") and
+    (evt.type in (execve, execveat, fork, vfork, clone, clone3, socket, connect, bind, listen, accept, ptrace, io_uring_setup, open, openat, openat2, unlink, unlinkat) or
+     syscall.type in (execve, execveat, fork, vfork, clone, clone3, socket, connect, bind, listen, accept, ptrace, io_uring_setup, open, openat, openat2, unlink, unlinkat))
+  output: >
+    CRITICAL: Unauthorized syscall or sandbox escape attempt from OmniConnect CDR Worker
+    (user=%user.name user_id=%user.uid proc=%proc.name cmdline=%proc.cmdline syscall=%syscall.type evt=%evt.type container_id=%container.id)
+  priority: CRITICAL
+  tags: [host, container_escape, mitre_execution, mitre_privilege_escalation, cis_benchmark, omniconnect]
+
+- rule: OmniConnect Sentinel CDR Worker W^X Memory Protection Violation
+  desc: Detects memory allocation or permission changes requesting PROT_EXEC within the ephemeral CDR worker
+  condition: >
+    (proc.name = "sentinel_cdr_worker" or proc.name = "sentinel-cdr-worker") and
+    evt.type in (mmap, mprotect) and
+    (evt.arg.prot contains "PROT_EXEC" or evt.rawarg.prot & 4 != 0)
+  output: >
+    CRITICAL: W^X executable memory violation attempted by OmniConnect CDR Worker
+    (proc=%proc.name pid=%proc.pid syscall=%syscall.type prot=%evt.arg.prot)
+  priority: CRITICAL
+  tags: [memory_corruption, code_injection, w_xor_x, omniconnect]
+

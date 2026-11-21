@@ -1,6 +1,30 @@
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
+/// Default JPEG re-encode quality raised from `image` crate's `75` to `90` (`CSE-21`).
+pub const DEFAULT_JPEG_REENCODE_QUALITY: u8 = 90;
+
+fn default_jpeg_reencode_quality() -> u8 {
+    DEFAULT_JPEG_REENCODE_QUALITY
+}
+
+/// Explicit policy governing cryptographically signed PDFs (`/ByteRange` + `/Sig`) (`CSE-20`).
+/// Prevents silent invalidation of legal contracts, DocuSign/Adobe PAdES documents, and signed e-invoices.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum SignedPdfPolicy {
+    /// Fail closed (`SIGNED_PDF_QUARANTINE_REQUIRED`) whenever a digital signature is detected so
+    /// callers quarantine and review the document instead of silently breaking the signature.
+    #[default]
+    QuarantineWithReason,
+    /// Explicit operator opt-in: preserve signed PDF bytes verbatim ONLY when deep AST inspection
+    /// confirms zero active content (no JS, launch/open/AA actions, XFA, `/EF`, `/EmbeddedFiles`,
+    /// `/AF` attachments when stripped, or `/Next` cycles). Signed PDFs with active content still fail closed.
+    AllowReadOnlyVerifiedClean,
+    /// Explicit operator opt-in: run full destructive CDR reconstruction and emit an explicit
+    /// `PDF_SIGNATURE_INVALIDATED_WARNING` in the sanitization report.
+    FlattenAndWarnSignatureBroken,
+}
+
 /// Configurable sanitization policy per file type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SanitizationPolicy {
@@ -10,6 +34,9 @@ pub struct SanitizationPolicy {
     pub strip_pdf_attachments: bool,
     /// PDF: Remove /URI or form submit actions
     pub strip_pdf_actions: bool,
+    /// PDF: Explicit handling policy for cryptographically signed PDFs (`/ByteRange` + `/Sig`) (`CSE-20`)
+    #[serde(default)]
+    pub signed_pdf_policy: SignedPdfPolicy,
 
     /// Office: Strip word/vbaProject.bin, xl/vbaProject.bin
     pub strip_office_macros: bool,
@@ -29,6 +56,9 @@ pub struct SanitizationPolicy {
     pub truncate_image_overlays: bool,
     /// Images: Re-encode raw pixels to canonical bitstream
     pub reencode_images: bool,
+    /// Images: Configurable JPEG re-encode quality (`1..=100`, default `90`, `CSE-21`)
+    #[serde(default = "default_jpeg_reencode_quality")]
+    pub jpeg_reencode_quality: u8,
 
     /// Default-deny allowlist opt-in: Allow SVG sanitization (default `false` per Plan v2 §2.6)
     #[serde(default)]
@@ -52,6 +82,7 @@ impl Default for SanitizationPolicy {
             strip_pdf_scripts: true,
             strip_pdf_attachments: true,
             strip_pdf_actions: true,
+            signed_pdf_policy: SignedPdfPolicy::QuarantineWithReason,
             strip_office_macros: true,
             strip_office_ole_objects: true,
             sanitize_office_external_relationships: true,
@@ -60,6 +91,7 @@ impl Default for SanitizationPolicy {
             strip_image_metadata: true,
             truncate_image_overlays: true,
             reencode_images: true,
+            jpeg_reencode_quality: DEFAULT_JPEG_REENCODE_QUALITY,
             allow_svg: false,
             allow_legacy_ole2: false,
             allow_generic_zip: false,
@@ -78,6 +110,7 @@ impl SanitizationPolicy {
             strip_pdf_scripts: false,
             strip_pdf_attachments: false,
             strip_pdf_actions: false,
+            signed_pdf_policy: SignedPdfPolicy::QuarantineWithReason,
             strip_office_macros: false,
             strip_office_ole_objects: false,
             sanitize_office_external_relationships: false,
@@ -86,6 +119,7 @@ impl SanitizationPolicy {
             strip_image_metadata: false,
             truncate_image_overlays: false,
             reencode_images: false,
+            jpeg_reencode_quality: DEFAULT_JPEG_REENCODE_QUALITY,
             allow_svg: false,
             allow_legacy_ole2: false,
             allow_generic_zip: false,
@@ -123,6 +157,7 @@ impl SanitizationPolicy {
                     strip_pdf_actions: server_ceiling.strip_pdf_actions
                         || p.strip_pdf_actions
                         || p.strip_external_hyperlinks,
+                    signed_pdf_policy: server_ceiling.signed_pdf_policy,
                     strip_office_macros: server_ceiling.strip_office_macros || p.strip_macros,
                     strip_office_ole_objects: server_ceiling.strip_office_ole_objects
                         || p.strip_embedded_files,
@@ -139,6 +174,7 @@ impl SanitizationPolicy {
                     truncate_image_overlays: server_ceiling.truncate_image_overlays
                         || p.truncate_overlay_bytes,
                     reencode_images: server_ceiling.reencode_images || p.reencode_images,
+                    jpeg_reencode_quality: server_ceiling.jpeg_reencode_quality.clamp(1, 100),
                     allow_svg: server_ceiling.allow_svg,
                     allow_legacy_ole2: server_ceiling.allow_legacy_ole2,
                     allow_generic_zip: server_ceiling.allow_generic_zip,
@@ -146,8 +182,48 @@ impl SanitizationPolicy {
                     max_decompressed_bytes: max_bytes,
                 }
             }
-            None => server_ceiling.clone(),
+            None => {
+                let mut cloned = server_ceiling.clone();
+                cloned.jpeg_reencode_quality = cloned.jpeg_reencode_quality.clamp(1, 100);
+                cloned
+            }
         }
+    }
+
+    /// Encodes extended worker-only policy directives (`signed_pdf_policy`, `jpeg_reencode_quality`)
+    /// into a `DisarmMetadata.session_id` envelope so the parent-to-worker pipe preserves operator
+    /// settings without breaking protobuf wire compatibility (`CSE-20`, `CSE-21`).
+    pub fn encode_worker_session_meta(&self, session_uuid: &str) -> String {
+        let spd = match self.signed_pdf_policy {
+            SignedPdfPolicy::QuarantineWithReason => "Q",
+            SignedPdfPolicy::AllowReadOnlyVerifiedClean => "A",
+            SignedPdfPolicy::FlattenAndWarnSignatureBroken => "F",
+        };
+        let jq = self.jpeg_reencode_quality.clamp(1, 100);
+        format!("{session_uuid}|SPD={spd}|JQ={jq}")
+    }
+
+    /// Maps a trusted parent-to-worker `DisarmPolicy` protobuf frame + `session_id` metadata
+    /// onto a `SanitizationPolicy` while still clamping numeric budgets and defaulting fail-closed.
+    pub fn from_worker_proto_with_meta(
+        p: sentinel_proto::DisarmPolicy,
+        session_meta: &str,
+    ) -> Self {
+        let mut policy = Self::from_worker_proto(p);
+        for part in session_meta.split('|').skip(1) {
+            if let Some(code) = part.strip_prefix("SPD=") {
+                policy.signed_pdf_policy = match code {
+                    "A" => SignedPdfPolicy::AllowReadOnlyVerifiedClean,
+                    "F" => SignedPdfPolicy::FlattenAndWarnSignatureBroken,
+                    _ => SignedPdfPolicy::QuarantineWithReason,
+                };
+            } else if let Some(q_str) = part.strip_prefix("JQ=") {
+                if let Ok(q) = q_str.parse::<u8>() {
+                    policy.jpeg_reencode_quality = q.clamp(1, 100);
+                }
+            }
+        }
+        policy
     }
 
     /// Maps a trusted parent-to-worker `DisarmPolicy` protobuf frame directly onto a `SanitizationPolicy`
@@ -168,6 +244,7 @@ impl SanitizationPolicy {
             strip_pdf_scripts: p.strip_javascript,
             strip_pdf_attachments: p.strip_embedded_files,
             strip_pdf_actions: p.strip_pdf_actions,
+            signed_pdf_policy: SignedPdfPolicy::QuarantineWithReason,
             strip_office_macros: p.strip_macros,
             strip_office_ole_objects: p.strip_embedded_files,
             sanitize_office_external_relationships: p.strip_external_hyperlinks,
@@ -176,6 +253,7 @@ impl SanitizationPolicy {
             strip_image_metadata: p.strip_exif_metadata,
             truncate_image_overlays: p.truncate_overlay_bytes,
             reencode_images: p.reencode_images,
+            jpeg_reencode_quality: DEFAULT_JPEG_REENCODE_QUALITY,
             allow_svg: false,
             allow_legacy_ole2: false,
             allow_generic_zip: false,

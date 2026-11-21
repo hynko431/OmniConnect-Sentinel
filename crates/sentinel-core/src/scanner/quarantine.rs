@@ -2,7 +2,6 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Key, Nonce,
 };
-use chrono::Utc;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,21 +12,30 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use sentinel_sys::{
-    apply_system_admin_dacl, decrypt_kek_from_soc_escrow, default_soc_rsa_public_blob,
-    encrypt_kek_for_soc_escrow, seal_key_bytes, sync_directory, to_verbatim_path, unseal_key_bytes,
-    write_protected_key_file, zeroize_slice, KeyProtectionPosture, SealedKeyBlob, SocEscrowBlob,
-    ZeroizingBytes,
+    create_restricted_dir_atomic, create_restricted_file_handle_atomic,
+    decrypt_kek_from_soc_escrow, decrypt_kek_from_soc_escrow_hybrid_v3, encrypt_kek_for_soc_escrow,
+    encrypt_kek_for_soc_escrow_hybrid_v3, now_unix_and_rfc3339_utc, parse_rsa_public_key,
+    seal_key_bytes, sync_directory, to_verbatim_path, unseal_key_bytes,
+    validate_fips203_mlkem768_encapsulation_key, write_protected_key_file, zeroize_slice,
+    HybridSocEscrowBlobV3, HybridSocPrivateKeyBundle, HybridSocPublicKeyBundle,
+    KeyProtectionPosture, SealedKeyBlob, SocEscrowBlob, ZeroizingBytes,
 };
 
-use crate::enterprise::ledger::AuditLedger;
+use crate::enterprise::ledger::{
+    tokenize_path_for_ledger, AuditLedger, AuditSubsystem, SharedAuditLedger,
+};
 use crate::error::{DegradationEvent, SentinelError};
 use crate::scanner::secure_shredder::{SecureShredder, ShredMethod};
 
 pub const ENVELOPE_MAGIC_V2_FULL: &[u8; 8] = b"SNTLQV02";
 pub const ENVELOPE_VERSION: u16 = 2;
+pub const ENVELOPE_MAGIC_V3_FULL: &[u8; 8] = b"SNTLQV03";
+pub const ENVELOPE_VERSION_V3: u16 = 3;
 pub const HKDF_INFO_QUARANTINE_V2: &[u8] = b"OMNICONNECT_SENTINEL_QUARANTINE_V2";
 const SEALED_KEK_FILENAME: &str = "vault_kek.sealed";
 const ESCROW_KEK_FILENAME: &str = "vault_kek.escrow";
+pub const HYBRID_ESCROW_V3_JSON_FILENAME: &str = "vault_kek.escrow.v3.json";
+pub const HYBRID_ESCROW_V3_WIRE_FILENAME: &str = "vault_kek.ocescrow3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LegacyMigrationAction {
@@ -82,6 +90,13 @@ pub struct QuarantineEnvelopeHeader {
     pub quarantined_at_utc: String,
     #[serde(default = "default_recovery_status")]
     pub recovery_status: String,
+    /// AES-256-GCM encrypted plaintext `original_path` under the per-entry DEK (`SNTLQV03`, `CSE-16`).
+    /// Keeps raw path/username PII out of unencrypted `.quar` header JSON on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_original_path_hex: Option<String>,
+    /// Distinct 96-bit AEAD nonce used to encrypt `encrypted_original_path_hex` (`SNTLQV03`, `CSE-16`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_nonce: Option<[u8; 12]>,
 }
 
 fn default_header_magic() -> [u8; 8] {
@@ -98,14 +113,15 @@ fn default_recovery_status() -> String {
 
 /// Cryptographic Quarantine Vault (`BUG-CORE-02`, `BUG-CLI-01`, `ADR-005`, Phase 1.1)
 ///
-/// - Protects the 256-bit Master KEK via TPM 2.0 PCP RSA-2048 OAEP (`MS_PLATFORM_CRYPTO_PROVIDER`),
+/// - Protects the 256-bit Master KEK via TPM 2.0 PCP RSA OAEP (`MS_PLATFORM_CRYPTO_PROVIDER`),
 ///   falling back to DPAPI `CRYPTPROTECT_LOCAL_MACHINE` with `DegradationEvent::PostureReducedNoTpm`.
-/// - Asymmetrically escrows the Master KEK to an offline SOC RSA-2048 public key (`vault_kek.escrow`)
-///   via CNG `BCryptEncrypt(BCRYPT_PAD_OAEP)` so recovery survives total hardware failure.
+/// - Asymmetrically escrows the Master KEK to an offline SOC RSA-3072+ public key (`vault_kek.escrow`)
+///   or Hybrid PQC `OCESCROW3` (`RSA-3072+` + `ML-KEM-768`) so recovery survives total hardware failure.
 /// - Fails closed (`VAULT_INTEGRITY_FAIL`) if `vault_kek.sealed` exists on disk and cannot be unsealed —
 ///   never silently regenerating or overwriting an existing KEK.
 /// - Derives per-file wrapping keys via `HKDF-SHA256(KEK, file_salt, "OMNICONNECT_SENTINEL_QUARANTINE_V2")`
-///   and stores a wrapped per-entry DEK (`<entry_id>.dek`) so `purge()` performs true cryptographic erasure.
+///   and stores a wrapped per-entry DEK (`<entry_id>.dek`) so `purge()` overwrites the DEK and `.quar`
+///   envelope via honest NIST SP 800-88 Rev. 2 `Clear` while the shared vault KEK/escrow remain active.
 pub struct QuarantineVault {
     vault_dir: PathBuf,
     master_kek: ZeroizingBytes<32>,
@@ -113,6 +129,7 @@ pub struct QuarantineVault {
     posture: KeyProtectionPosture,
     degradation_event: Option<DegradationEvent>,
     init_error: Option<String>,
+    shared_ledger: Option<SharedAuditLedger>,
 }
 
 impl std::fmt::Debug for QuarantineVault {
@@ -128,29 +145,155 @@ impl std::fmt::Debug for QuarantineVault {
     }
 }
 
-impl QuarantineVault {
-    /// Opens or provisions the Quarantine Vault, returning `Err` (`VAULT_INTEGRITY_FAIL`) if
-    /// directory creation, DACL hardening, or existing KEK unsealing fails.
-    pub fn open(vault_dir: PathBuf) -> Result<Self, String> {
-        let soc_pub = default_soc_rsa_public_blob();
-        Self::open_with_soc_public_key(vault_dir, &soc_pub)
+enum ConfiguredSocEscrowKey {
+    Unconfigured,
+    RsaPublicBlob(Vec<u8>),
+    HybridV3(HybridSocPublicKeyBundle),
+}
+
+fn default_soc_config_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        let pd = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
+        PathBuf::from(pd).join("OmniConnect").join("Sentinel")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/etc/omniconnect")
+    }
+}
+
+fn resolve_configured_soc_public_key() -> Result<ConfiguredSocEscrowKey, String> {
+    if let Ok(hybrid_path) = std::env::var("SENTINEL_SOC_HYBRID_PUBKEY_PATH") {
+        let trimmed = hybrid_path.trim();
+        if !trimmed.is_empty() {
+            let raw = fs::read(trimmed).map_err(|e| {
+                format!("VAULT_CONFIG_FAIL: Failed reading SENTINEL_SOC_HYBRID_PUBKEY_PATH '{trimmed}': {e}")
+            })?;
+            let bundle: HybridSocPublicKeyBundle = serde_json::from_slice(&raw).map_err(|e| {
+                format!(
+                    "VAULT_CONFIG_FAIL: Invalid HybridSocPublicKeyBundle JSON in '{trimmed}': {e}"
+                )
+            })?;
+            parse_rsa_public_key(&bundle.rsa_public_blob).map_err(|e| {
+                format!(
+                    "VAULT_CONFIG_FAIL: Hybrid SOC RSA key rejected (requires >= 3072 bits): {e}"
+                )
+            })?;
+            validate_fips203_mlkem768_encapsulation_key(&bundle.mlkem768_encapsulation_key)
+                .map_err(|e| {
+                    format!("VAULT_CONFIG_FAIL: Hybrid SOC ML-KEM-768 key rejected: {e}")
+                })?;
+            return Ok(ConfiguredSocEscrowKey::HybridV3(bundle));
+        }
     }
 
-    /// Opens or provisions the Quarantine Vault using an explicit offline SOC RSA-2048 public key blob.
+    if let Ok(rsa_path) = std::env::var("SENTINEL_SOC_RSA_PUBKEY_PATH") {
+        let trimmed = rsa_path.trim();
+        if !trimmed.is_empty() {
+            let raw = fs::read(trimmed).map_err(|e| {
+                format!("VAULT_CONFIG_FAIL: Failed reading SENTINEL_SOC_RSA_PUBKEY_PATH '{trimmed}': {e}")
+            })?;
+            parse_rsa_public_key(&raw).map_err(|e| {
+                format!("VAULT_CONFIG_FAIL: Configured SOC RSA public key rejected (requires >= 3072 bits): {e}")
+            })?;
+            return Ok(ConfiguredSocEscrowKey::RsaPublicBlob(raw));
+        }
+    }
+
+    let cfg_dir = default_soc_config_dir();
+    let default_hybrid_path = cfg_dir.join("soc_hybrid_pubkey.json");
+    if default_hybrid_path.exists() {
+        let raw = fs::read(&default_hybrid_path).map_err(|e| {
+            format!(
+                "VAULT_CONFIG_FAIL: Failed reading {}: {e}",
+                default_hybrid_path.display()
+            )
+        })?;
+        let bundle: HybridSocPublicKeyBundle = serde_json::from_slice(&raw).map_err(|e| {
+            format!(
+                "VAULT_CONFIG_FAIL: Invalid HybridSocPublicKeyBundle JSON in {}: {e}",
+                default_hybrid_path.display()
+            )
+        })?;
+        parse_rsa_public_key(&bundle.rsa_public_blob).map_err(|e| {
+            format!("VAULT_CONFIG_FAIL: Hybrid SOC RSA key rejected (requires >= 3072 bits): {e}")
+        })?;
+        validate_fips203_mlkem768_encapsulation_key(&bundle.mlkem768_encapsulation_key)
+            .map_err(|e| format!("VAULT_CONFIG_FAIL: Hybrid SOC ML-KEM-768 key rejected: {e}"))?;
+        return Ok(ConfiguredSocEscrowKey::HybridV3(bundle));
+    }
+
+    let default_rsa_path = cfg_dir.join("soc_rsa_pubkey.bin");
+    if default_rsa_path.exists() {
+        let raw = fs::read(&default_rsa_path).map_err(|e| {
+            format!(
+                "VAULT_CONFIG_FAIL: Failed reading {}: {e}",
+                default_rsa_path.display()
+            )
+        })?;
+        parse_rsa_public_key(&raw).map_err(|e| {
+            format!("VAULT_CONFIG_FAIL: Configured SOC RSA public key rejected (requires >= 3072 bits): {e}")
+        })?;
+        return Ok(ConfiguredSocEscrowKey::RsaPublicBlob(raw));
+    }
+
+    Ok(ConfiguredSocEscrowKey::Unconfigured)
+}
+
+impl QuarantineVault {
+    /// Opens or provisions the Quarantine Vault using only persistent administrator-configured
+    /// offline SOC recovery keys (`SENTINEL_SOC_HYBRID_PUBKEY_PATH` / `SENTINEL_SOC_RSA_PUBKEY_PATH`
+    /// or OS admin config), NEVER generating unrecoverable ephemeral in-memory RSA keys (`CEA-DEFECT-03`).
+    ///
+    /// When no offline SOC public key is configured, records `DegradationEvent::SocEscrowUnconfigured`
+    /// honestly and skips writing a fake unrecoverable `vault_kek.escrow`.
+    pub fn open(vault_dir: PathBuf) -> Result<Self, String> {
+        match resolve_configured_soc_public_key()? {
+            ConfiguredSocEscrowKey::Unconfigured => Self::open_with_soc_public_key(vault_dir, &[]),
+            ConfiguredSocEscrowKey::RsaPublicBlob(pub_bytes) => {
+                Self::open_with_soc_public_key(vault_dir, &pub_bytes)
+            }
+            ConfiguredSocEscrowKey::HybridV3(pub_bundle) => {
+                let mut vault =
+                    Self::open_with_soc_public_key(vault_dir, &pub_bundle.rsa_public_blob)?;
+                if !vault
+                    .vault_dir
+                    .join(HYBRID_ESCROW_V3_JSON_FILENAME)
+                    .exists()
+                    || !vault
+                        .vault_dir
+                        .join(HYBRID_ESCROW_V3_WIRE_FILENAME)
+                        .exists()
+                {
+                    let _ = vault.provision_hybrid_soc_escrow_v3(&pub_bundle)?;
+                    if vault.degradation_event == Some(DegradationEvent::SocEscrowUnconfigured) {
+                        vault.degradation_event =
+                            if vault.posture == KeyProtectionPosture::Tpm2Assisted {
+                                None
+                            } else {
+                                Some(DegradationEvent::PostureReducedNoTpm)
+                            };
+                    }
+                }
+                Ok(vault)
+            }
+        }
+    }
+
+    /// Opens or provisions the Quarantine Vault using an explicit offline SOC RSA-3072+ public key blob.
     pub fn open_with_soc_public_key(
         vault_dir: PathBuf,
         soc_rsa_pub_blob: &[u8],
     ) -> Result<Self, String> {
-        fs::create_dir_all(&vault_dir).map_err(|e| {
+        if !soc_rsa_pub_blob.is_empty() {
+            parse_rsa_public_key(soc_rsa_pub_blob).map_err(|e| {
+                format!("Offline SOC RSA public key rejected (requires >= 3072 bits): {e}")
+            })?;
+        }
+        create_restricted_dir_atomic(&vault_dir).map_err(|e| {
             format!(
                 "Failed creating quarantine vault directory {}: {}",
-                vault_dir.display(),
-                e
-            )
-        })?;
-        apply_system_admin_dacl(&vault_dir).map_err(|e| {
-            format!(
-                "Failed applying SYSTEM/Admin DACL to quarantine vault directory {}: {}",
                 vault_dir.display(),
                 e
             )
@@ -167,7 +310,14 @@ impl QuarantineVault {
             posture,
             degradation_event,
             init_error: None,
+            shared_ledger: None,
         })
+    }
+
+    /// Attaches a unified `SharedAuditLedger` to the Quarantine Vault (`CSE-13`).
+    pub fn with_shared_ledger(mut self, shared_ledger: SharedAuditLedger) -> Self {
+        self.shared_ledger = Some(shared_ledger);
+        self
     }
 
     /// Convenience constructor that preserves fail-closed semantics: if `open()` fails
@@ -186,16 +336,28 @@ impl QuarantineVault {
                     posture: KeyProtectionPosture::DpapiLocalMachine,
                     degradation_event: Some(DegradationEvent::VaultIntegrityFail),
                     init_error: Some(err),
+                    shared_ledger: None,
                 }
             }
         }
     }
 
     /// Recovers a Quarantine Vault whose host TPM/DPAPI `vault_kek.sealed` was lost or corrupted
-    /// using the offline SOC RSA-2048 private key and `vault_kek.escrow` (`Master Plan v2 §1.1 #2, §5.1`).
+    /// using the offline SOC RSA-3072+ private key and `vault_kek.escrow` (`Master Plan v2 §1.1 #2, §5.1`).
     pub fn recover_from_soc_escrow(
         vault_dir: PathBuf,
         soc_rsa_priv_blob: &[u8],
+    ) -> Result<Self, String> {
+        Self::recover_from_soc_escrow_with_shared_ledger(vault_dir, soc_rsa_priv_blob, None)
+    }
+
+    /// Recovers a Quarantine Vault via offline SOC RSA-3072+ escrow, atomically re-sealing
+    /// `vault_kek.sealed`, syncing the vault directory, and logging `VAULT_ESCROW_RECOVERED` to
+    /// `shared_ledger` when supplied (`CSE-16`).
+    pub fn recover_from_soc_escrow_with_shared_ledger(
+        vault_dir: PathBuf,
+        soc_rsa_priv_blob: &[u8],
+        shared_ledger: Option<SharedAuditLedger>,
     ) -> Result<Self, String> {
         let escrow_path = vault_dir.join(ESCROW_KEK_FILENAME);
         let raw_escrow = fs::read(&escrow_path).map_err(|e| {
@@ -239,6 +401,8 @@ impl QuarantineVault {
         let sealed_path = vault_dir.join(SEALED_KEK_FILENAME);
         write_protected_key_file(&sealed_path, &serialized)
             .map_err(|e| format!("Failed persisting re-sealed KEK: {e}"))?;
+        sync_directory(&vault_dir)
+            .map_err(|e| format!("Failed syncing vault directory after KEK recovery: {e}"))?;
 
         let vault = Self {
             vault_dir,
@@ -247,10 +411,147 @@ impl QuarantineVault {
             posture,
             degradation_event,
             init_error: None,
+            shared_ledger,
         };
         vault.append_ledger_event(
             "VAULT_ESCROW_RECOVERED",
-            &format!("Recovered master KEK '{computed_id}' via offline SOC RSA-2048 OAEP escrow"),
+            &format!("Recovered master KEK '{computed_id}' via offline SOC RSA-3072+ OAEP escrow"),
+        )?;
+        Ok(vault)
+    }
+
+    /// Provisions a Hybrid Post-Quantum `OCESCROW3` (`v3`) offline SOC recovery envelope
+    /// (`RSA-3072-OAEP` + `FIPS 203 ML-KEM-768` via `HKDF-SHA256` + `AES-256-GCM`, `Sub-Phase 2.2`, `CSE-14`).
+    pub fn provision_hybrid_soc_escrow_v3(
+        &self,
+        pub_bundle: &HybridSocPublicKeyBundle,
+    ) -> Result<HybridSocEscrowBlobV3, String> {
+        self.check_healthy()?;
+        let escrow_v3 =
+            encrypt_kek_for_soc_escrow_hybrid_v3(&self.master_kek, pub_bundle, &self.kek_id)
+                .map_err(|e| format!("Failed creating OCESCROW3 hybrid PQC escrow: {e}"))?;
+
+        let json_bytes = serde_json::to_vec_pretty(&escrow_v3)
+            .map_err(|e| format!("Failed serializing OCESCROW3 JSON: {e}"))?;
+        let json_path = self.vault_dir.join(HYBRID_ESCROW_V3_JSON_FILENAME);
+        write_protected_key_file(&json_path, &json_bytes)
+            .map_err(|e| format!("Failed writing {}: {e}", json_path.display()))?;
+
+        let wire_path = self.vault_dir.join(HYBRID_ESCROW_V3_WIRE_FILENAME);
+        write_protected_key_file(&wire_path, &escrow_v3.ocescrow3_wire_bytes)
+            .map_err(|e| format!("Failed writing {}: {e}", wire_path.display()))?;
+
+        self.append_ledger_event(
+            "VAULT_HYBRID_PQC_ESCROW_V3_PROVISIONED",
+            &format!(
+                "Provisioned OCESCROW3 hybrid PQC escrow for KEK '{}' (alg={}, rsa_fp={}, mlkem768_fp={})",
+                self.kek_id,
+                escrow_v3.algorithm,
+                escrow_v3.soc_rsa_fingerprint,
+                escrow_v3.soc_mlkem768_fingerprint
+            ),
+        )?;
+        Ok(escrow_v3)
+    }
+
+    /// Recovers a Quarantine Vault whose host TPM/DPAPI `vault_kek.sealed` was destroyed using the
+    /// offline SOC Hybrid Post-Quantum `OCESCROW3` (`v3`) private key bundle (`RSA-3072` + `ML-KEM-768`).
+    pub fn recover_from_hybrid_soc_escrow_v3(
+        vault_dir: PathBuf,
+        priv_bundle: &HybridSocPrivateKeyBundle,
+    ) -> Result<Self, String> {
+        Self::recover_from_hybrid_soc_escrow_v3_with_shared_ledger(vault_dir, priv_bundle, None)
+    }
+
+    /// Recovers a Quarantine Vault via Hybrid Post-Quantum `OCESCROW3` (`v3`), atomically re-sealing
+    /// `vault_kek.sealed`, syncing the vault directory, and logging `VAULT_HYBRID_PQC_ESCROW_V3_RECOVERED`
+    /// to `shared_ledger` when supplied (`CSE-16`).
+    pub fn recover_from_hybrid_soc_escrow_v3_with_shared_ledger(
+        vault_dir: PathBuf,
+        priv_bundle: &HybridSocPrivateKeyBundle,
+        shared_ledger: Option<SharedAuditLedger>,
+    ) -> Result<Self, String> {
+        let json_path = vault_dir.join(HYBRID_ESCROW_V3_JSON_FILENAME);
+        let raw_json = fs::read(&json_path).map_err(|e| {
+            format!(
+                "VAULT_INTEGRITY_FAIL: Failed reading OCESCROW3 file {}: {}",
+                json_path.display(),
+                e
+            )
+        })?;
+        let mut escrow_v3: HybridSocEscrowBlobV3 = serde_json::from_slice(&raw_json)
+            .map_err(|e| format!("VAULT_INTEGRITY_FAIL: Corrupted OCESCROW3 JSON: {e}"))?;
+
+        let wire_path = vault_dir.join(HYBRID_ESCROW_V3_WIRE_FILENAME);
+        if !wire_path.exists() {
+            return Err(format!(
+                "VAULT_INTEGRITY_FAIL: Missing OCESCROW3 binary wire file {}",
+                wire_path.display()
+            ));
+        }
+        let disk_wire = fs::read(&wire_path).map_err(|e| {
+            format!(
+                "VAULT_INTEGRITY_FAIL: Failed reading OCESCROW3 binary envelope {}: {}",
+                wire_path.display(),
+                e
+            )
+        })?;
+        if disk_wire != escrow_v3.ocescrow3_wire_bytes {
+            return Err(
+                "VAULT_INTEGRITY_FAIL: OCESCROW3 binary wire file diverges from JSON metadata (tampering detected)"
+                    .to_string(),
+            );
+        }
+        escrow_v3.ocescrow3_wire_bytes = disk_wire;
+
+        let mut recovered_kek = decrypt_kek_from_soc_escrow_hybrid_v3(&escrow_v3, priv_bundle)
+            .map_err(|e| {
+                format!("VAULT_INTEGRITY_FAIL: OCESCROW3 hybrid PQC decapsulation failed: {e}")
+            })?;
+        let computed_id = Self::compute_kek_id(&recovered_kek);
+        if computed_id != escrow_v3.kek_id {
+            zeroize_slice(&mut recovered_kek);
+            return Err(format!(
+                "VAULT_INTEGRITY_FAIL: Recovered KEK ID '{}' does not match OCESCROW3 KEK ID '{}'",
+                computed_id, escrow_v3.kek_id
+            ));
+        }
+
+        let zeroizing = ZeroizingBytes::new(recovered_kek);
+        zeroize_slice(&mut recovered_kek);
+
+        let context = format!("OmniConnect-Sentinel-Vault:{}", vault_dir.display());
+        let sealed_blob = seal_key_bytes(zeroizing.as_slice(), context.as_bytes(), &computed_id)
+            .map_err(|e| format!("Failed re-sealing OCESCROW3-recovered KEK: {e}"))?;
+        let posture = sealed_blob.posture;
+        let degradation_event = if posture == KeyProtectionPosture::Tpm2Assisted {
+            None
+        } else {
+            Some(DegradationEvent::PostureReducedNoTpm)
+        };
+
+        let serialized = serde_json::to_vec_pretty(&sealed_blob)
+            .map_err(|e| format!("Failed serializing re-sealed KEK: {e}"))?;
+        let sealed_path = vault_dir.join(SEALED_KEK_FILENAME);
+        write_protected_key_file(&sealed_path, &serialized)
+            .map_err(|e| format!("Failed persisting re-sealed KEK: {e}"))?;
+        sync_directory(&vault_dir)
+            .map_err(|e| format!("Failed syncing vault directory after OCESCROW3 recovery: {e}"))?;
+
+        let vault = Self {
+            vault_dir,
+            master_kek: zeroizing,
+            kek_id: computed_id.clone(),
+            posture,
+            degradation_event,
+            init_error: None,
+            shared_ledger,
+        };
+        vault.append_ledger_event(
+            "VAULT_HYBRID_PQC_ESCROW_V3_RECOVERED",
+            &format!(
+                "Recovered master KEK '{computed_id}' via offline SOC OCESCROW3 (RSA-OAEP + ML-KEM-768) escrow"
+            ),
         )?;
         Ok(vault)
     }
@@ -278,9 +579,64 @@ impl QuarantineVault {
         self.vault_dir.join("vault_audit.jsonl")
     }
 
+    pub fn shred_file_to_vault_ledger(
+        &self,
+        path: &Path,
+        method: ShredMethod,
+    ) -> Result<crate::scanner::secure_shredder::ShredReceipt, String> {
+        if let Some(shared) = &self.shared_ledger {
+            SecureShredder::shred_file_with_shared_ledger(path, method, Some(shared))
+        } else {
+            SecureShredder::shred_file_with_ledger(path, method, &self.ledger_file_path())
+        }
+    }
+
+    pub fn shred_ads_to_vault_ledger(
+        &self,
+        host_path: &Path,
+        stream_name: &str,
+    ) -> Result<crate::scanner::secure_shredder::ShredReceipt, String> {
+        if let Some(shared) = &self.shared_ledger {
+            SecureShredder::shred_ntfs_stream_with_shared_ledger(
+                host_path,
+                stream_name,
+                Some(shared),
+            )
+        } else {
+            SecureShredder::shred_ntfs_stream_with_ledger(
+                host_path,
+                stream_name,
+                &self.ledger_file_path(),
+            )
+        }
+    }
+
+    fn tokenize_path_for_audit(&self, raw_path: &Path) -> Result<String, String> {
+        tokenize_path_for_ledger(
+            self.shared_ledger.as_ref(),
+            &self.ledger_file_path(),
+            raw_path,
+        )
+    }
+
     fn append_ledger_event(&self, event: &str, data: &str) -> Result<(), String> {
+        if let Some(shared) = &self.shared_ledger {
+            if let Ok(mut guard) = shared.lock() {
+                guard.append_subsystem_event(
+                    AuditSubsystem::Quarantine,
+                    event,
+                    serde_json::Value::String(data.to_string()),
+                )?;
+                return Ok(());
+            }
+        }
         let mut ledger = AuditLedger::open_result(self.ledger_file_path())?;
-        ledger.append_event(event, data).map(|_| ())
+        ledger.append_subsystem_event(
+            AuditSubsystem::Quarantine,
+            event,
+            serde_json::Value::String(data.to_string()),
+        )?;
+        Ok(())
     }
 
     fn load_or_init_master_kek(
@@ -348,7 +704,28 @@ impl QuarantineVault {
             let zeroizing = ZeroizingBytes::new(arr);
             zeroize_slice(&mut arr);
 
-            let degradation = if posture == KeyProtectionPosture::Tpm2Assisted {
+            let escrow_path = vault_dir.join(ESCROW_KEK_FILENAME);
+            if !soc_rsa_pub_blob.is_empty() && !escrow_path.exists() {
+                let mut kek_arr = [0u8; 32];
+                kek_arr.copy_from_slice(zeroizing.as_slice());
+                let escrow_res =
+                    encrypt_kek_for_soc_escrow(&kek_arr, soc_rsa_pub_blob, &actual_kek_id);
+                zeroize_slice(&mut kek_arr);
+                let escrow_blob = escrow_res.map_err(|e| {
+                    format!("Failed encrypting Master KEK for offline SOC escrow: {e}")
+                })?;
+                let escrow_json = serde_json::to_vec_pretty(&escrow_blob)
+                    .map_err(|e| format!("Failed serializing SOC escrow blob: {e}"))?;
+                write_protected_key_file(&escrow_path, &escrow_json)
+                    .map_err(|e| format!("Failed writing {}: {}", escrow_path.display(), e))?;
+            }
+
+            let has_escrow = escrow_path.exists()
+                || (vault_dir.join(HYBRID_ESCROW_V3_JSON_FILENAME).exists()
+                    && vault_dir.join(HYBRID_ESCROW_V3_WIRE_FILENAME).exists());
+            let degradation = if !has_escrow {
+                Some(DegradationEvent::SocEscrowUnconfigured)
+            } else if posture == KeyProtectionPosture::Tpm2Assisted {
                 None
             } else {
                 Some(DegradationEvent::PostureReducedNoTpm)
@@ -358,7 +735,7 @@ impl QuarantineVault {
 
         // First-time provisioning of a new Quarantine Vault
         let mut fresh_kek = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut fresh_kek);
+        rand::rngs::OsRng.fill_bytes(&mut fresh_kek);
         let zeroizing = ZeroizingBytes::new(fresh_kek);
         zeroize_slice(&mut fresh_kek);
         let kek_id = Self::compute_kek_id(zeroizing.as_slice());
@@ -366,7 +743,7 @@ impl QuarantineVault {
         let blob = seal_key_bytes(zeroizing.as_slice(), context.as_bytes(), &kek_id)
             .map_err(|e| format!("Failed sealing new Master KEK: {e}"))?;
         let posture = blob.posture;
-        let degradation = if posture == KeyProtectionPosture::Tpm2Assisted {
+        let mut degradation = if posture == KeyProtectionPosture::Tpm2Assisted {
             None
         } else {
             warn!(
@@ -383,18 +760,27 @@ impl QuarantineVault {
         write_protected_key_file(&sealed_path, &serialized)
             .map_err(|e| format!("Failed writing {}: {}", sealed_path.display(), e))?;
 
-        // Provision offline SOC RSA-2048-OAEP recovery escrow blob (`vault_kek.escrow`, Master Plan v2 §1.1 #2)
-        let escrow_path = vault_dir.join(ESCROW_KEK_FILENAME);
-        let mut kek_arr = [0u8; 32];
-        kek_arr.copy_from_slice(zeroizing.as_slice());
-        let escrow_res = encrypt_kek_for_soc_escrow(&kek_arr, soc_rsa_pub_blob, &kek_id);
-        zeroize_slice(&mut kek_arr);
-        let escrow_blob = escrow_res
-            .map_err(|e| format!("Failed encrypting Master KEK for offline SOC escrow: {e}"))?;
-        let escrow_json = serde_json::to_vec_pretty(&escrow_blob)
-            .map_err(|e| format!("Failed serializing SOC escrow blob: {e}"))?;
-        write_protected_key_file(&escrow_path, &escrow_json)
-            .map_err(|e| format!("Failed writing {}: {}", escrow_path.display(), e))?;
+        // Provision offline SOC RSA-3072+-OAEP recovery escrow blob (`vault_kek.escrow`, Master Plan v2 §1.1 #2)
+        if soc_rsa_pub_blob.is_empty() {
+            warn!(
+                "Degradation event {}: QuarantineVault KEK '{}' provisioned without offline SOC RSA public key; vault_kek.escrow skipped",
+                DegradationEvent::SocEscrowUnconfigured.event_code(),
+                kek_id
+            );
+            degradation = Some(DegradationEvent::SocEscrowUnconfigured);
+        } else {
+            let escrow_path = vault_dir.join(ESCROW_KEK_FILENAME);
+            let mut kek_arr = [0u8; 32];
+            kek_arr.copy_from_slice(zeroizing.as_slice());
+            let escrow_res = encrypt_kek_for_soc_escrow(&kek_arr, soc_rsa_pub_blob, &kek_id);
+            zeroize_slice(&mut kek_arr);
+            let escrow_blob = escrow_res
+                .map_err(|e| format!("Failed encrypting Master KEK for offline SOC escrow: {e}"))?;
+            let escrow_json = serde_json::to_vec_pretty(&escrow_blob)
+                .map_err(|e| format!("Failed serializing SOC escrow blob: {e}"))?;
+            write_protected_key_file(&escrow_path, &escrow_json)
+                .map_err(|e| format!("Failed writing {}: {}", escrow_path.display(), e))?;
+        }
 
         Ok((zeroizing, posture, degradation))
     }
@@ -407,60 +793,15 @@ impl QuarantineVault {
         digest[..16].to_string()
     }
 
-    /// RFC 5869 HMAC-SHA256 Extract-and-Expand Key Derivation Function (HKDF-SHA256)
-    /// for 32-byte per-file key derivation (`HKDF-SHA256(KEK, salt_32B, "OMNICONNECT_SENTINEL_QUARANTINE_V2")`).
-    fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8]) -> ZeroizingBytes<32> {
-        let actual_salt = if salt.is_empty() {
-            &[0u8; 32][..]
-        } else {
-            salt
-        };
-        let prk = Self::hmac_sha256(actual_salt, ikm);
-        let mut expand_input = Vec::with_capacity(info.len() + 1);
-        expand_input.extend_from_slice(info);
-        expand_input.push(0x01);
-        let okm = Self::hmac_sha256(prk.as_slice(), &expand_input);
-        zeroize_slice(&mut expand_input);
-        okm
-    }
-
-    fn hmac_sha256(key: &[u8], message: &[u8]) -> ZeroizingBytes<32> {
-        const BLOCK_SIZE: usize = 64;
-        let mut key_block = [0u8; BLOCK_SIZE];
-        if key.len() > BLOCK_SIZE {
-            let mut hasher = Sha256::new();
-            hasher.update(key);
-            let hashed = hasher.finalize();
-            key_block[..32].copy_from_slice(&hashed);
-        } else {
-            key_block[..key.len()].copy_from_slice(key);
-        }
-
-        let mut ipad = [0x36u8; BLOCK_SIZE];
-        let mut opad = [0x5cu8; BLOCK_SIZE];
-        for ((ip, op), &kb) in ipad.iter_mut().zip(opad.iter_mut()).zip(key_block.iter()) {
-            *ip ^= kb;
-            *op ^= kb;
-        }
-        zeroize_slice(&mut key_block);
-
-        let mut inner = Sha256::new();
-        inner.update(ipad);
-        inner.update(message);
-        let inner_hash = inner.finalize();
-        zeroize_slice(&mut ipad);
-
-        let mut outer = Sha256::new();
-        outer.update(opad);
-        outer.update(inner_hash);
-        let final_hash = outer.finalize();
-        zeroize_slice(&mut opad);
-
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&final_hash);
-        let res = ZeroizingBytes::new(out);
-        zeroize_slice(&mut out);
-        res
+    /// RFC 5869 audited `HKDF-SHA256` (`hkdf::Hkdf::<Sha256>`, `CSE-28`) for 32-byte per-file DEK
+    /// wrapping (`HKDF-SHA256(KEK, salt_32B, "OMNICONNECT_SENTINEL_QUARANTINE_V2")`).
+    fn derive_entry_dek_wrapping_key(
+        ikm: &[u8],
+        salt: &[u8],
+        info: &[u8],
+    ) -> Result<ZeroizingBytes<32>, String> {
+        sentinel_sys::hkdf_sha256_derive_32(ikm, salt, info)
+            .map_err(|e| format!("Audited HKDF-SHA256 derivation failed: {e}"))
     }
 
     fn write_wrapped_entry_dek(
@@ -469,14 +810,14 @@ impl QuarantineVault {
         file_salt: &[u8; 32],
         entry_dek: &ZeroizingBytes<32>,
     ) -> Result<PathBuf, String> {
-        let wrapping_key = Self::hkdf_sha256(
+        let wrapping_key = Self::derive_entry_dek_wrapping_key(
             self.master_kek.as_slice(),
             file_salt,
             HKDF_INFO_QUARANTINE_V2,
-        );
+        )?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(wrapping_key.as_slice()));
         let mut wrap_nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut wrap_nonce);
+        rand::rngs::OsRng.fill_bytes(&mut wrap_nonce);
         let wrapped_ct = cipher
             .encrypt(
                 Nonce::from_slice(&wrap_nonce),
@@ -521,11 +862,11 @@ impl QuarantineVault {
         let wrap_nonce = &dek_blob[..12];
         let wrapped_ct = &dek_blob[12..];
 
-        let wrapping_key = Self::hkdf_sha256(
+        let wrapping_key = Self::derive_entry_dek_wrapping_key(
             self.master_kek.as_slice(),
             file_salt,
             HKDF_INFO_QUARANTINE_V2,
-        );
+        )?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(wrapping_key.as_slice()));
         let mut raw_dek = cipher
             .decrypt(
@@ -612,17 +953,62 @@ impl QuarantineVault {
 
         // Shred the original plaintext carrier from the source volume after verifying `.quar` (`BUG-CLI-01` #2)
         // Propagate errors with `?` — never ignore shred errors!
-        SecureShredder::shred_file(file_path, ShredMethod::ClearMultiPass { passes: 3 })?;
+        self.shred_file_to_vault_ledger(file_path, ShredMethod::ClearMultiPass { passes: 3 })?;
 
+        let path_token = self.tokenize_path_for_audit(file_path)?;
         self.append_ledger_event(
             "QUARANTINE_CREATED",
             &format!(
-                "entry_id={} path={} sha256={} threat={} score={}",
-                entry.entry_id,
-                entry.original_path,
-                entry.original_sha256,
-                threat_name,
-                threat_score
+                "entry_id={} path_token={} sha256={} threat={} score={}",
+                entry.entry_id, path_token, entry.original_sha256, threat_name, threat_score
+            ),
+        )?;
+
+        Ok(entry)
+    }
+
+    /// Seals an encrypted forensic evidence copy of `file_path` into the Quarantine Vault (`SNTLQV03`),
+    /// verifies the vault entry back from disk (Invariant I4), and records `QUARANTINE_CREATED`
+    /// **without** modifying or shredding the source path (`CSE-17`, read-only kiosk intake media).
+    pub fn quarantine_readonly_evidence(
+        &self,
+        file_path: &Path,
+        threat_name: &str,
+        threat_score: u8,
+    ) -> Result<QuarantineEntry, String> {
+        self.check_healthy()?;
+        sentinel_sys::ensure_not_symlink_or_reparse_point(file_path).map_err(|e| {
+            format!(
+                "Refusing read-only quarantine on symlink or reparse point '{}': {e}",
+                file_path.display()
+            )
+        })?;
+
+        let mut raw_bytes = Vec::new();
+        {
+            let mut file = sentinel_sys::open_untrusted_readonly_nofollow(file_path)
+                .map_err(|e| format!("Failed to open source file for read-only quarantine: {e}"))?;
+            file.read_to_end(&mut raw_bytes)
+                .map_err(|e| format!("Failed reading file for read-only quarantine: {e}"))?;
+        }
+
+        let entry = self.seal_bytes_into_vault(
+            &raw_bytes,
+            &file_path.to_string_lossy(),
+            threat_name,
+            threat_score,
+        );
+        zeroize_slice(&mut raw_bytes);
+        let entry = entry?;
+
+        self.verify_entry(&entry.entry_id)?;
+
+        let path_token = self.tokenize_path_for_audit(file_path)?;
+        self.append_ledger_event(
+            "QUARANTINE_CREATED",
+            &format!(
+                "entry_id={} path_token={} sha256={} threat={} score={} mode=READONLY_INTAKE",
+                entry.entry_id, path_token, entry.original_sha256, threat_name, threat_score
             ),
         )?;
 
@@ -676,7 +1062,7 @@ impl QuarantineVault {
             ));
         }
 
-        SecureShredder::shred_file(file_path, ShredMethod::ClearMultiPass { passes: 3 })?;
+        self.shred_file_to_vault_ledger(file_path, ShredMethod::ClearMultiPass { passes: 3 })?;
         Ok(entry)
     }
 
@@ -733,17 +1119,14 @@ impl QuarantineVault {
         self.verify_entry(&entry.entry_id)?;
 
         // Surgically Clear and delete ONLY the NTFS Alternate Data Stream, preserving `host_path`
-        SecureShredder::shred_ntfs_stream(host_path, clean_stream)?;
+        self.shred_ads_to_vault_ledger(host_path, clean_stream)?;
 
+        let ads_token = self.tokenize_path_for_audit(Path::new(&logical_display_path))?;
         self.append_ledger_event(
             "QUARANTINE_ADS_CREATED",
             &format!(
-                "entry_id={} ads={} sha256={} threat={} score={}",
-                entry.entry_id,
-                logical_display_path,
-                entry.original_sha256,
-                threat_name,
-                threat_score
+                "entry_id={} ads_token={} sha256={} threat={} score={}",
+                entry.entry_id, ads_token, entry.original_sha256, threat_name, threat_score
             ),
         )?;
 
@@ -763,16 +1146,17 @@ impl QuarantineVault {
         let original_size = raw_bytes.len() as u64;
 
         let entry_id = Uuid::new_v4().to_string();
-        let now = Utc::now();
-        let quarantined_at_utc = now.to_rfc3339();
-        let quarantined_at_unix = now.timestamp().max(0) as u64;
+        let (now_unix, quarantined_at_utc) = now_unix_and_rfc3339_utc();
+        let quarantined_at_unix = now_unix.max(0) as u64;
 
         let mut file_salt = [0u8; 32];
         let mut nonce = [0u8; 12];
+        let mut meta_nonce = [0u8; 12];
         let mut raw_entry_dek = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut file_salt);
-        rand::thread_rng().fill_bytes(&mut nonce);
-        rand::thread_rng().fill_bytes(&mut raw_entry_dek);
+        rand::rngs::OsRng.fill_bytes(&mut file_salt);
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::rngs::OsRng.fill_bytes(&mut meta_nonce);
+        rand::rngs::OsRng.fill_bytes(&mut raw_entry_dek);
 
         let entry_dek = ZeroizingBytes::new(raw_entry_dek);
         zeroize_slice(&mut raw_entry_dek);
@@ -780,13 +1164,29 @@ impl QuarantineVault {
         // Persist wrapped DEK (`<entry_id>.dek`) under `HKDF-SHA256(KEK, file_salt, "OMNICONNECT_SENTINEL_QUARANTINE_V2")`
         self.write_wrapped_entry_dek(&entry_id, &file_salt, &entry_dek)?;
 
+        // `SNTLQV03` (`CSE-16`, `F-16`): keep plaintext `original_path` PII out of the unencrypted
+        // `.quar` JSON header on disk by storing only the HMAC path token in `original_path` and
+        // encrypting the real path under `entry_dek` with a distinct `meta_nonce` and domain-bound AAD.
+        let path_token = self.tokenize_path_for_audit(Path::new(original_path_str))?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(entry_dek.as_slice()));
+        let meta_aad = format!("SNTLQV03-META:{entry_id}");
+        let encrypted_path_ct = cipher
+            .encrypt(
+                Nonce::from_slice(&meta_nonce),
+                Payload {
+                    msg: original_path_str.as_bytes(),
+                    aad: meta_aad.as_bytes(),
+                },
+            )
+            .map_err(|e| format!("AES-256-GCM metadata encryption failure: {e}"))?;
+
         let header = QuarantineEnvelopeHeader {
-            magic: *ENVELOPE_MAGIC_V2_FULL,
-            version: ENVELOPE_VERSION,
+            magic: *ENVELOPE_MAGIC_V3_FULL,
+            version: ENVELOPE_VERSION_V3,
             kek_id: self.kek_id.clone(),
             file_salt,
             nonce,
-            original_path: original_path_str.to_string(),
+            original_path: path_token,
             original_size,
             sha256_plaintext: sha256_plaintext.clone(),
             threat_name: threat_name.to_string(),
@@ -795,12 +1195,13 @@ impl QuarantineVault {
             entry_id: entry_id.clone(),
             quarantined_at_utc: quarantined_at_utc.clone(),
             recovery_status: "RECOVERABLE".to_string(),
+            encrypted_original_path_hex: Some(hex::encode(encrypted_path_ct)),
+            meta_nonce: Some(meta_nonce),
         };
 
         let header_json = serde_json::to_vec(&header)
             .map_err(|e| format!("Failed serializing quarantine header: {e}"))?;
 
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(entry_dek.as_slice()));
         let ciphertext = cipher
             .encrypt(
                 Nonce::from_slice(&nonce),
@@ -815,10 +1216,12 @@ impl QuarantineVault {
         let vault_file_path = self.vault_dir.join(&vault_file_name);
         let tmp_file_path = self.vault_dir.join(format!("{entry_id}.quar.tmp"));
 
-        // Exact layout (`Plan v2 §1.1 #4`): `[header_len: u32 LE][header JSON][ciphertext]`
+        // Exact layout (`Plan v2 §1.1 #4`, `CSE-16`): `[header_len: u32 LE][header JSON][ciphertext]`
         {
-            let mut vault_file = File::create(&tmp_file_path)
-                .map_err(|e| format!("Failed creating temporary vault file: {e}"))?;
+            let mut vault_file =
+                create_restricted_file_handle_atomic(&tmp_file_path).map_err(|e| {
+                    format!("Failed creating atomic restricted temporary vault file: {e}")
+                })?;
             let header_len = header_json.len() as u32;
             vault_file
                 .write_all(&header_len.to_le_bytes())
@@ -834,13 +1237,6 @@ impl QuarantineVault {
 
         fs::rename(&tmp_file_path, &vault_file_path)
             .map_err(|e| format!("Atomic rename into quarantine vault failed: {e}"))?;
-        apply_system_admin_dacl(&vault_file_path).map_err(|e| {
-            format!(
-                "Failed applying SYSTEM/Admin DACL to {}: {}",
-                vault_file_path.display(),
-                e
-            )
-        })?;
         sync_directory(&self.vault_dir)
             .map_err(|e| format!("Failed syncing quarantine vault directory: {e}"))?;
 
@@ -854,7 +1250,7 @@ impl QuarantineVault {
         Ok(QuarantineEntry {
             entry_id,
             kek_id: self.kek_id.clone(),
-            original_path: header.original_path,
+            original_path: original_path_str.to_string(),
             original_sha256: sha256_plaintext,
             original_size_bytes: original_size,
             vault_file_path: vault_file_path.to_string_lossy().to_string(),
@@ -862,7 +1258,7 @@ impl QuarantineVault {
             threat_score,
             quarantined_at_utc,
             quarantined_at_unix,
-            encryption_algorithm: "AES-256-GCM-HKDF-SHA256-V2".to_string(),
+            encryption_algorithm: "AES-256-GCM-HKDF-SHA256-V3".to_string(),
             nonce_hex: hex::encode(nonce),
             recovery_status: "RECOVERABLE".to_string(),
         })
@@ -955,13 +1351,12 @@ impl QuarantineVault {
             }
         }
 
+        let dest_token = self.tokenize_path_for_audit(destination_path)?;
         self.append_ledger_event(
             "QUARANTINE_RESTORED",
             &format!(
-                "entry_id={} destination={} sha256={}",
-                entry_id,
-                destination_path.display(),
-                actual_sha256
+                "entry_id={} destination_token={} sha256={}",
+                entry_id, dest_token, actual_sha256
             ),
         )?;
 
@@ -1013,9 +1408,9 @@ impl QuarantineVault {
         Ok(true)
     }
 
-    /// Performs true cryptographic erasure (`Master Plan v2 §1.1 #5`, `ADR-011`) by first
-    /// overwriting and destroying the entry's wrapped DEK file (`<entry_id>.dek`) so the
-    /// ciphertext is immediately unrecoverable, and then running NIST 800-88 Clear on `<entry_id>.quar`.
+    /// Removes a quarantined entry via NIST SP 800-88 Rev. 2 `Clear` (`CSE-15`, `F-13`) by first
+    /// overwriting and unlinking `<entry_id>.dek` and then overwriting and unlinking `<entry_id>.quar`.
+    /// Does not claim `CryptographicErasePurge` while `vault_kek.sealed` / `vault_kek.escrow` stay active.
     pub fn purge(&self, entry_id: &str) -> Result<(), String> {
         self.check_healthy()?;
 
@@ -1027,20 +1422,27 @@ impl QuarantineVault {
             return Err(format!("Quarantine entry '{entry_id}' not found"));
         }
 
-        // Step 1: True Cryptographic Erasure — overwrite and destroy the wrapped per-entry DEK (`<entry_id>.dek`)
+        // Step 1: Overwrite and destroy the wrapped per-entry DEK (`<entry_id>.dek`) via NIST 800-88 Rev. 2 Clear
         let dek_path = self.vault_dir.join(format!("{entry_id}.dek"));
         if dek_path.exists() {
-            SecureShredder::shred_file(&dek_path, ShredMethod::ClearMultiPass { passes: 3 })?;
+            self.shred_file_to_vault_ledger(&dek_path, ShredMethod::ClearMultiPass { passes: 3 })?;
         }
 
-        // Step 2: Overwrite and unlink the `.quar` ciphertext envelope and sync the directory
-        SecureShredder::shred_file(&vault_file_path, ShredMethod::CryptoErase)?;
+        // Step 2: Overwrite and unlink the `.quar` ciphertext envelope via honest NIST 800-88 Rev. 2 Clear
+        // (`CSE-15`, `F-13`): because `vault_kek.sealed` and `vault_kek.escrow` remain live on wear-leveled
+        // storage for remaining vault entries, per-entry purge MUST NOT claim `CryptographicErasePurge`.
+        self.shred_file_to_vault_ledger(
+            &vault_file_path,
+            ShredMethod::ClearMultiPass { passes: 3 },
+        )?;
         sync_directory(&self.vault_dir)
             .map_err(|e| format!("Failed syncing quarantine directory after purge: {e}"))?;
 
         self.append_ledger_event(
             "QUARANTINE_PURGED",
-            &format!("Crypto-erased DEK and shredded quarantine entry '{entry_id}'"),
+            &format!(
+                "Overwrote wrapped DEK and cleared quarantine entry '{entry_id}' (NIST SP 800-88 Rev. 2 Clear; vault KEK/escrow remain active for other entries)"
+            ),
         )?;
 
         Ok(())
@@ -1073,12 +1475,23 @@ impl QuarantineVault {
                     let entry_id = if header.entry_id.is_empty() {
                         file_stem
                     } else {
-                        header.entry_id
+                        header.entry_id.clone()
+                    };
+                    let resolved_original_path = if header.version == ENVELOPE_VERSION_V3 {
+                        self.decrypt_v3_original_path(&entry_id, &header)
+                            .unwrap_or_else(|| header.original_path.clone())
+                    } else {
+                        header.original_path
+                    };
+                    let enc_alg = if header.version == ENVELOPE_VERSION_V3 {
+                        "AES-256-GCM-HKDF-SHA256-V3"
+                    } else {
+                        "AES-256-GCM-HKDF-SHA256-V2"
                     };
                     entries.push(QuarantineEntry {
                         entry_id,
                         kek_id: header.kek_id,
-                        original_path: header.original_path,
+                        original_path: resolved_original_path,
                         original_sha256: header.sha256_plaintext,
                         original_size_bytes: header.original_size,
                         vault_file_path: path.to_string_lossy().to_string(),
@@ -1086,7 +1499,7 @@ impl QuarantineVault {
                         threat_score: header.threat_score,
                         quarantined_at_utc: header.quarantined_at_utc,
                         quarantined_at_unix: header.quarantined_at_unix,
-                        encryption_algorithm: "AES-256-GCM-HKDF-SHA256-V2".to_string(),
+                        encryption_algorithm: enc_alg.to_string(),
                         nonce_hex: hex::encode(header.nonce),
                         recovery_status: header.recovery_status,
                     });
@@ -1169,12 +1582,12 @@ impl QuarantineVault {
                         })?;
                     }
                     LegacyMigrationAction::Delete => {
-                        SecureShredder::shred_file(
+                        self.shred_file_to_vault_ledger(
                             &path,
                             ShredMethod::ClearMultiPass { passes: 3 },
                         )?;
                         if json_sidecar.exists() {
-                            SecureShredder::shred_file(
+                            self.shred_file_to_vault_ledger(
                                 &json_sidecar,
                                 ShredMethod::ClearMultiPass { passes: 3 },
                             )?;
@@ -1182,13 +1595,12 @@ impl QuarantineVault {
                     }
                 }
 
+                let legacy_path_token = self.tokenize_path_for_audit(&path)?;
                 self.append_ledger_event(
                     "UNRECOVERABLE_LEGACY",
                     &format!(
-                        "entry_id={} path={} status=UNRECOVERABLE_LEGACY action={:?}",
-                        entry_name,
-                        path.display(),
-                        action
+                        "entry_id={} path_token={} status=UNRECOVERABLE_LEGACY action={:?}",
+                        entry_name, legacy_path_token, action
                     ),
                 )?;
 
@@ -1201,6 +1613,31 @@ impl QuarantineVault {
             }
         }
         Ok(migrated_ids)
+    }
+
+    fn decrypt_v3_original_path(
+        &self,
+        entry_id: &str,
+        header: &QuarantineEnvelopeHeader,
+    ) -> Option<String> {
+        let ct_hex = header.encrypted_original_path_hex.as_deref()?;
+        let meta_nonce = header.meta_nonce.as_ref()?;
+        let ct_bytes = hex::decode(ct_hex).ok()?;
+        let entry_dek = self.unwrap_entry_dek(entry_id, &header.file_salt).ok()?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(entry_dek.as_slice()));
+        let meta_aad = format!("SNTLQV03-META:{entry_id}");
+        let mut pt = cipher
+            .decrypt(
+                Nonce::from_slice(meta_nonce),
+                Payload {
+                    msg: &ct_bytes,
+                    aad: meta_aad.as_bytes(),
+                },
+            )
+            .ok()?;
+        let out = String::from_utf8(pt.clone()).ok();
+        zeroize_slice(&mut pt);
+        out
     }
 
     pub fn parse_envelope(
@@ -1217,7 +1654,7 @@ impl QuarantineVault {
         let header_len = u32::from_le_bytes(len_buf) as usize;
         if header_len == 0 || header_len > 1024 * 1024 || bytes.len() < 4 + header_len {
             return Err(
-                "VAULT_INTEGRITY_FAIL: Quarantine entry is not a v2 authenticated envelope (UNRECOVERABLE_LEGACY)"
+                "VAULT_INTEGRITY_FAIL: Quarantine entry is not a v2/v3 authenticated envelope (UNRECOVERABLE_LEGACY)"
                     .to_string(),
             );
         }
@@ -1228,7 +1665,11 @@ impl QuarantineVault {
                 "VAULT_INTEGRITY_FAIL: Malformed quarantine envelope header JSON (UNRECOVERABLE_LEGACY): {e}"
             )
         })?;
-        if &header.magic != ENVELOPE_MAGIC_V2_FULL || header.version != ENVELOPE_VERSION {
+        let is_valid_v2 =
+            &header.magic == ENVELOPE_MAGIC_V2_FULL && header.version == ENVELOPE_VERSION;
+        let is_valid_v3 =
+            &header.magic == ENVELOPE_MAGIC_V3_FULL && header.version == ENVELOPE_VERSION_V3;
+        if !is_valid_v2 && !is_valid_v3 {
             return Err(
                 "VAULT_INTEGRITY_FAIL: Invalid envelope magic or version (UNRECOVERABLE_LEGACY)"
                     .to_string(),

@@ -67,13 +67,23 @@ pub fn collect_validated_xml_attributes<'a>(
                     "xmlns URI exceeds {MAX_XMLNS_URI_BYTES} bytes (RUSTSEC-2026-0195 mitigation)"
                 )));
             }
-            let uri_lower = attr.value.trim().to_ascii_lowercase();
+            let decoded_uri = unescape_xml_attribute_value(&attr)?;
+            if decoded_uri.bytes().any(|b| b <= 0x1F || b == 0x7F) {
+                return Err(CdrError::ParserCorruption(
+                    "Control character forbidden in xmlns declaration (RUSTSEC-2026-0195 / CSE-19)"
+                        .to_string(),
+                ));
+            }
+            let uri_lower = decoded_uri.trim().to_ascii_lowercase();
             if uri_lower.starts_with("javascript:")
                 || uri_lower.starts_with("vbscript:")
                 || uri_lower.starts_with("data:")
                 || uri_lower.starts_with("file:")
                 || uri_lower.starts_with("ms-msdt:")
                 || uri_lower.starts_with("mhtml:")
+                || uri_lower.starts_with("smb:")
+                || uri_lower.starts_with("search-ms:")
+                || uri_lower.starts_with("ms-appinstaller:")
             {
                 return Err(CdrError::ParserCorruption(
                     "Forbidden URI scheme in xmlns declaration (RUSTSEC-2026-0195 mitigation)"
@@ -86,6 +96,51 @@ pub fn collect_validated_xml_attributes<'a>(
     }
 
     Ok(attrs)
+}
+
+/// Decodes XML predefined and numeric character references (`&amp;`, `&#102;`, `&#x66;`, etc.)
+/// inside an attribute value via `quick-xml` (`CSE-19`). Fails closed on custom or malformed entities.
+pub fn unescape_xml_attribute_value(attr: &Attribute<'_>) -> Result<String> {
+    attr.normalized_value(quick_xml::XmlVersion::Explicit1_0)
+        .map(|cow| cow.into_owned())
+        .map_err(|err| {
+            CdrError::ParserCorruption(format!(
+                "Malformed or disallowed XML entity in attribute value: {err}"
+            ))
+        })
+}
+
+/// Resolves a single standard predefined or numeric XML `Event::GeneralRef` payload
+/// (e.g. `amp`, `#68`, `#x44`) into its decoded string form for cross-entity DDE/URI inspection (`CSE-19`).
+pub fn resolve_allowed_xml_general_ref(raw_ref: &[u8]) -> Option<String> {
+    match raw_ref {
+        b"lt" => Some("<".to_string()),
+        b"gt" => Some(">".to_string()),
+        b"amp" => Some("&".to_string()),
+        b"apos" => Some("'".to_string()),
+        b"quot" => Some("\"".to_string()),
+        _ => {
+            let rest = raw_ref.strip_prefix(b"#")?;
+            if rest.is_empty() || rest.len() > 9 {
+                return None;
+            }
+            let code = if let Some(hex_bytes) =
+                rest.strip_prefix(b"x").or_else(|| rest.strip_prefix(b"X"))
+            {
+                std::str::from_utf8(hex_bytes)
+                    .ok()
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+            } else {
+                std::str::from_utf8(rest)
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+            }?;
+            if code == 0 {
+                return None;
+            }
+            char::from_u32(code).map(|c| c.to_string())
+        }
+    }
 }
 
 /// Validates whether a `quick-xml` `Event::GeneralRef` entity reference is a safe standard XML

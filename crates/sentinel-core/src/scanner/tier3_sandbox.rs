@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fs;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 
-use crate::enterprise::ledger::AuditLedger;
+use crate::enterprise::ledger::{AuditLedger, AuditSubsystem, SharedAuditLedger};
 use crate::error::DegradationEvent;
 use crate::scanner::tier0_yara::Tier0YaraScanner;
 
@@ -31,34 +33,241 @@ pub struct SandboxDetonationReport {
     pub degradation_event: Option<String>,
 }
 
-/// Tier-3 Behavioral Emulation & Sandbox Connector (`BUG-CORE-10`, `BUG-CORE-13`, `Rows 157, 158, 159`)
+/// Validates that an IP address is permissible for remote sandbox egress (Anti-SSRF, `CSE-08`, `T33`).
+/// Blocks loopback, RFC 1918 private, link-local, cloud metadata (`169.254.169.254`), broadcast, and multicast.
+pub fn validate_egress_ip(ip: IpAddr) -> Result<(), String> {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            if ipv4.is_loopback() {
+                return Err(format!(
+                    "SSRF_VIOLATION: Loopback IPv4 address '{ipv4}' is prohibited"
+                ));
+            }
+            let oct = ipv4.octets();
+            // AWS / Azure / GCP IMDS cloud metadata & link-local: 169.254.0.0/16
+            if oct[0] == 169 && oct[1] == 254 || ipv4.is_link_local() {
+                return Err(format!(
+                    "SSRF_VIOLATION: Link-local / IMDS cloud metadata address '{ipv4}' is prohibited"
+                ));
+            }
+            if ipv4.is_private() {
+                return Err(format!(
+                    "SSRF_VIOLATION: RFC 1918 private IPv4 address '{ipv4}' is prohibited"
+                ));
+            }
+            if ipv4.is_broadcast()
+                || ipv4.is_multicast()
+                || ipv4.is_unspecified()
+                || ipv4.is_documentation()
+            {
+                return Err(format!(
+                    "SSRF_VIOLATION: Non-routable or multicast IPv4 address '{ipv4}' is prohibited"
+                ));
+            }
+        }
+        IpAddr::V6(ipv6) => {
+            if ipv6.is_loopback() {
+                return Err(format!(
+                    "SSRF_VIOLATION: Loopback IPv6 address '{ipv6}' is prohibited"
+                ));
+            }
+            if ipv6.is_multicast() || ipv6.is_unspecified() {
+                return Err(format!(
+                    "SSRF_VIOLATION: Non-routable or multicast IPv6 address '{ipv6}' is prohibited"
+                ));
+            }
+            let seg = ipv6.segments();
+            // IPv6 Unique Local Address: fc00::/7
+            if (seg[0] & 0xfe00) == 0xfc00 {
+                return Err(format!(
+                    "SSRF_VIOLATION: Unique local IPv6 address '{ipv6}' is prohibited"
+                ));
+            }
+            // IPv6 Link-Local: fe80::/10
+            if (seg[0] & 0xffc0) == 0xfe80 {
+                return Err(format!(
+                    "SSRF_VIOLATION: Link-local IPv6 address '{ipv6}' is prohibited"
+                ));
+            }
+            let octets = ipv6.octets();
+            // 1. Standard IPv4-mapped IPv6: ::ffff:A.B.C.D
+            if let Some(mapped) = ipv6.to_ipv4_mapped() {
+                return validate_egress_ip(IpAddr::V4(mapped));
+            }
+
+            // 2. IPv4-compatible IPv6 (RFC 4291 §2.5.5.1): ::A.B.C.D (first 96 bits are 0)
+            if octets[0..12] == [0u8; 12] && !ipv6.is_unspecified() && !ipv6.is_loopback() {
+                let v4 = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+                return validate_egress_ip(IpAddr::V4(v4));
+            }
+
+            // 3. SIIT IPv4-translated IPv6: ::ffff:0:A.B.C.D
+            if octets[0..8] == [0u8; 8]
+                && octets[8..10] == [0xff, 0xff]
+                && octets[10..12] == [0u8; 2]
+            {
+                let v4 = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+                return validate_egress_ip(IpAddr::V4(v4));
+            }
+
+            // 4. Well-Known Prefix NAT64: 64:ff9b::/96
+            if octets[0..4] == [0x00, 0x64, 0xff, 0x9b] && octets[4..12] == [0u8; 8] {
+                let v4 = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+                return validate_egress_ip(IpAddr::V4(v4));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates that a string does not contain CRLF or control characters (Anti-CRLF Injection, `CSE-08`, `T33`).
+pub fn validate_crlf_safe(name: &str, val: &str) -> Result<(), String> {
+    if val.chars().any(|c| (c as u32) < 0x20 || c == '\x7f') {
+        return Err(format!(
+            "CRLF_INJECTION: Value for '{name}' contains prohibited control characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Default maximum sample upload size (32 MiB) transmitted to remote Tier-3 sandbox (`CSE-23`).
+pub const DEFAULT_MAX_SANDBOX_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+/// Pure-Rust RFC 4648 standard base64 encoder (`O(N)` time, zero unsafe, zero external crates, `CSE-23`).
+pub fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        let triple = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Pure-Rust strict canonical RFC 4648 standard base64 decoder (`CSE-23`, `T52`):
+/// rejects embedded padding in non-final quanta and non-zero trailing padding bits.
+pub fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    let bytes = input.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return Err("Invalid base64 length (must be multiple of 4)".to_string());
+    }
+    let val = |b: u8| -> Result<u8, String> {
+        match b {
+            b'A'..=b'Z' => Ok(b - b'A'),
+            b'a'..=b'z' => Ok(b - b'a' + 26),
+            b'0'..=b'9' => Ok(b - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(format!("Invalid base64 byte 0x{b:02X}")),
+        }
+    };
+    let (chunks, _) = bytes.as_chunks::<4>();
+    let total_chunks = chunks.len();
+    let mut out = Vec::with_capacity(total_chunks * 3);
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let is_last = idx + 1 == total_chunks;
+        let a = val(chunk[0])?;
+        let b = val(chunk[1])?;
+        out.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            let c = val(chunk[2])?;
+            out.push((b << 4) | (c >> 2));
+            if chunk[3] != b'=' {
+                let d = val(chunk[3])?;
+                out.push((c << 6) | d);
+            } else {
+                if !is_last {
+                    return Err("Invalid base64 padding in non-final quantum".to_string());
+                }
+                if (c & 0x03) != 0 {
+                    return Err("Non-canonical non-zero base64 padding bits".to_string());
+                }
+            }
+        } else if chunk[3] == b'=' {
+            if !is_last {
+                return Err("Invalid base64 padding in non-final quantum".to_string());
+            }
+            if (b & 0x0F) != 0 {
+                return Err("Non-canonical non-zero base64 padding bits".to_string());
+            }
+        } else {
+            return Err("Invalid base64 padding".to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Tier-3 Behavioral Emulation & Sandbox Connector (`BUG-CORE-10`, `BUG-CORE-13`, `CSE-08`, `CSE-13`, `CSE-23`)
 ///
-/// Attempts remote sandbox submission with bounded timeouts and job polling when configured,
-/// falls back cleanly on air-gapped/offline kiosks while recording `SANDBOX_OFFLINE_EMULATED`
-/// in the signed audit ledger, performs structural PE IAT/section analysis without hardcoded
-/// file-size checks or fabricated C2 domain IOCs, and filters out benign Authenticode/PKI
-/// CRL & OCSP URLs using strict authority hostname suffix matching.
+/// Implements `rustls` TLS 1.3 Client-Cert mTLS transport with DNS-rebind-safe SSRF IP validation,
+/// strict CRLF header injection guards, bounded base64 payload upload with SHA-256 verification,
+/// and single-root `SharedAuditLedger` logging.
 pub struct Tier3SandboxConnector {
     api_endpoint: String,
     api_key: String,
     client_cert_pem_path: Option<PathBuf>,
+    custom_ca_cert_pem: Option<Vec<u8>>,
     ledger_path: PathBuf,
+    shared_ledger: Option<SharedAuditLedger>,
+    max_upload_bytes: usize,
+    allow_loopback_for_testing: bool,
 }
 
 impl Tier3SandboxConnector {
     pub fn new(api_endpoint: impl Into<String>, api_key: impl Into<String>) -> Self {
+        #[cfg(test)]
+        let ledger_path = std::env::temp_dir()
+            .join(format!("omniconnect_sentinel_sbx_{}", std::process::id()))
+            .join("sandbox_ledger.jsonl");
+        #[cfg(not(test))]
+        let ledger_path = {
+            #[cfg(windows)]
+            {
+                PathBuf::from(r"C:\ProgramData\OmniConnect\AuditLedger\sandbox_ledger.jsonl")
+            }
+            #[cfg(not(windows))]
+            {
+                PathBuf::from("/var/lib/omniconnect/audit_ledger/sandbox_ledger.jsonl")
+            }
+        };
         Self {
             api_endpoint: api_endpoint.into(),
             api_key: api_key.into(),
             client_cert_pem_path: None,
-            ledger_path: std::env::temp_dir()
-                .join(format!("omniconnect_sentinel_sbx_{}", std::process::id()))
-                .join("sandbox_ledger.jsonl"),
+            custom_ca_cert_pem: None,
+            ledger_path,
+            shared_ledger: None,
+            max_upload_bytes: DEFAULT_MAX_SANDBOX_UPLOAD_BYTES,
+            allow_loopback_for_testing: false,
         }
+    }
+
+    pub fn with_max_upload_bytes(mut self, max_upload_bytes: usize) -> Self {
+        self.max_upload_bytes = max_upload_bytes;
+        self
     }
 
     pub fn with_mtls_cert(mut self, cert_path: PathBuf) -> Self {
         self.client_cert_pem_path = Some(cert_path);
+        self
+    }
+
+    pub fn with_custom_ca(mut self, ca_pem: Vec<u8>) -> Self {
+        self.custom_ca_cert_pem = Some(ca_pem);
         self
     }
 
@@ -67,68 +276,265 @@ impl Tier3SandboxConnector {
         self
     }
 
-    /// Attempts remote sandbox detonation with bounded connection/read timeouts and job polling (`Row 159`, `BUG-CORE-13` #9).
+    pub fn with_shared_ledger(mut self, shared_ledger: SharedAuditLedger) -> Self {
+        self.shared_ledger = Some(shared_ledger);
+        self
+    }
+
+    pub fn with_allow_loopback_for_testing(mut self, allow: bool) -> Self {
+        self.allow_loopback_for_testing = allow;
+        self
+    }
+
+    /// Attempts remote sandbox detonation over `rustls` TLS 1.3 with client-cert mTLS,
+    /// DNS-rebind-safe SSRF filtering, and CRLF validation (`CSE-08`, `T33`).
     pub fn try_remote_detonation(
         &self,
         request: &SandboxDetonationRequest,
     ) -> Result<SandboxDetonationReport, String> {
-        if self.api_endpoint.starts_with("offline://")
-            || self.api_endpoint.contains("127.0.0.1:8080")
+        if self
+            .api_endpoint
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("offline://")
             || self.api_key == "OFFLINE"
             || self.api_key == "TEST-KEY"
         {
             return Err("Remote sandbox configured in offline/emulated kiosk mode".to_string());
         }
 
-        let host_port = self
-            .api_endpoint
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .split('/')
-            .next()
-            .ok_or_else(|| "Invalid remote sandbox endpoint URL".to_string())?;
+        // 1. CRLF Injection Guard (`CSE-08`)
+        validate_crlf_safe("api_key", &self.api_key)?;
 
-        let addr: SocketAddr = host_port.parse().map_err(|e| {
-            format!("Unresolvable remote sandbox socket address '{host_port}': {e}")
+        // 2. Enforce HTTPS URL scheme (reject http://, file://, etc.)
+        let url = url::Url::parse(&self.api_endpoint).map_err(|e| {
+            format!(
+                "Invalid remote sandbox endpoint URL '{}': {e}",
+                self.api_endpoint
+            )
         })?;
+        if url.scheme() != "https" {
+            return Err(format!(
+                "INSECURE_TRANSPORT_REJECTED: Scheme '{}' is prohibited; remote sandbox egress strictly requires https://",
+                url.scheme()
+            ));
+        }
 
+        let host = url
+            .host_str()
+            .ok_or_else(|| "Missing host in remote sandbox URL".to_string())?;
+        let port = url.port_or_known_default().unwrap_or(443);
+
+        // 3. DNS-Rebind-Safe SSRF Filter: Resolve host and validate all resolved IPs
+        let target_addrs: Vec<SocketAddr> = format!("{host}:{port}")
+            .to_socket_addrs()
+            .map_err(|e| format!("Failed resolving remote sandbox host '{host}:{port}': {e}"))?
+            .collect();
+
+        if target_addrs.is_empty() {
+            return Err(format!(
+                "DNS resolution returned zero addresses for '{host}:{port}'"
+            ));
+        }
+
+        if !self.allow_loopback_for_testing {
+            for addr in &target_addrs {
+                validate_egress_ip(addr.ip())?;
+            }
+        }
+
+        // 4. Bounded Payload Size & SHA-256 Verification BEFORE connecting (`CSE-23`)
+        if request.file_bytes.len() > self.max_upload_bytes {
+            return Err(format!(
+                "SANDBOX_UPLOAD_SIZE_EXCEEDED: Sample size {} bytes exceeds cap of {} bytes",
+                request.file_bytes.len(),
+                self.max_upload_bytes
+            ));
+        }
+        let computed_sha256 = hex::encode(Sha256::digest(&request.file_bytes));
+        if !request.sha256_hex.trim().is_empty()
+            && !computed_sha256.eq_ignore_ascii_case(request.sha256_hex.trim())
+        {
+            return Err(format!(
+                "SANDBOX_PAYLOAD_SHA256_MISMATCH: Declared SHA-256 '{}' does not match computed '{}'",
+                request.sha256_hex, computed_sha256
+            ));
+        }
+
+        // 4. Build rustls TLS 1.3 Client-Cert mTLS Config BEFORE opening any TCP socket (`CSE-23`)
+        use rustls_pki_types::pem::PemObject;
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(custom_ca_bytes) = &self.custom_ca_cert_pem {
+            let ca_certs: Vec<rustls_pki_types::CertificateDer<'static>> =
+                rustls_pki_types::CertificateDer::pem_slice_iter(custom_ca_bytes)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Failed parsing custom sandbox CA PEM: {e}"))?;
+            if ca_certs.is_empty() {
+                return Err("Custom sandbox CA PEM contains 0 certificates".to_string());
+            }
+            for c in ca_certs {
+                root_store
+                    .add(c)
+                    .map_err(|e| format!("Failed adding custom sandbox CA cert: {e}"))?;
+            }
+        }
+
+        let client_config = if let Some(cert_path) = &self.client_cert_pem_path {
+            sentinel_sys::ensure_not_symlink_or_reparse_point(cert_path).map_err(|e| {
+                format!(
+                    "Refusing symlink/reparse client mTLS certificate {}: {e}",
+                    cert_path.display()
+                )
+            })?;
+            let cert_data = fs::read(cert_path).map_err(|e| {
+                format!(
+                    "Failed reading client mTLS certificate {}: {e}",
+                    cert_path.display()
+                )
+            })?;
+            let cert_chain: Vec<rustls_pki_types::CertificateDer<'static>> =
+                rustls_pki_types::CertificateDer::pem_slice_iter(&cert_data)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Failed parsing client mTLS certificates: {e}"))?;
+            if cert_chain.is_empty() {
+                return Err("No certificates found in client mTLS PEM".to_string());
+            }
+
+            let private_key = match rustls_pki_types::PrivateKeyDer::from_pem_slice(&cert_data) {
+                Ok(key) => key,
+                Err(rustls_pki_types::pem::Error::NoItemsFound) => {
+                    return Err("No private key found in client mTLS certificate PEM".to_string());
+                }
+                Err(e) => {
+                    return Err(format!("Failed parsing client mTLS private key: {e}"));
+                }
+            };
+
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(root_store)
+                .with_client_auth_cert(cert_chain, private_key)
+                .map_err(|e| format!("mTLS client configuration failed: {e}"))?
+        } else {
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+
+        let server_name = rustls_pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| format!("Invalid DNS SNI hostname '{host}': {e}"))?;
+
+        // Connect directly to the validated IP to prevent DNS rebinding TOCTOU
+        let validated_addr = target_addrs[0];
         let timeout = Duration::from_secs(request.timeout_seconds.clamp(1, 30) as u64);
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(750))
-            .map_err(|e| format!("Remote sandbox unreachable: {e}"))?;
-        let _ = stream.set_read_timeout(Some(timeout));
-        let _ = stream.set_write_timeout(Some(timeout));
+        let mut tcp_stream =
+            TcpStream::connect_timeout(&validated_addr, Duration::from_millis(1500))
+                .map_err(|e| format!("Remote sandbox unreachable at {validated_addr}: {e}"))?;
+        let _ = tcp_stream.set_read_timeout(Some(timeout));
+        let _ = tcp_stream.set_write_timeout(Some(timeout));
 
+        let mut conn = rustls::ClientConnection::new(Arc::new(client_config), server_name)
+            .map_err(|e| format!("Failed creating TLS client connection: {e}"))?;
+
+        let mut tls_stream = rustls::Stream::new(&mut conn, &mut tcp_stream);
+
+        let payload_base64 = encode_base64(&request.file_bytes);
+        let mtls_enforced = self.client_cert_pem_path.is_some();
         let submit_body = serde_json::json!({
             "file_name": request.file_name,
-            "sha256_hex": request.sha256_hex,
+            "sha256_hex": computed_sha256,
             "size_bytes": request.file_bytes.len(),
-            "mtls_configured": self.client_cert_pem_path.is_some(),
+            "payload_encoding": "base64",
+            "payload_base64": payload_base64,
+            "mtls_configured": mtls_enforced,
+            "mtls_enforced": mtls_enforced,
         })
         .to_string();
 
+        let path_and_query = url.path();
+        let request_path = if path_and_query.is_empty() || path_and_query == "/" {
+            "/api/v1/detonate"
+        } else {
+            path_and_query
+        };
+
         let http_req = format!(
-            "POST /api/v1/detonate HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            host_port,
+            "POST {} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            request_path,
+            host,
+            port,
             self.api_key,
             submit_body.len(),
             submit_body
         );
-        stream
-            .write_all(http_req.as_bytes())
-            .map_err(|e| format!("Failed submitting sample to remote sandbox: {e}"))?;
 
+        tls_stream
+            .write_all(http_req.as_bytes())
+            .map_err(|e| format!("Failed submitting sample over TLS 1.3 to remote sandbox: {e}"))?;
+        tls_stream
+            .flush()
+            .map_err(|e| format!("TLS flush failed: {e}"))?;
+
+        const MAX_SANDBOX_RESPONSE_BYTES: u64 = 64 * 1024;
         let mut resp_buf = Vec::new();
-        stream
-            .take(64 * 1024)
+        tls_stream
+            .take(MAX_SANDBOX_RESPONSE_BYTES + 1)
             .read_to_end(&mut resp_buf)
-            .map_err(|e| format!("Failed reading remote sandbox response: {e}"))?;
+            .map_err(|e| format!("Failed reading remote sandbox response over TLS 1.3: {e}"))?;
+        if resp_buf.len() as u64 > MAX_SANDBOX_RESPONSE_BYTES {
+            return Err(format!(
+                "SANDBOX_RESPONSE_TOO_LARGE: Remote sandbox response exceeded {MAX_SANDBOX_RESPONSE_BYTES} bytes"
+            ));
+        }
+
         let resp_str = String::from_utf8_lossy(&resp_buf);
+        let (status_line, _) = resp_str
+            .split_once("\r\n")
+            .ok_or_else(|| "Malformed HTTP response from remote sandbox".to_string())?;
+        let status_ok = status_line == "HTTP/1.1 200"
+            || status_line.starts_with("HTTP/1.1 200 ")
+            || status_line == "HTTP/1.0 200"
+            || status_line.starts_with("HTTP/1.0 200 ");
+        if !status_ok {
+            return Err(format!(
+                "Remote sandbox rejected detonation upload: {status_line}"
+            ));
+        }
         let body_start = resp_str
             .find("\r\n\r\n")
             .map(|i| i + 4)
             .ok_or_else(|| "Malformed HTTP response from remote sandbox".to_string())?;
-        serde_json::from_str::<SandboxDetonationReport>(&resp_str[body_start..])
-            .map_err(|e| format!("Invalid JSON report from remote sandbox: {e}"))
+
+        let report = serde_json::from_str::<SandboxDetonationReport>(&resp_str[body_start..])
+            .map_err(|e| format!("Invalid JSON report from remote sandbox: {e}"))?;
+
+        // Record successful remote detonation to audit ledger
+        self.record_audit_event(
+            "SANDBOX_REMOTE_DETONATION",
+            serde_json::json!({
+                "analysis_id": report.analysis_id,
+                "file_name": request.file_name,
+                "uploaded_bytes": request.file_bytes.len(),
+                "sha256_hex": computed_sha256,
+                "verdict_malicious": report.verdict_malicious,
+                "threat_score": report.threat_score,
+                "mtls_enforced": mtls_enforced,
+            }),
+        );
+
+        Ok(report)
+    }
+
+    fn record_audit_event(&self, event: &str, data: serde_json::Value) {
+        if let Some(shared) = &self.shared_ledger {
+            if let Ok(mut guard) = shared.lock() {
+                let _ =
+                    guard.append_subsystem_event(AuditSubsystem::Tier3Sandbox, event, data.clone());
+                return;
+            }
+        }
+        let mut ledger = AuditLedger::open(&self.ledger_path);
+        let _ = ledger.append_subsystem_event(AuditSubsystem::Tier3Sandbox, event, data);
     }
 
     pub async fn detonate_sample(
@@ -212,8 +618,7 @@ impl Tier3SandboxConnector {
             .event_code()
             .to_string();
 
-        let mut ledger = AuditLedger::open(&self.ledger_path);
-        let _ = ledger.append_event(
+        self.record_audit_event(
             &deg_code,
             serde_json::json!({
                 "analysis_id": analysis_id,

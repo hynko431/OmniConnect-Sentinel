@@ -1,0 +1,23 @@
+# OmniConnect Sentinel Network Security & Egress Rules
+# Enforced via Suricata / Zeek for Egress & SIEM Anomaly Detection (`Master Plan v2 §4.1, §4.2`, `T33`)
+
+# Rule 9100001: Detects prohibited cleartext HTTP sandbox detonation egress
+alert tcp $HOME_NET any -> $EXTERNAL_NET 80 (
+    msg:"OMNICONNECT-SENTINEL: Prohibited cleartext HTTP sandbox egress attempt (CSE-08 violation)";
+    flow:to_server,established;
+    content:"POST "; depth:5;
+    content:"/api/v1/detonate"; distance:0;
+    classtype:policy-violation;
+    sid:9100001;
+    rev:1;
+)
+
+# Rule 9100002: Detects prohibited cleartext UDP 514 SIEM transmission
+alert udp $HOME_NET any -> $EXTERNAL_NET 514 (
+    msg:"OMNICONNECT-SENTINEL: Prohibited cleartext UDP 514 SIEM transmission (CSE-13 violation)";
+    content:"CEF:0|OmniConnect|Sentinel";
+    classtype:policy-violation;
+    sid:9100002;
+    rev:1;
+)
+

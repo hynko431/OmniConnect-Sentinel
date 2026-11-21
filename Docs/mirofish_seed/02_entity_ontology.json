@@ -1,0 +1,104 @@
+{
+  "schema_version": "mirofish-ontology-v1",
+  "project_name": "OmniConnect Sentinel",
+  "simulation_goal": "Stress-test OmniConnect Sentinel's technical architecture, security invariants, operational deployability, UX friction, regulatory claims, and commercial GTM viability inside a multi-agent enterprise digital world to uncover fatal and non-fatal flaws.",
+  "entities": [
+    {
+      "id": "agent_redteam",
+      "name": "Red-Team Hardware & Windows/Linux Internals Attacker",
+      "archetype": "Adversary",
+      "motives": [
+        "Bypass Ring 3 pre-mount hold before userspace sees USB volume",
+        "Exploit non-mass-storage interfaces (BadUSB HID, RNDIS/ECM network gadget, MTP/PTP phones, Thunderbolt/USB4 DMA)",
+        "Abuse CDR parser edge cases, ProjFS fallback races, or localhost UI/IPC boundaries"
+      ],
+      "constraints": ["Physical access to USB port or supply-chain compromised flash drive"],
+      "evidence_scope": ["crates/sentinel-sys", "crates/sentinel-core", "crates/sentinel-cdr", "crates/sentinel-cli"]
+    },
+    {
+      "id": "agent_ciso",
+      "name": "Fortune 500 CISO & Enterprise Security Buyer",
+      "archetype": "Economic Buyer",
+      "motives": [
+        "Consolidate vendors (reduce agent sprawl on endpoints)",
+        "Justify every dollar against existing Microsoft E5 / CrowdStrike Falcon licenses",
+        "Avoid catastrophic operational outages or vendor abandonment risk"
+      ],
+      "constraints": ["Flat security budget", "Strict procurement / SOC 2 / Cyber Insurance requirements"],
+      "evidence_scope": ["README.md", "Docs/ADR-004_optimal_hybrid_architecture_decision.md"]
+    },
+    {
+      "id": "agent_competitor",
+      "name": "Incumbent EDR & CDR Product Strategist (CrowdStrike / Microsoft / OPSWAT)",
+      "archetype": "Competitor",
+      "motives": [
+        "Identify commoditizable features absorbable into existing kernel/OS platforms",
+        "Expose where OPSWAT MetaDefender Kiosk or Microsoft Defender ASR already dominates",
+        "Attack weak pricing power ($8-$18/seat/mo) and missing central management plane"
+      ],
+      "constraints": ["Must protect incumbent market share and enterprise bundle lock-in"],
+      "evidence_scope": ["README.md", "Docs/ADR-004_optimal_hybrid_architecture_decision.md", "crates/sentinel-core/src/enterprise"]
+    },
+    {
+      "id": "agent_ot_operator",
+      "name": "OT / ICS SCADA Substation & Manufacturing Engineer",
+      "archetype": "Mode A Operator",
+      "motives": [
+        "Keep turbines/PLCs running with zero unplanned downtime",
+        "Transfer 2GB-32GB vendor PLC firmware images, CAD files, and proprietary encrypted installers safely",
+        "Pass IEC 62443-3-3 SL-3 audits on truly air-gapped Windows LTSC / legacy stations"
+      ],
+      "constraints": ["No internet access", "Heavy gloves / walk-up kiosk ergonomics", "Strict vendor warranty rules on unmodified firmware packages"],
+      "evidence_scope": ["crates/sentinel-core/src/enterprise/kiosk.rs", "crates/sentinel-core/src/vfs", "crates/sentinel-cdr/src/policy.rs", "config/iec62443_kiosk_zone.yaml"]
+    },
+    {
+      "id": "agent_mdm_admin",
+      "name": "Enterprise Endpoint / Intune MDM Infrastructure Engineer (50k Fleet)",
+      "archetype": "Fleet Deployer",
+      "motives": [
+        "Deploy agents silently without breaking BitLocker, USB-C docks, phones, smartcards, printers, or external dev SSDs",
+        "Minimize L1/L2 helpdesk tickets and emergency break-glass requests",
+        "Maintain OS compatibility across Windows 10/11 Home/Pro/Enterprise and Ubuntu/RHEL"
+      ],
+      "constraints": ["Small IT ops team", "Strict change-control boards", "Zero tolerance for broken peripherals"],
+      "evidence_scope": ["crates/sentinel-sys/src/mount_control.rs", "crates/sentinel-core/src/vfs/projfs.rs", "crates/sentinel-core/src/enterprise/intune.rs", "Docs/intune_sentinel_policy_profile.xml"]
+    },
+    {
+      "id": "agent_enduser",
+      "name": "Field Engineer / Senior Developer / Finance Analyst",
+      "archetype": "End User",
+      "motives": [
+        "Open Excel financial models with macros, signed PDF contracts, CAD zips, and large datasets immediately",
+        "Route around annoying security friction via cloud links, personal phones, or Shadow IT"
+      ],
+      "constraints": ["Tight project deadlines", "Zero patience for silently mangled files or 512 MiB errors"],
+      "evidence_scope": ["crates/sentinel-cdr/src/sanitizers", "dashboard", "crates/sentinel-cli/src/main.rs"]
+    },
+    {
+      "id": "agent_auditor",
+      "name": "GRC Compliance Auditor & Enterprise Technology Counsel",
+      "archetype": "Regulator / Legal",
+      "motives": [
+        "Verify every compliance badge against actual cryptographic and procedural certification standards",
+        "Flag overclaimed FIPS 140-3/186-5, NIST SP 800-88 Rev 1 vs Rev 2, IEC 62443 SL-3, and SOC 2 compliance",
+        "Identify legal liability from CDR document alteration (invalidated e-signatures, financial/medical data loss)"
+      ],
+      "constraints": ["Strict evidentiary audit standards", "Zero tolerance for uncertified crypto or misleading claims"],
+      "evidence_scope": ["README.md", "Cargo.toml", "crates/sentinel-sys/src/crypto_seal.rs", "crates/sentinel-core/src/enterprise/ledger.rs", "crates/sentinel-core/src/scanner/secure_shredder.rs"]
+    }
+  ],
+  "relationships": [
+    { "from": "agent_redteam", "to": "agent_ciso", "type": "INVALIDATES_SECURITY_CLAIMS" },
+    { "from": "agent_mdm_admin", "to": "agent_ciso", "type": "VETOES_FLEET_ROLLOUT" },
+    { "from": "agent_enduser", "to": "agent_mdm_admin", "type": "FLOODS_HELPDESK_AND_BYPASSES_VIA_SHADOW_IT" },
+    { "from": "agent_competitor", "to": "agent_ciso", "type": "OFFERS_BUNDLED_ZERO_INCREMENTAL_COST_ALTERNATIVE" },
+    { "from": "agent_auditor", "to": "agent_ciso", "type": "BLOCKS_PROCUREMENT_ON_UNVERIFIED_COMPLIANCE" },
+    { "from": "agent_ot_operator", "to": "agent_auditor", "type": "REQUIRES_VENDOR_SIGNED_FIRMWARE_AND_CERTIFIED_KIOSK" },
+    { "from": "agent_ot_operator", "to": "agent_ciso", "type": "VALIDATES_OR_REJECTS_MODE_A_KIOSK_NICHE" }
+  ],
+  "anti_bias_rules": [
+    "No agent may endorse willingness-to-pay without specifying what budget line item gets cut.",
+    "Every technical flaw must cite real source files or documented architectural constraints.",
+    "Agents must cross-examine and challenge overly optimistic or speculative claims from other agents in Round 2."
+  ]
+}

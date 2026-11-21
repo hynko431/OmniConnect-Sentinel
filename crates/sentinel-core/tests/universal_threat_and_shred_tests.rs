@@ -616,7 +616,7 @@ fn test_intune_xml_escaping_and_falcon_cef_injection_immunity() {
         "Unescaped '&' must not appear in OMA-URI XML"
     );
 
-    let bridge = CrowdStrikeFalconBridge::new("127.0.0.1:514");
+    let bridge = CrowdStrikeFalconBridge::new("tls://siem.enterprise.local:6514");
     let cef = bridge.format_cef_payload(&FalconTelemetryEvent {
         severity: 9,
         signature_id: "BADUSB|INJECT".to_string(),
@@ -689,7 +689,7 @@ fn test_intune_xml_escaping_and_falcon_cef_injection_immunity() {
     // Inject an expired record (185 days old) and verify 180-day pruning removes it while keeping recent record
     offline_bridge
         .append_spool_record(&sentinel_core::enterprise::falcon::SiemSpoolRecord {
-            timestamp_unix: chrono::Utc::now().timestamp() - (185 * 86_400),
+            timestamp_unix: sentinel_sys::now_unix_secs() - (185 * 86_400),
             timestamp_rfc3339: "2020-01-01T00:00:00Z".to_string(),
             cef_payload: "CEF:0|Old|Record".to_string(),
             delivered: true,
@@ -708,8 +708,10 @@ fn test_intune_xml_escaping_and_falcon_cef_injection_immunity() {
     let (pub_key, priv_key) = sentinel_sys::generate_raw_ecdsa_p256_keypair()
         .expect("Generating ECDSA P-256 keypair must succeed");
 
-    let mut policy_mgr =
-        IntunePolicyManager::new().with_ledger_path(dir.path().join("policy_ledger.jsonl"));
+    let mut policy_mgr = IntunePolicyManager::new()
+        .with_ledger_path(dir.path().join("policy_ledger.jsonl"))
+        .with_vault_dir(dir.path().join(".sentinel_vault"))
+        .with_pinned_root_public_keys(vec![pub_key.clone()]);
     assert_eq!(policy_mgr.policy().version, 2);
 
     let mut v3_policy = policy_mgr.policy().clone();
@@ -884,8 +886,127 @@ fn test_kiosk_recursive_subdirectory_shred_and_audit_ledger_tamper_detection() {
     );
 }
 
+fn stage_worker_for_core_tests() {
+    static STAGE: std::sync::Once = std::sync::Once::new();
+    STAGE.call_once(|| {
+        struct LockGuard(std::path::PathBuf);
+        impl Drop for LockGuard {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+
+        let exe_name = if cfg!(windows) {
+            "sentinel-cdr-worker.exe"
+        } else {
+            "sentinel-cdr-worker"
+        };
+        let Ok(cur_exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(deps_dir) = cur_exe.parent() else {
+            return;
+        };
+        let Some(target_profile_dir) = cur_exe
+            .ancestors()
+            .skip(1)
+            .find(|a| {
+                matches!(
+                    a.file_name().and_then(|n| n.to_str()),
+                    Some("debug" | "release")
+                )
+            })
+            .or_else(|| deps_dir.parent())
+        else {
+            return;
+        };
+
+        let lock_path = deps_dir.join(".stage_sentinel_cdr_worker.lock");
+        let mut _lock_guard = None;
+        for _ in 0..200 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => {
+                    _lock_guard = Some(LockGuard(lock_path.clone()));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Ok(meta) = fs::metadata(&lock_path) {
+                        if let Ok(modified) = meta.modified() {
+                            if modified.elapsed().unwrap_or_default()
+                                > std::time::Duration::from_secs(30)
+                            {
+                                let _ = fs::remove_file(&lock_path);
+                                continue;
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+
+        let sibling = target_profile_dir.join(exe_name);
+        if !sibling.exists() {
+            let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let mut build_args = vec!["build", "--offline", "--bin", "sentinel-cdr-worker"];
+            if target_profile_dir
+                .file_name()
+                .is_some_and(|n| n == "release")
+            {
+                build_args.push("--release");
+            }
+            let _ = std::process::Command::new("cargo")
+                .args(&build_args)
+                .current_dir(workspace_root)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        if sibling.exists() {
+            let dst = deps_dir.join(exe_name);
+            let needs_copy = match (fs::metadata(&sibling), fs::metadata(&dst)) {
+                (Ok(sm), Ok(dm)) => {
+                    let older = match (sm.modified(), dm.modified()) {
+                        (Ok(smt), Ok(dmt)) => dmt < smt,
+                        _ => false,
+                    };
+                    older || sm.len() != dm.len()
+                }
+                _ => true,
+            };
+            if needs_copy {
+                let tmp_dst = deps_dir.join(format!(".stage_{}_{}", std::process::id(), exe_name));
+                if fs::copy(&sibling, &tmp_dst).is_ok() {
+                    #[cfg(unix)]
+                    {
+                        let _ = fs::rename(&tmp_dst, &dst);
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        if !dst.exists() {
+                            let _ = fs::rename(&tmp_dst, &dst);
+                        } else {
+                            let _ = fs::copy(&tmp_dst, &dst);
+                        }
+                    }
+                    let _ = fs::remove_file(&tmp_dst);
+                }
+            }
+        }
+    });
+}
+
 #[tokio::test]
 async fn test_interceptor_retains_channel_sender_and_vfs_shadow_cache() {
+    stage_worker_for_core_tests();
     // BUG-CORE-01 & BUG-CORE-13 (Phase 3.2):
     // 1. WindowsUmdfInterceptor retains `Sender<DeviceConnectedEvent>` so `rx.recv()` does not immediately return `None`.
     // 2. ProjFsProvider projects sanitized files into the virtual mount point and wipes them on unmount.
@@ -894,11 +1015,12 @@ async fn test_interceptor_retains_channel_sender_and_vfs_shadow_cache() {
 
     let synthetic_event = DeviceConnectedEvent {
         connection_id: uuid::Uuid::new_v4(),
-        timestamp_utc: chrono::Utc::now(),
+        timestamp_utc: sentinel_sys::now_rfc3339_utc(),
         vector: ConnectionVector::WiredUsb {
             vid: 0x0781,
             pid: 0x5583,
             serial: "SN-TEST-001".to_string(),
+            device_instance_id: Some(r"USB\VID_0781&PID_5583\SN-TEST-001".to_string()),
             interfaces: Vec::new(),
         },
         raw_mount_point: None,
@@ -929,16 +1051,31 @@ async fn test_interceptor_retains_channel_sender_and_vfs_shadow_cache() {
     .unwrap();
     fs::write(raw_usb.join("dropper.exe"), b"MZ_UNAPPROVED_BINARY").unwrap();
 
-    let vfs = ProjFsProvider::new();
+    let vfs = ProjFsProvider::with_shadow_cache(
+        sentinel_core::vfs::ShadowCacheManager::with_cache_root_and_quota(
+            dir.path().join("shadow_cache"),
+            64 * 1024 * 1024,
+        ),
+    );
     vfs.mount_sanitized_volume(&raw_usb, &virt_mount)
         .await
         .expect("VFS shadow cache projection must succeed");
 
-    // Verify encrypted-only at-rest posture: before `on_file_first_open`, no plaintext copy exists in `virt_mount` (`Rows 147, 223`)
-    assert!(
-        !virt_mount.join("notes.txt").exists(),
-        "Plaintext must NOT be pre-written to virtual_mount_point before on_file_first_open (`Row 147`)"
-    );
+    // Verify encrypted-only at-rest posture: before `on_file_first_open`, no plaintext copy exists
+    // on disk in `virt_mount` (`Rows 147, 223`). When native Windows ProjFS (`prjflt.sys`) is
+    // active, querying `virt_mount.join("notes.txt").exists()` triggers `prj_get_placeholder_info_cb`,
+    // so assert the active ProjFS virtualization root tag instead.
+    if vfs.is_degraded_no_projfs() {
+        assert!(
+            !virt_mount.join("notes.txt").exists(),
+            "Plaintext must NOT be pre-written to virtual_mount_point before on_file_first_open (`Row 147`)"
+        );
+    } else {
+        assert!(
+            sentinel_sys::is_projfs_reparse_point(&virt_mount),
+            "Active native ProjFS root must carry IO_REPARSE_TAG_PROJFS (`Row 148`)"
+        );
+    }
 
     // Verify `read_projected_file` decrypts from `.enc` and verifies `sanitized_sha256` (`Row 148`)
     let decrypted_bytes = vfs
@@ -1052,6 +1189,7 @@ fn test_kiosk_posture_blocks_session_when_noncompliant() {
         write_protect_active: true,
         autoplay_suppressed: true,
         linux_authorized_default_zero: Some(false),
+        hardware_write_blocker: Default::default(),
     };
     assert!(!noncompliant.is_compliant());
     assert!(
@@ -1069,6 +1207,7 @@ fn test_kiosk_posture_blocks_session_when_noncompliant() {
         write_protect_active: true,
         autoplay_suppressed: true,
         linux_authorized_default_zero: Some(true),
+        hardware_write_blocker: Default::default(),
     };
     assert!(compliant.is_compliant());
     let sess_id = kiosk
@@ -1360,6 +1499,7 @@ fn invariant_i1() {
         write_protect_active: false,
         autoplay_suppressed: false,
         linux_authorized_default_zero: Some(false),
+        hardware_write_blocker: Default::default(),
     };
     assert!(!non_compliant.is_compliant());
 
@@ -1374,6 +1514,7 @@ fn invariant_i1() {
         write_protect_active: true,
         autoplay_suppressed: true,
         linux_authorized_default_zero: Some(true),
+        hardware_write_blocker: Default::default(),
     };
     assert!(
         !online_volume_noncompliant.is_compliant(),
@@ -1383,6 +1524,7 @@ fn invariant_i1() {
 
 #[tokio::test]
 async fn invariant_i2_rig() {
+    stage_worker_for_core_tests();
     // Master Plan v2 §0.1, §3.2 & §5 (`T12`, `invariant_i2_rig`):
     // 1. Test using a custom `MutatingUsbReader` (`std::io::Read`) that returns
     //    `"FIRST_READ_CLEAN_CONTENT\n"` on read #1 and `"SECOND_READ_MALICIOUS_PAYLOAD_SWAP\n"`
@@ -1911,6 +2053,7 @@ fn kiosk_posture_blocks_session() {
         write_protect_active: true,
         autoplay_suppressed: true,
         linux_authorized_default_zero: Some(false),
+        hardware_write_blocker: Default::default(),
     };
     assert!(!noncompliant.is_compliant());
     assert!(
@@ -1977,6 +2120,7 @@ fn ui_disconnected_state() {
 
 #[tokio::test]
 async fn invariant_i3() {
+    stage_worker_for_core_tests();
     // Master Plan v2 §0.1, §2.1 & §5.2 #5 (`T24`, `invariant_i3`, `Rows 8, 95, 203`):
     // Verify that `Tier1CdrClient::disarm_file` and `ShadowCacheManager` execute CDR inside
     // the isolated `sentinel-cdr-worker` process (never in-process), and that exceeding the
@@ -2004,7 +2148,6 @@ async fn invariant_i3() {
 
     // 2. Worker exceeding 256 MB memory cap (`__TEST_ALLOC_300MB__.bin`) is killed by the OS Job Object
     //    and `Tier1CdrClient::disarm_file` returns `Err` so the caller quarantines the file.
-    std::env::set_var("SENTINEL_CDR_ENABLE_FAULT_PROBES", "1");
     let oom_src = dir.path().join("__TEST_ALLOC_300MB__.bin");
     let oom_dst = dir.path().join("oom_out.bin");
     fs::write(&oom_src, b"trigger 300MB allocation").unwrap();
@@ -2185,6 +2328,7 @@ fn bug_core_12() {
 
 #[test]
 fn bug_core_13() {
+    stage_worker_for_core_tests();
     kiosk_posture_blocks_session();
     test_interceptor_retains_channel_sender_and_vfs_shadow_cache();
 }

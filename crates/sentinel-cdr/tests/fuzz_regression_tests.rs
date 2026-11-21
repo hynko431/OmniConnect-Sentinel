@@ -483,9 +483,91 @@ fn test_svg_and_csv_and_text_sanitizers() {
     );
 }
 
+fn stage_worker_next_to_test_exe() {
+    static STAGE: std::sync::Once = std::sync::Once::new();
+    STAGE.call_once(|| {
+        struct LockGuard(std::path::PathBuf);
+        impl Drop for LockGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let src = std::path::Path::new(env!("CARGO_BIN_EXE_sentinel-cdr-worker"));
+        let exe_name = if cfg!(windows) {
+            "sentinel-cdr-worker.exe"
+        } else {
+            "sentinel-cdr-worker"
+        };
+        if let Ok(cur_exe) = std::env::current_exe() {
+            if let Some(dir) = cur_exe.parent() {
+                let lock_path = dir.join(".stage_sentinel_cdr_worker.lock");
+                let mut _lock_guard = None;
+                for _ in 0..200 {
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&lock_path)
+                    {
+                        Ok(_) => {
+                            _lock_guard = Some(LockGuard(lock_path.clone()));
+                            break;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            if let Ok(meta) = std::fs::metadata(&lock_path) {
+                                if let Ok(modified) = meta.modified() {
+                                    if modified.elapsed().unwrap_or_default()
+                                        > std::time::Duration::from_secs(30)
+                                    {
+                                        let _ = std::fs::remove_file(&lock_path);
+                                        continue;
+                                    }
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                let dst = dir.join(exe_name);
+                let needs_copy = match (std::fs::metadata(src), std::fs::metadata(&dst)) {
+                    (Ok(sm), Ok(dm)) => {
+                        let older = match (sm.modified(), dm.modified()) {
+                            (Ok(smt), Ok(dmt)) => dmt < smt,
+                            _ => false,
+                        };
+                        older || sm.len() != dm.len()
+                    }
+                    _ => true,
+                };
+                if needs_copy {
+                    let tmp_dst = dir.join(format!(".stage_{}_{}", std::process::id(), exe_name));
+                    if std::fs::copy(src, &tmp_dst).is_ok() {
+                        #[cfg(unix)]
+                        {
+                            let _ = std::fs::rename(&tmp_dst, &dst);
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            if !dst.exists() {
+                                let _ = std::fs::rename(&tmp_dst, &dst);
+                            } else {
+                                let _ = std::fs::copy(&tmp_dst, &dst);
+                            }
+                        }
+                        let _ = std::fs::remove_file(&tmp_dst);
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[test]
 fn test_worker_pipe_protocol_roundtrip() {
     // BUG-CDR-10 & Phase 2.1: Test length-prefixed JSON pipe framing and one-shot worker execution
+    stage_worker_next_to_test_exe();
     let req = WorkerRequest {
         file_name: "notes.txt".to_string(),
         raw_bytes: format!("Safe line{}\n", '\u{202E}').into_bytes(),
@@ -1008,6 +1090,7 @@ fn pdf_launch_action_removed() {
 
 #[test]
 fn worker_memory_cap() {
+    stage_worker_next_to_test_exe();
     // Master Plan v2 §2.1 & §5 (`T13`, `worker_memory_cap`, `Invariant I3`):
     // 1. Verify length-prefixed protobuf roundtrip on a normal artifact
     test_worker_pipe_protocol_roundtrip();
@@ -1015,7 +1098,6 @@ fn worker_memory_cap() {
     // 2. Spawn `sentinel-cdr-worker` inside the 256 MB Job Object sandbox and trigger a 300 MB
     //    allocation (`__TEST_ALLOC_300MB__.bin`), verifying the OS Job Object terminates the
     //    worker and `WorkerLauncher::sanitize_isolated` returns `Err(CdrError::ResourceLimitExceeded)`.
-    std::env::set_var("SENTINEL_CDR_ENABLE_FAULT_PROBES", "1");
     let launcher = WorkerLauncher::new();
     let res = launcher.sanitize_isolated(WorkerRequest {
         file_name: "__TEST_ALLOC_300MB__.bin".to_string(),
@@ -1132,9 +1214,12 @@ fn proptest_forward_parsers_and_cdr_sanitizers_never_panic() {
             "Forward PNG parser must locate exact IEND chunk boundary for arbitrary trailing payload (seed={seed})"
         );
 
-        // Exercise all 6 sanitizers on structured mutated inputs (`Row 201`)
+        // Exercise all 6 sanitizers + CSE-19/20/21 pre-parsers on structured mutated inputs (`Row 201`, Phase 1)
         let _ = PdfSanitizer::sanitize(&raw_entropy, &policy);
         let _ = OpenXmlSanitizer::sanitize(&raw_entropy, &policy);
+        let _ = ImageSanitizer::parse_tiff_exif_orientation(&raw_entropy);
+        let _ = ImageSanitizer::is_valid_srgb_icc_profile(&raw_entropy);
+        let _ = ImageSanitizer::extract_jpeg_color_and_exif(&raw_entropy);
         let _ = ImageSanitizer::sanitize_png(&raw_entropy, &policy);
         let _ = ImageSanitizer::sanitize_jpeg(&raw_entropy, &policy);
         let _ = ImageSanitizer::sanitize_webp(&raw_entropy, &policy);
@@ -1142,6 +1227,76 @@ fn proptest_forward_parsers_and_cdr_sanitizers_never_panic() {
         let _ = Ole2Sanitizer::sanitize(&raw_entropy, &policy);
         let _ = TextCsvSanitizer::sanitize(&raw_entropy, &policy, true);
         let _ = TextCsvSanitizer::sanitize(&raw_entropy, &policy, false);
+
+        // Structured magic/UTF-8-penetrating mutations so every Phase 1 parser runs deep on all 500 seeds:
+        // (a) Valid UTF-8 CSV alphabet with quotes, delimiters, BOM, and formula triggers
+        const CSV_ALPHABET: &[u8] = b",\"\r\n=+-@\t'0123456789.eE abcXYZ";
+        let mut structured_csv = String::with_capacity(140);
+        if seed % 3 == 0 {
+            structured_csv.push('\u{FEFF}');
+        }
+        for &b in &raw_entropy[..96] {
+            structured_csv.push(CSV_ALPHABET[(b as usize) % CSV_ALPHABET.len()] as char);
+        }
+        if let Ok((clean_csv, _)) =
+            TextCsvSanitizer::sanitize(structured_csv.as_bytes(), &policy, true)
+        {
+            let clean_csv_str =
+                std::str::from_utf8(&clean_csv).expect("Sanitized CSV must always be valid UTF-8");
+            TextCsvSanitizer::verify_csv_fields_clean(clean_csv_str)
+                .expect("Sanitized CSV must always pass post-CDR RFC 4180 verification");
+        }
+
+        // (b) Structured OOXML `<w:instrText>` + `CDATA` + relationship target fuzzing
+        let ascii_frag: String = raw_entropy[..48]
+            .iter()
+            .map(|b| (0x20 + (b % 94)) as char)
+            .filter(|c| !matches!(c, '<' | '>' | '&' | ']' | '"'))
+            .collect();
+        let xml_doc = format!(
+            "<w:document><w:p><w:instrText>{ascii_frag}</w:instrText><w:instrText><![CDATA[{ascii_frag}]]></w:instrText></w:p></w:document>"
+        );
+        let _ = OpenXmlSanitizer::has_residual_dde_or_field_code(xml_doc.as_bytes());
+        let _ = OpenXmlSanitizer::is_allowed_ooxml_relationship_target(&ascii_frag, seed % 2 == 0);
+
+        // (c) Structured `%PDF-1.7` stream-aware depth lexer fuzzing
+        let mut pdf_mut = b"%PDF-1.7\n1 0 obj << /Length ".to_vec();
+        pdf_mut.extend_from_slice((raw_entropy[0] % 32).to_string().as_bytes());
+        pdf_mut.extend_from_slice(b" >> stream\n");
+        pdf_mut.extend_from_slice(&raw_entropy[..64]);
+        pdf_mut.extend_from_slice(b"\nendstream\nendobj\n");
+        let _ = PdfSanitizer::validate_pdf_token_nesting_depth(&pdf_mut, 64);
+
+        // (d) Magic-prefixed OLE2 CFB buffer
+        let mut ole_mut = vec![0u8; 1024];
+        ole_mut[..8].copy_from_slice(&sentinel_cdr::sanitizers::ole2::OLE2_MAGIC);
+        ole_mut[8..264].copy_from_slice(&raw_entropy);
+        let _ = Ole2Sanitizer::sanitize(&ole_mut, &policy);
+
+        // (e) Magic-prefixed TIFF (`II`/`MM`), length-matched `acsp` ICC, and `FF D8` JPEG segment fuzzing
+        let mut tiff_mut = Vec::with_capacity(raw_entropy.len() + 4);
+        tiff_mut.extend_from_slice(if seed % 2 == 0 {
+            b"II\x2A\x00"
+        } else {
+            b"MM\x00\x2A"
+        });
+        tiff_mut.extend_from_slice(&raw_entropy);
+        let _ = ImageSanitizer::parse_tiff_exif_orientation(&tiff_mut);
+
+        let mut icc_mut = vec![0u8; 256];
+        icc_mut.copy_from_slice(&raw_entropy);
+        icc_mut[0..4].copy_from_slice(&256u32.to_be_bytes());
+        icc_mut[8] = 2;
+        icc_mut[12..16].copy_from_slice(b"mntr");
+        icc_mut[16..20].copy_from_slice(b"RGB ");
+        icc_mut[20..24].copy_from_slice(b"XYZ ");
+        icc_mut[36..40].copy_from_slice(b"acsp");
+        let _ = ImageSanitizer::is_valid_srgb_icc_profile(&icc_mut);
+
+        let mut jpeg_mut = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg_mut.extend_from_slice(&raw_entropy);
+        let _ = ImageSanitizer::extract_jpeg_color_and_exif(&jpeg_mut);
+        let _ = ImageSanitizer::scan_jpeg_structure(&jpeg_mut);
     }
 }
 
@@ -1861,4 +2016,150 @@ async fn test_grpc_stream_empty_chunk_flood_rejected_rustsec_2026_0258() {
         }
         other => panic!("Expected DisarmError(STREAM_FRAME_FLOOD_DETECTED), got: {other:?}"),
     }
+}
+
+#[test]
+fn test_worker_launcher_with_nonexistent_worker_bin_fails_closed() {
+    let nonexistent_path = std::env::temp_dir().join(format!(
+        "nonexistent_sentinel_cdr_worker_{}.exe",
+        uuid::Uuid::new_v4()
+    ));
+    let launcher = WorkerLauncher::new().with_worker_bin(nonexistent_path.clone());
+    assert!(launcher.has_worker_binary());
+
+    let res = launcher.sanitize_isolated(WorkerRequest {
+        file_name: "notes.txt".to_string(),
+        policy: SanitizationPolicy::default(),
+        raw_bytes: b"hello".to_vec(),
+    });
+    assert!(
+        matches!(res, Err(sentinel_cdr::CdrError::SandboxFailure(_))),
+        "WorkerLauncher::with_worker_bin(nonexistent_path).sanitize_isolated must fail closed with CdrError::SandboxFailure: got {res:?}"
+    );
+
+    let inspect_res = launcher.inspect_isolated(b"hello", "notes.txt");
+    assert!(
+        matches!(inspect_res, Err(sentinel_cdr::CdrError::SandboxFailure(_))),
+        "WorkerLauncher::with_worker_bin(nonexistent_path).inspect_isolated must fail closed with CdrError::SandboxFailure: got {inspect_res:?}"
+    );
+
+    // Passing a directory path (not a regular file) must also fail closed with SandboxFailure
+    let dir_launcher = WorkerLauncher::new().with_worker_bin(std::env::temp_dir());
+    let dir_res = dir_launcher.sanitize_isolated(WorkerRequest {
+        file_name: "notes.txt".to_string(),
+        policy: SanitizationPolicy::default(),
+        raw_bytes: b"hello".to_vec(),
+    });
+    assert!(
+        matches!(dir_res, Err(sentinel_cdr::CdrError::SandboxFailure(_))),
+        "WorkerLauncher::with_worker_bin(directory) must fail closed with SandboxFailure: got {dir_res:?}"
+    );
+
+    // Passing a symlink / NTFS junction path must also fail closed with SandboxFailure
+    let link_root = std::env::temp_dir().join(format!("cdr_link_test_{}", uuid::Uuid::new_v4()));
+    let real_target_dir = link_root.join("real_dir");
+    std::fs::create_dir_all(&real_target_dir).unwrap();
+    let real_file = real_target_dir.join("worker_dummy.exe");
+    std::fs::write(&real_file, b"MZ_DUMMY").unwrap();
+
+    #[cfg(windows)]
+    {
+        let junction_dir = link_root.join("junction_dir");
+        if let Ok(out) = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &junction_dir.to_string_lossy(),
+                &real_target_dir.to_string_lossy(),
+            ])
+            .output()
+        {
+            if out.status.success() {
+                let junc_launcher =
+                    WorkerLauncher::new().with_worker_bin(junction_dir.join("worker_dummy.exe"));
+                let junc_res = junc_launcher.sanitize_isolated(WorkerRequest {
+                    file_name: "notes.txt".to_string(),
+                    policy: SanitizationPolicy::default(),
+                    raw_bytes: b"hello".to_vec(),
+                });
+                assert!(
+                    matches!(junc_res, Err(sentinel_cdr::CdrError::SandboxFailure(_))),
+                    "WorkerLauncher::with_worker_bin(junction child) must fail closed with SandboxFailure: got {junc_res:?}"
+                );
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        let symlink_file = link_root.join("symlink_worker");
+        if std::os::unix::fs::symlink(&real_file, &symlink_file).is_ok() {
+            let sym_launcher = WorkerLauncher::new().with_worker_bin(symlink_file);
+            let sym_res = sym_launcher.sanitize_isolated(WorkerRequest {
+                file_name: "notes.txt".to_string(),
+                policy: SanitizationPolicy::default(),
+                raw_bytes: b"hello".to_vec(),
+            });
+            assert!(
+                matches!(sym_res, Err(sentinel_cdr::CdrError::SandboxFailure(_))),
+                "WorkerLauncher::with_worker_bin(symlink) must fail closed with SandboxFailure: got {sym_res:?}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&link_root);
+}
+
+#[test]
+fn test_cdr_daemon_fails_closed_without_adjacent_worker_ignoring_env_vars() {
+    let tmp_dir = std::env::temp_dir().join(format!("cdr_daemon_iso_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let daemon_src = std::path::Path::new(env!("CARGO_BIN_EXE_sentinel-cdr-daemon"));
+    let worker_src = std::path::Path::new(env!("CARGO_BIN_EXE_sentinel-cdr-worker"));
+    let daemon_name = daemon_src.file_name().unwrap();
+    let worker_name = worker_src.file_name().unwrap();
+    let daemon_isolated = tmp_dir.join(daemon_name);
+    std::fs::copy(daemon_src, &daemon_isolated).unwrap();
+
+    // 1. `--check` must succeed even without adjacent worker
+    let check_out = std::process::Command::new(&daemon_isolated)
+        .arg("--check")
+        .output()
+        .unwrap();
+    assert!(
+        check_out.status.success(),
+        "sentinel-cdr-daemon --check should exit 0"
+    );
+
+    // 2. Normal startup without adjacent worker MUST fail closed even when env overrides are set
+    let out = std::process::Command::new(&daemon_isolated)
+        .env("SENTINEL_CDR_WORKER_BIN", worker_src)
+        .env("CARGO_BIN_EXE_sentinel-cdr-worker", worker_src)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "sentinel-cdr-daemon must refuse startup without adjacent sentinel-cdr-worker"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("FATAL: CDR_WORKER_FAILED: sentinel-cdr-worker binary not found adjacent to sentinel-cdr-daemon; refusing startup (Invariant I3)"),
+        "Unexpected daemon stderr: {stderr}"
+    );
+
+    // 3. Staging sentinel-cdr-worker adjacent to sentinel-cdr-daemon allows `--stdio` startup and clean EOF shutdown (`CSE-22`)
+    let worker_isolated = tmp_dir.join(worker_name);
+    std::fs::copy(worker_src, &worker_isolated).unwrap();
+    let ok_out = std::process::Command::new(&daemon_isolated)
+        .arg("--stdio")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        ok_out.status.success(),
+        "sentinel-cdr-daemon --stdio with adjacent worker and EOF stdin should exit 0, stderr: {}",
+        String::from_utf8_lossy(&ok_out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

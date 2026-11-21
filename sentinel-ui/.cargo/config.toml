@@ -1,0 +1,13 @@
+# Standalone Rune UI cargo configuration (overrides parent workspace strict -D warnings
+# so upstream pre-release GPU/windowing dependencies build cleanly with incremental caching).
+[build]
+incremental = true
+
+[target.x86_64-pc-windows-msvc]
+rustflags = []
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = []
+
+[env]
+CARGO_INCREMENTAL = "1"

@@ -5,11 +5,39 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use sentinel_sys::{sign_ecdsa_p256_with_private_blob, verify_ecdsa_p256_digest};
+use sentinel_sys::{
+    ensure_not_symlink_or_reparse_point, open_untrusted_readonly_nofollow,
+    read_untrusted_to_end_bounded, sign_ecdsa_p256_with_private_blob, verify_ecdsa_p256_digest,
+};
+use std::path::Path;
+use subtle::ConstantTimeEq;
 
-use crate::enterprise::ledger::AuditLedger;
+use crate::enterprise::intune::default_enterprise_root_public_keys;
+use crate::enterprise::ledger::{AuditLedger, AuditSubsystem, SharedAuditLedger};
 use crate::error::{DegradationEvent, SentinelError};
 use crate::scanner::content_scanner::ContentScanner;
+
+/// Environment variable overriding the default `SYSTEM`-only persisted signed offline YARA rule
+/// pack directory (`CSE-27`). Unsigned packs in this directory are ALWAYS rejected fail-closed.
+pub const SENTINEL_OFFLINE_YARA_DIR_ENV: &str = "SENTINEL_OFFLINE_YARA_DIR";
+
+/// Maximum file size (4 MiB) accepted for a single persisted `SignedRulePack` JSON file (`CSE-27`).
+pub const MAX_SIGNED_YARA_PACK_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Default `SYSTEM`-only directory containing persisted ECDSA P-256 signed offline YARA packs (`CSE-27`).
+pub fn default_offline_yara_rules_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(pd) = std::env::var("ProgramData") {
+            return PathBuf::from(pd).join("OmniConnect").join("YaraRules");
+        }
+        PathBuf::from(r"C:\ProgramData\OmniConnect\YaraRules")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/var/lib/omniconnect/yara_rules")
+    }
+}
 
 /// Default embedded YARA rule definitions compiled at startup (`Rows 154, 186`).
 pub const DEFAULT_YARA_RULES_SOURCE: &str = r#"
@@ -187,6 +215,7 @@ pub struct YaraScanResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DynamicYaraRule {
     pub id: String,
     pub description: String,
@@ -195,12 +224,13 @@ pub struct DynamicYaraRule {
     pub requires_pe_header: bool,
 }
 
-/// Cryptographically Signed YARA Rule Pack (`Row 186`, Master Plan v2 §3.3 & §4.4)
+/// Cryptographically Signed YARA Rule Pack (`Row 186`, Master Plan v2 §3.3 & §4.4, `CSE-27`)
 ///
 /// Signs the canonical rule pack payload (`pack_id`, `version`, `rules`) with an asymmetric
 /// ECDSA P-256 keypair and enforces monotonic versioning (`pack.version > current_version`)
 /// to block rule downgrade attacks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SignedRulePack {
     pub pack_id: String,
     pub version: u32,
@@ -359,6 +389,135 @@ pub fn compile_yara_source(yar_source: &str) -> Result<Vec<CompiledYaraRule>, St
     Ok(compiled)
 }
 
+/// Single-pass `O(64 KiB)` streaming YARA + SHA-256 threat-intelligence + PE/ELF header
+/// accumulator allowing ShadowCache to scan, hash, and AES-256-GCM encrypt large OT firmware
+/// streams in ONE physical hardware read (`CSE-27`, `Invariant I2`).
+pub struct StreamingYaraAccumulator<'a> {
+    scanner: &'a Tier0YaraScanner,
+    started: Instant,
+    hasher: Sha256,
+    first_window: Vec<u8>,
+    overlap: Vec<u8>,
+    window: Vec<u8>,
+    rule_matched_markers: Vec<HashSet<usize>>,
+}
+
+impl<'a> StreamingYaraAccumulator<'a> {
+    /// Feeds the next bounded chunk (typically `<= 64 KiB`) into SHA-256, 4 KiB overlap
+    /// multi-condition YARA rule matching, and header capture without ever buffering the file.
+    pub fn update(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        const FIRST_WINDOW_CAP: usize = 64 * 1024;
+        const OVERLAP_SIZE: usize = 4 * 1024;
+
+        self.hasher.update(chunk);
+        if self.first_window.len() < FIRST_WINDOW_CAP {
+            let take = (FIRST_WINDOW_CAP - self.first_window.len()).min(chunk.len());
+            self.first_window.extend_from_slice(&chunk[..take]);
+        }
+
+        // Process in sub-slices of at most 64 KiB so `self.window` stays strictly bounded at 68 KiB
+        for slice in chunk.chunks(FIRST_WINDOW_CAP) {
+            self.window.clear();
+            self.window.extend_from_slice(&self.overlap);
+            self.window.extend_from_slice(slice);
+
+            for (r_idx, rule) in self.scanner.rules.iter().enumerate() {
+                if self.rule_matched_markers[r_idx].len() >= rule.min_matches {
+                    continue;
+                }
+                for (m_idx, marker) in rule.required_markers.iter().enumerate() {
+                    if !self.rule_matched_markers[r_idx].contains(&m_idx)
+                        && Tier0YaraScanner::contains_subslice(&self.window, marker)
+                    {
+                        self.rule_matched_markers[r_idx].insert(m_idx);
+                    }
+                }
+            }
+
+            // Preserve up to `OVERLAP_SIZE` bytes from `self.window` (NOT just `slice`) so
+            // short partial reads (`< 4 KiB`, e.g., 10-byte reads splitting a marker across
+            // 3+ chunks) never discard prior bytes (`CSE-27`).
+            self.overlap.clear();
+            let tail_start = self.window.len().saturating_sub(OVERLAP_SIZE);
+            self.overlap.extend_from_slice(&self.window[tail_start..]);
+        }
+    }
+
+    /// Finalizes the single-pass streaming scan, returning `(YaraScanResult, full_sha256_hex, is_valid_pe)`.
+    pub fn finalize_with_digest(self) -> (YaraScanResult, String, bool) {
+        let digest: [u8; 32] = self.hasher.finalize().into();
+        let sha256_hex = hex::encode(digest);
+        let is_pe = Tier0YaraScanner::is_valid_pe(&self.first_window);
+
+        if let Some((intel_id, intel_desc)) = self.scanner.intel_bloom.lookup(&digest) {
+            return (
+                YaraScanResult {
+                    matched: true,
+                    rule_name: Some(intel_id),
+                    threat_details: Some(intel_desc),
+                    scan_duration_micros: self.started.elapsed().as_micros() as u64,
+                },
+                sha256_hex,
+                is_pe,
+            );
+        }
+
+        for (r_idx, rule) in self.scanner.rules.iter().enumerate() {
+            if rule.requires_pe_header && !is_pe {
+                continue;
+            }
+            if self.rule_matched_markers[r_idx].len() >= rule.min_matches {
+                return (
+                    YaraScanResult {
+                        matched: true,
+                        rule_name: Some(rule.id.clone()),
+                        threat_details: Some(rule.description.clone()),
+                        scan_duration_micros: self.started.elapsed().as_micros() as u64,
+                    },
+                    sha256_hex,
+                    is_pe,
+                );
+            }
+        }
+
+        if let Some(elf) = Tier0YaraScanner::parse_elf_structure(&self.first_window) {
+            if elf.has_rwx_segment {
+                return (
+                    YaraScanResult {
+                        matched: true,
+                        rule_name: Some("YARA_ELF_RWX_LOAD_SEGMENT".to_string()),
+                        threat_details: Some(
+                            "ELF binary declares a writable + executable (PF_W | PF_X) PT_LOAD segment"
+                                .to_string(),
+                        ),
+                        scan_duration_micros: self.started.elapsed().as_micros() as u64,
+                    },
+                    sha256_hex,
+                    is_pe,
+                );
+            }
+        }
+
+        (
+            YaraScanResult {
+                matched: false,
+                rule_name: None,
+                threat_details: None,
+                scan_duration_micros: self.started.elapsed().as_micros() as u64,
+            },
+            sha256_hex,
+            is_pe,
+        )
+    }
+
+    pub fn finalize(self) -> YaraScanResult {
+        self.finalize_with_digest().0
+    }
+}
+
 pub type Tier0SignatureScanner = Tier0YaraScanner;
 
 /// Tier-0 Multi-Condition YARA, Structural PE32/PE32+ IAT/Section & SHA-256 Intel Scanner
@@ -367,6 +526,7 @@ pub struct Tier0YaraScanner {
     rules: Vec<CompiledYaraRule>,
     rule_pack_version: u32,
     ledger_path: PathBuf,
+    shared_ledger: Option<SharedAuditLedger>,
     intel_bloom: ThreatIntelBloomFilter,
 }
 
@@ -379,19 +539,53 @@ impl Default for Tier0YaraScanner {
 impl Tier0YaraScanner {
     pub fn new() -> Self {
         let rules = compile_yara_source(DEFAULT_YARA_RULES_SOURCE).unwrap_or_default();
+        #[cfg(test)]
+        let ledger_path = std::env::temp_dir()
+            .join(format!("omniconnect_sentinel_yara_{}", std::process::id()))
+            .join("yara_rulepack_ledger.jsonl");
+        #[cfg(not(test))]
+        let ledger_path = {
+            #[cfg(windows)]
+            {
+                PathBuf::from(r"C:\ProgramData\OmniConnect\AuditLedger\yara_rulepack_ledger.jsonl")
+            }
+            #[cfg(not(windows))]
+            {
+                PathBuf::from("/var/lib/omniconnect/audit_ledger/yara_rulepack_ledger.jsonl")
+            }
+        };
         Self {
             rules,
             rule_pack_version: 1,
-            ledger_path: std::env::temp_dir()
-                .join(format!("omniconnect_sentinel_yara_{}", std::process::id()))
-                .join("yara_rulepack_ledger.jsonl"),
+            ledger_path,
+            shared_ledger: None,
             intel_bloom: ThreatIntelBloomFilter::new(),
         }
     }
 
     pub fn with_ledger_path(mut self, ledger_path: PathBuf) -> Self {
         self.ledger_path = ledger_path;
+        self.shared_ledger = None;
         self
+    }
+
+    pub fn with_shared_ledger(mut self, shared_ledger: SharedAuditLedger) -> Self {
+        if let Ok(guard) = shared_ledger.lock() {
+            self.ledger_path = guard.path().to_path_buf();
+        }
+        self.shared_ledger = Some(shared_ledger);
+        self
+    }
+
+    fn record_ledger_event(&self, event: &str, details: serde_json::Value) {
+        if let Some(shared) = &self.shared_ledger {
+            if let Ok(mut guard) = shared.lock() {
+                let _ = guard.append_subsystem_event(AuditSubsystem::System, event, details);
+                return;
+            }
+        }
+        let mut ledger = AuditLedger::open(&self.ledger_path);
+        let _ = ledger.append_event(event, details);
     }
 
     pub fn intel_bloom_mut(&mut self) -> &mut ThreatIntelBloomFilter {
@@ -414,8 +608,7 @@ impl Tier0YaraScanner {
         trusted_public_key: &[u8],
     ) -> Result<u32, SentinelError> {
         if let Err(sig_err) = pack.verify_signature(trusted_public_key) {
-            let mut ledger = AuditLedger::open(&self.ledger_path);
-            let _ = ledger.append_event(
+            self.record_ledger_event(
                 DegradationEvent::PolicyRejected.event_code(),
                 serde_json::json!({
                     "component": "Tier0YaraScanner",
@@ -433,8 +626,7 @@ impl Tier0YaraScanner {
                 "YARA rule pack rollback rejected: candidate version {} <= active version {}",
                 pack.version, self.rule_pack_version
             ));
-            let mut ledger = AuditLedger::open(&self.ledger_path);
-            let _ = ledger.append_event(
+            self.record_ledger_event(
                 DegradationEvent::PolicyRejected.event_code(),
                 serde_json::json!({
                     "component": "Tier0YaraScanner",
@@ -478,8 +670,7 @@ impl Tier0YaraScanner {
         self.rules.extend(compiled_additions);
         self.rule_pack_version = pack.version;
 
-        let mut ledger = AuditLedger::open(&self.ledger_path);
-        let _ = ledger.append_event(
+        self.record_ledger_event(
             "YARA_RULEPACK_UPDATED",
             serde_json::json!({
                 "pack_id": pack.pack_id,
@@ -490,6 +681,177 @@ impl Tier0YaraScanner {
         );
 
         Ok(self.rule_pack_version)
+    }
+
+    /// Constructs a `Tier0YaraScanner` and loads any persisted ECDSA P-256 signed offline YARA rule
+    /// packs from `SENTINEL_OFFLINE_YARA_DIR` (or `default_offline_yara_rules_dir()`), verified
+    /// strictly against pinned enterprise roots (`CSE-27`). Unsigned or tampered packs are rejected
+    /// fail-closed while preserving built-in rules.
+    pub fn new_with_persisted_offline_packs() -> Self {
+        let mut scanner = Self::new();
+        let dir = std::env::var(SENTINEL_OFFLINE_YARA_DIR_ENV)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(default_offline_yara_rules_dir);
+        if dir.exists() {
+            let pinned_roots = default_enterprise_root_public_keys();
+            if let Err(err) = scanner.load_persisted_signed_rule_packs(&dir, &pinned_roots) {
+                tracing::warn!(
+                    "Rejected invalid offline YARA pack in '{}': {}",
+                    dir.display(),
+                    err
+                );
+            }
+        }
+        scanner
+    }
+
+    /// Loads all persisted `.json` `SignedRulePack` files from `dir` in deterministic sorted order,
+    /// strictly verifying each pack's signer against `trusted_root_public_keys` (constant-time)
+    /// and its ECDSA P-256 signature + monotonic version (`CSE-27`).
+    ///
+    /// Fails closed (returns `Err` and logs `POLICY_REJECTED`) on symlinked directories/files,
+    /// untrusted signers, invalid JSON, bad signatures, or version rollbacks. Zero unsigned rules
+    /// are ever loaded.
+    pub fn load_persisted_signed_rule_packs(
+        &mut self,
+        dir: &Path,
+        trusted_root_public_keys: &[Vec<u8>],
+    ) -> Result<usize, SentinelError> {
+        if !dir.exists() {
+            return Ok(0);
+        }
+        ensure_not_symlink_or_reparse_point(dir).map_err(|e| {
+            SentinelError::PolicySignatureInvalid(format!(
+                "YARA_PACK_DIR_SYMLINK: refusing symlink/reparse offline YARA directory '{}': {e}",
+                dir.display()
+            ))
+        })?;
+        if trusted_root_public_keys.is_empty() {
+            return Err(SentinelError::PolicySignatureInvalid(
+                "YARA_PACK_NO_TRUSTED_ROOTS: zero pinned enterprise root public keys configured"
+                    .to_string(),
+            ));
+        }
+
+        let mut pack_paths: Vec<PathBuf> = Vec::new();
+        let read_dir = std::fs::read_dir(dir).map_err(|e| {
+            SentinelError::PolicySignatureInvalid(format!(
+                "YARA_PACK_DIR_IO: failed reading offline YARA directory '{}': {e}",
+                dir.display()
+            ))
+        })?;
+        for entry_res in read_dir {
+            let entry = entry_res.map_err(|e| {
+                SentinelError::PolicySignatureInvalid(format!(
+                    "YARA_PACK_DIR_IO: failed reading directory entry in '{}': {e}",
+                    dir.display()
+                ))
+            })?;
+            let path = entry.path();
+            let is_json = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+            if is_json {
+                pack_paths.push(path);
+            }
+        }
+        pack_paths.sort();
+
+        let mut loaded_count = 0usize;
+        for pack_path in pack_paths {
+            let mut file = open_untrusted_readonly_nofollow(&pack_path).map_err(|e| {
+                self.record_ledger_event(
+                    DegradationEvent::PolicyRejected.event_code(),
+                    serde_json::json!({
+                        "component": "Tier0YaraScanner",
+                        "reason": "offline_yara_pack_open_failed",
+                        "file": pack_path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+                    }),
+                );
+                SentinelError::PolicySignatureInvalid(format!(
+                    "YARA_PACK_OPEN_FAILED: failed opening '{}': {e}",
+                    pack_path.display()
+                ))
+            })?;
+            let raw_bytes = read_untrusted_to_end_bounded(&mut file, MAX_SIGNED_YARA_PACK_BYTES)
+                .map_err(|e| {
+                    self.record_ledger_event(
+                        DegradationEvent::PolicyRejected.event_code(),
+                        serde_json::json!({
+                            "component": "Tier0YaraScanner",
+                            "reason": "offline_yara_pack_read_failed",
+                            "file": pack_path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+                        }),
+                    );
+                    SentinelError::PolicySignatureInvalid(format!(
+                        "YARA_PACK_READ_FAILED: failed reading '{}': {e}",
+                        pack_path.display()
+                    ))
+                })?;
+            let pack: SignedRulePack = serde_json::from_slice(&raw_bytes).map_err(|e| {
+                self.record_ledger_event(
+                    DegradationEvent::PolicyRejected.event_code(),
+                    serde_json::json!({
+                        "component": "Tier0YaraScanner",
+                        "reason": "offline_yara_pack_unsigned_or_malformed",
+                        "file": pack_path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+                    }),
+                );
+                SentinelError::PolicySignatureInvalid(format!(
+                    "YARA_PACK_MALFORMED: rejecting unsigned/malformed YARA rule pack '{}': {e}",
+                    pack_path.display()
+                ))
+            })?;
+
+            let signer_pk = hex::decode(&pack.signer_public_key_hex).map_err(|e| {
+                SentinelError::PolicySignatureInvalid(format!(
+                    "YARA_PACK_BAD_SIGNER_HEX: invalid signer_public_key_hex in '{}': {e}",
+                    pack.pack_id
+                ))
+            })?;
+            let matched_root = trusted_root_public_keys
+                .iter()
+                .find(|root| {
+                    root.len() == signer_pk.len() && bool::from(root.as_slice().ct_eq(&signer_pk))
+                })
+                .ok_or_else(|| {
+                    self.record_ledger_event(
+                        DegradationEvent::PolicyRejected.event_code(),
+                        serde_json::json!({
+                            "component": "Tier0YaraScanner",
+                            "reason": "offline_yara_pack_untrusted_signer",
+                            "pack_id": pack.pack_id,
+                            "candidate_version": pack.version,
+                        }),
+                    );
+                    SentinelError::PolicySignatureInvalid(format!(
+                        "YARA_PACK_UNTRUSTED_SIGNER: rule pack '{}' signer public key is not in pinned enterprise roots",
+                        pack.pack_id
+                    ))
+                })?;
+
+            self.apply_signed_rule_pack(&pack, matched_root)?;
+            loaded_count += 1;
+        }
+        Ok(loaded_count)
+    }
+
+    /// Starts a zero-rewind, constant `O(64 KiB)` RAM single-pass streaming YARA + SHA-256 threat
+    /// intelligence scan accumulator (`CSE-27`, `Invariant I2`).
+    pub fn begin_streaming_scan(&self) -> StreamingYaraAccumulator<'_> {
+        StreamingYaraAccumulator {
+            scanner: self,
+            started: Instant::now(),
+            hasher: Sha256::new(),
+            first_window: Vec::new(),
+            overlap: Vec::with_capacity(4 * 1024),
+            window: Vec::with_capacity(68 * 1024),
+            rule_matched_markers: vec![HashSet::new(); self.rules.len()],
+        }
     }
 
     pub fn scan_bytes(&self, bytes: &[u8], context_name: &str) -> YaraScanResult {
@@ -555,9 +917,11 @@ impl Tier0YaraScanner {
                 }
             }
 
+            // Preserve up to `OVERLAP_SIZE` bytes from `window` (NOT just `chunk[..n]`) so
+            // short partial reads (`< 4 KiB`) cannot drop cross-chunk marker prefixes (`CSE-27`).
             overlap.clear();
-            let tail_start = n.saturating_sub(OVERLAP_SIZE);
-            overlap.extend_from_slice(&chunk[tail_start..n]);
+            let tail_start = window.len().saturating_sub(OVERLAP_SIZE);
+            overlap.extend_from_slice(&window[tail_start..]);
         }
 
         let digest: [u8; 32] = hasher.finalize().into();
@@ -632,10 +996,7 @@ impl Tier0YaraScanner {
         }
         let pe_offset =
             u32::from_le_bytes([bytes[0x3C], bytes[0x3D], bytes[0x3E], bytes[0x3F]]) as usize;
-        if pe_offset + 4 <= bytes.len() && &bytes[pe_offset..pe_offset + 4] == b"PE\0\0" {
-            return true;
-        }
-        false
+        pe_offset + 4 <= bytes.len() && &bytes[pe_offset..pe_offset + 4] == b"PE\0\0"
     }
 
     /// Full PE32 / PE32+ structural parser (`Rows 154, 156, 228`):

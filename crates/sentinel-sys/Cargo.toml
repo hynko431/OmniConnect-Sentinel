@@ -4,12 +4,24 @@ version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Isolated OS FFI boundary for OmniConnect Sentinel (MountMgr, DPAPI/TPM, Job Objects, Verbatim I/O, NTFS ADS)"
 
 [dependencies]
 tracing.workspace = true
 serde.workspace = true
 sha2.workspace = true
+sha3.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+p256.workspace = true
+hkdf.workspace = true
+rsa.workspace = true
+ml-kem.workspace = true
+
+[features]
+default = []
+linux-tpm2 = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

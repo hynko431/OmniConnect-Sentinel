@@ -8,15 +8,13 @@ on:
 
 permissions:
   contents: read
-  id-token: write
-  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test-and-verify:
-    name: Test Matrix, Clippy & Fuzz Corpus Regression
+    name: Test Matrix, Clippy, Invariant Gates & Fuzz Regression
     strategy:
       fail-fast: false
       matrix:
@@ -24,48 +22,132 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy, rustfmt
 
       - name: Install qpdf output oracle and Linux build prerequisites
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y qpdf libfuse3-dev pkg-config protobuf-compiler
+        run: |
+          sudo apt-get update && sudo apt-get install -y qpdf libfuse3-dev pkg-config protobuf-compiler
+          # Ubuntu 24.04 AppArmor restricts unprivileged userns by default; allow real CLONE_NEWUSER|CLONE_NEWNET|CLONE_NEWIPC verification in CI
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Clippy strict lint gate (no unwrap/expect in production crates)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Strict Invariant Gate - Zero unapproved allow() bypasses
+        shell: bash
+        run: |
+          if git grep -n "allow(" crates/ | grep -v "cold_eye" | grep -v "#!\[allow(unused_imports, unused_variables)\]"; then
+            echo "ERROR: Unapproved allow() compiler bypass detected in production crates!"
+            exit 1
+          fi
 
-      - name: Execute full test pyramid (unit, property, invariant I1-I5, output oracles, chaos)
-        run: cargo test --workspace -- --nocapture
+      - name: Strict Invariant Gate - Zero thread_rng() calls in workspace crates
+        shell: bash
+        run: |
+          if git grep -n "thread_rng" crates/; then
+            echo "ERROR: Disallowed thread_rng() detected in crates! Use cryptographically secure OsRng."
+            exit 1
+          fi
+
+      - name: Strict Invariant Gate - Verify .dep-v0 parser self-test
+        run: python3 tests/verify_auditable_dep_v0.py --self-test
+        if: runner.os == 'Linux'
+
+      - name: Strict Invariant Gate - Verify .dep-v0 parser self-test (Windows)
+        run: python tests/verify_auditable_dep_v0.py --self-test
+        if: runner.os == 'Windows'
+
+      - name: Clippy strict lint gate (no unwrap/expect in production crates)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Execute full test pyramid (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --workspace --bins --locked
+          cargo test --workspace --locked --no-fail-fast -- --nocapture 2>&1 | tee ci-test.log
+
+      - name: Execute full test pyramid (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cargo build --workspace --bins --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --workspace --locked --no-fail-fast -- --nocapture 2>&1 | Tee-Object -FilePath ci-test.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Emit structured test failure annotations
+        if: failure()
+        shell: bash
+        run: |
+          PY="$(command -v python3 || command -v python)"
+          "$PY" - <<'PYEOF'
+          import os, re, pathlib
+          p = pathlib.Path("ci-test.log")
+          if not p.exists():
+              print("::error title=Test Log Missing::ci-test.log was not created (cargo build or earlier step failed)")
+              raise SystemExit(0)
+          lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+          def esc(s):
+              return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          blocks = []
+          i = 0
+          while i < len(lines):
+              if (lines[i].startswith("---- ") and lines[i].endswith(" stdout ----")) or ("panicked at" in lines[i]):
+                  buf = [lines[i]]
+                  i += 1
+                  while i < len(lines) and not (lines[i].startswith("---- ") and lines[i].endswith(" stdout ----")) and lines[i] != "failures:" and "panicked at" not in lines[i]:
+                      if lines[i].strip():
+                          buf.append(lines[i])
+                      if len(buf) >= 8:
+                          break
+                      i += 1
+                  blocks.append("\n".join(buf))
+                  continue
+              i += 1
+          failed_summary = [l for l in lines if re.search(r"(^test .* FAILED$|^error:|test result: FAILED)", l)]
+          if failed_summary:
+              print("::error title=Failed Tests Summary::" + esc("\n".join(failed_summary[:40])))
+          for idx, blk in enumerate(blocks[:6], 1):
+              print(f"::error title=Failure Detail {idx}::" + esc(blk[:1800]))
+          if not failed_summary and not blocks:
+              print("::error title=Test Tail::" + esc("\n".join(lines[-30:])[:2500]))
+          PYEOF
 
   supply-chain-and-sbom:
-    name: Supply-Chain Gate (cargo-deny, cargo-audit, cargo-machete, CycloneDX SBOM, SLSA)
+    name: Linux Supply-Chain Gate (cargo-deny, cargo-audit, cargo-machete, Trivy, CycloneDX SBOM, Auditable ELF .dep-v0, SLSA)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Install Linux build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y pkg-config protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y pkg-config protobuf-compiler binutils
 
       - name: Run cargo-deny (advisories, licenses, bans, sources)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
         with:
           command: check advisories licenses bans sources
 
-      - name: Install prebuilt supply-chain security tools (cargo-audit, cargo-machete, cargo-cyclonedx)
-        uses: taiki-e/install-action@v2
+      - name: Install prebuilt supply-chain security tools (cargo-audit, cargo-machete, cargo-cyclonedx, cargo-auditable)
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
         with:
-          tool: cargo-audit,cargo-machete,cargo-cyclonedx
+          tool: cargo-audit,cargo-machete,cargo-cyclonedx,cargo-auditable
 
       - name: Run cargo-audit (RustSec advisory database with zero-ignore policy)
         run: cargo audit --deny yanked
@@ -85,12 +167,41 @@ jobs:
           fi
           test -f sbom.cdx.json
 
-      - name: Build release binaries for SLSA provenance & signing
-        run: cargo build --workspace --release --locked
+      - name: Run Trivy Vulnerability & Secret Scanner (Filesystem)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
 
-      - name: Attest SLSA Build Provenance & CycloneDX SBOM
+      - name: Run Trivy Scanner on CycloneDX SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'sbom'
+          scan-ref: 'sbom.cdx.json'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Build auditable Linux ELF release binaries and verify .dep-v0 section (CSE-29)
+        run: |
+          cargo auditable build --workspace --release --locked
+          for bin in target/release/sentinel target/release/sentinel-agent target/release/sentinel-cdr-daemon target/release/sentinel-cdr-worker; do
+            test -f "$bin"
+            readelf -S "$bin" | grep -q '\.dep-v0'
+          done
+          python3 tests/verify_auditable_dep_v0.py \
+            target/release/sentinel \
+            target/release/sentinel-agent \
+            target/release/sentinel-cdr-daemon \
+            target/release/sentinel-cdr-worker
+
+      - name: Attest SLSA Build Provenance & CycloneDX SBOM (Linux)
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             target/release/sentinel
@@ -98,3 +209,85 @@ jobs:
             target/release/sentinel-cdr-daemon
             target/release/sentinel-cdr-worker
             sbom.cdx.json
+            sentinel-cbom.cdx.json
+
+  windows-auditable-release:
+    name: Windows Auditable PE Release Gate (.dep-v0 Verification & SLSA Provenance)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
+        with:
+          tool: cargo-auditable
+
+      - name: Build auditable Windows PE release binaries and verify .dep-v0 section (CSE-29)
+        shell: pwsh
+        run: |
+          cargo auditable build --workspace --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bins = @(
+            "target/release/sentinel.exe",
+            "target/release/sentinel-agent.exe",
+            "target/release/sentinel-cdr-daemon.exe",
+            "target/release/sentinel-cdr-worker.exe"
+          )
+          foreach ($bin in $bins) {
+            if (-not (Test-Path $bin)) { throw "Missing Windows release binary: $bin" }
+          }
+          python tests/verify_auditable_dep_v0.py @bins
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Attest SLSA Build Provenance (Windows PE Release Binaries)
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            target/release/sentinel.exe
+            target/release/sentinel-agent.exe
+            target/release/sentinel-cdr-daemon.exe
+            target/release/sentinel-cdr-worker.exe
+            sentinel-cbom.cdx.json
+
+  anti-forensic-shred-oracle:
+    name: Out-of-Band Anti-Forensic Loopback Shred Oracle (ext4 16 MiB & FAT32 36 MiB)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Install loopback filesystem oracle prerequisites (dosfstools, e2fsprogs, binutils)
+        run: sudo apt-get update && sudo apt-get install -y dosfstools e2fsprogs binutils pkg-config protobuf-compiler libfuse3-dev
+
+      - name: Build release sentinel CLI binary
+        run: cargo build -p sentinel-cli --bin sentinel --release --locked
+
+      - name: Execute CI-only loopback shred verification oracle (0 residual canary matches)
+        shell: bash
+        run: |
+          set -o pipefail
+          bash tests/ci_shred_verify_oracle.sh --bin target/release/sentinel 2>&1 | tee ci-shred-oracle.log
+
+      - name: Emit shred oracle failure annotation
+        if: failure()
+        shell: bash
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib
+          p = pathlib.Path("ci-shred-oracle.log")
+          txt = p.read_text(encoding="utf-8", errors="replace") if p.exists() else "ci-shred-oracle.log missing"
+          esc = txt[-3000:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error title=Shred Oracle Output::" + esc)
+          PYEOF

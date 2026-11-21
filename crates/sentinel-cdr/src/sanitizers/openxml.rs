@@ -1,13 +1,16 @@
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 use quick_xml::{Reader, Writer};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use crate::engine::DetectedFormat;
 use crate::error::CdrError;
 use crate::policy::{ResourceBudget, SanitizationPolicy};
-use crate::sanitizers::DisarmReportItem;
+use crate::sanitizers::{
+    resolve_allowed_xml_general_ref, unescape_xml_attribute_value, DisarmReportItem,
+};
 
 pub const MAX_ZIP_ENTRIES: usize = 4_096;
 
@@ -194,6 +197,17 @@ impl OpenXmlSanitizer {
 
             budget.charge_bytes(entry_bytes.len() as u64)?;
 
+            // CSE-19: Enforce allowlist-only binary parts inside OOXML containers and strip
+            // prohibited binary/script/metafile parts (`.wmf`, `.emf`, `.bin`, `.exe`, `.ps1`,
+            // `.ole`, `.activex`) even when generic ZIP nesting is enabled.
+            if let Some((element_type, action_taken)) =
+                Self::classify_disallowed_binary_part(&name, &entry_bytes, is_generic_zip, policy)
+            {
+                stripped_parts.insert(Self::normalize_part_key(&name));
+                report.push(DisarmReportItem::new(element_type, name, action_taken));
+                continue;
+            }
+
             let method = match file.compression() {
                 CompressionMethod::Stored => CompressionMethod::Stored,
                 _ => CompressionMethod::Deflated,
@@ -202,21 +216,24 @@ impl OpenXmlSanitizer {
             raw_entries.push((name, method, entry_bytes));
         }
 
-        // Pass 2a: Rewrite all *.rels parts first so we collect every removed Relationship `Id`
-        // (e.g., `rId5`) before rewriting content XML parts (`Row 115`, `SP4.1-06`).
-        let mut removed_rel_ids: HashSet<String> = HashSet::new();
+        // Pass 2a: Rewrite all *.rels parts first, collecting removed Relationship `Id`s strictly
+        // scoped by their owning part path (`CSE-19`: e.g. `xl/worksheets/_rels/sheet1.xml.rels`
+        // -> `xl/worksheets/sheet1.xml`) so stripping `rId1` in one part never breaks `rId1` elsewhere.
+        let mut removed_rel_ids_by_part: HashMap<String, HashSet<String>> = HashMap::new();
         if !is_generic_zip {
             for (name, _method, entry_bytes) in &mut raw_entries {
                 if name.ends_with('/') {
                     continue;
                 }
                 if name.to_ascii_lowercase().ends_with(".rels") {
+                    let owner_key = Self::owner_part_for_rels(name).unwrap_or_default();
+                    let scoped_removed = removed_rel_ids_by_part.entry(owner_key).or_default();
                     *entry_bytes = Self::rewrite_rels_xml(
                         entry_bytes,
                         name,
                         &stripped_parts,
                         policy,
-                        &mut removed_rel_ids,
+                        scoped_removed,
                         &mut report,
                     )?;
                 }
@@ -225,6 +242,7 @@ impl OpenXmlSanitizer {
 
         // Pass 2b: Rewrite XML parts ([Content_Types].xml, document/sheet/slide XML)
         // and recursively sanitize nested files when present.
+        let empty_removed_rels: HashSet<String> = HashSet::new();
         let mut out_buf = Cursor::new(Vec::with_capacity(input_bytes.len()));
         {
             let mut zip_writer = ZipWriter::new(&mut out_buf);
@@ -253,17 +271,21 @@ impl OpenXmlSanitizer {
                         &name,
                     )?;
                 } else if !is_generic_zip && lower_name.ends_with(".rels") {
-                    // Already rewritten in Pass 2a while collecting `removed_rel_ids`
+                    // Already rewritten in Pass 2a while collecting per-part `removed_rel_ids_by_part`
                 } else if !is_generic_zip && lower_name.ends_with(".xml") {
+                    let part_key = Self::normalize_part_key(&name);
+                    let part_removed_rels = removed_rel_ids_by_part
+                        .get(&part_key)
+                        .unwrap_or(&empty_removed_rels);
                     if policy.strip_office_dde
                         || policy.sanitize_office_external_relationships
-                        || !removed_rel_ids.is_empty()
+                        || !part_removed_rels.is_empty()
                     {
                         entry_bytes = Self::sanitize_office_xml_dde_and_dangling_rels(
                             &entry_bytes,
                             &name,
                             policy,
-                            &removed_rel_ids,
+                            part_removed_rels,
                             &mut report,
                         )?;
                     }
@@ -349,6 +371,261 @@ impl OpenXmlSanitizer {
 
     fn normalize_part_key(path: &str) -> String {
         path.trim_start_matches('/').to_ascii_lowercase()
+    }
+
+    /// Derives the normalized owning part path for an OOXML `.rels` file (`CSE-19`):
+    /// - `_rels/.rels` -> `Some("")` (package root)
+    /// - `word/_rels/document.xml.rels` -> `Some("word/document.xml")`
+    /// - `xl/worksheets/_rels/sheet1.xml.rels` -> `Some("xl/worksheets/sheet1.xml")`
+    /// - `_rels/foo.xml.rels` -> `Some("foo.xml")`
+    pub fn owner_part_for_rels(rels_path: &str) -> Option<String> {
+        let norm = Self::normalize_part_key(rels_path);
+        if norm == "_rels/.rels" {
+            return Some(String::new());
+        }
+        let stem = norm.strip_suffix(".rels")?;
+        if let Some(idx) = stem.rfind("/_rels/") {
+            let dir = &stem[..idx];
+            let file = &stem[idx + "/_rels/".len()..];
+            if file.is_empty() {
+                return Some(String::new());
+            }
+            Some(format!("{dir}/{file}"))
+        } else {
+            stem.strip_prefix("_rels/").map(|file| file.to_string())
+        }
+    }
+
+    /// Returns `true` strictly for benign Office `printerSettings<digits>.bin` parts under
+    /// `word|xl|ppt/printersettings/` whose payload does NOT carry executable, OLE2, archive,
+    /// script, or Windows metafile magic bytes (`BUG-CDR-04` + `CSE-19`).
+    pub fn is_benign_printer_settings_bin(lower_path: &str, bytes: &[u8]) -> bool {
+        let norm = lower_path.trim_start_matches('/');
+        let rest = norm
+            .strip_prefix("word/printersettings/")
+            .or_else(|| norm.strip_prefix("xl/printersettings/"))
+            .or_else(|| norm.strip_prefix("ppt/printersettings/"));
+        let Some(file_name) = rest else {
+            return false;
+        };
+        let Some(digits) = file_name
+            .strip_prefix("printersettings")
+            .and_then(|s| s.strip_suffix(".bin"))
+        else {
+            return false;
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        !Self::has_prohibited_binary_magic(bytes) && !bytes.starts_with(b"PK\x03\x04")
+    }
+
+    fn has_prohibited_binary_magic(bytes: &[u8]) -> bool {
+        bytes.starts_with(b"MZ")
+            || bytes.starts_with(b"\x7fELF")
+            || bytes.starts_with(b"#!")
+            || bytes.starts_with(&[0xD7, 0xCD, 0xC6, 0x9A]) // Aldus Placeable WMF
+            || (bytes.len() >= 6
+                && bytes[0..4] == [0x01, 0x00, 0x09, 0x00]
+                && (bytes[4..6] == [0x00, 0x03] || bytes[4..6] == [0x00, 0x01])) // Standard WMF
+            || (bytes.len() >= 44
+                && bytes[0..4] == [0x01, 0x00, 0x00, 0x00]
+                && &bytes[40..44] == b" EMF") // EMF
+            || (bytes.len() >= 8 && bytes[..8] == crate::sanitizers::ole2::OLE2_MAGIC)
+            || bytes.starts_with(&[0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00])
+        // LNK
+    }
+
+    pub fn has_prohibited_part_extension(lower_path: &str) -> bool {
+        const PROHIBITED_EXTS: &[&str] = &[
+            ".wmf", ".emf", ".wmz", ".emz", ".exe", ".dll", ".scr", ".com", ".bat", ".cmd", ".vbs",
+            ".vbe", ".js", ".jse", ".wsf", ".wsh", ".ps1", ".psm1", ".psd1", ".msi", ".msp",
+            ".hta", ".lnk", ".jar", ".class", ".sh", ".elf", ".so", ".dylib", ".ole", ".activex",
+            ".ocx", ".cab", ".swf", ".xap",
+        ];
+        PROHIBITED_EXTS.iter().any(|ext| lower_path.ends_with(ext))
+    }
+
+    fn is_allowlisted_ooxml_static_asset(lower_path: &str, bytes: &[u8]) -> bool {
+        let in_media = lower_path.starts_with("word/media/")
+            || lower_path.starts_with("xl/media/")
+            || lower_path.starts_with("ppt/media/");
+        let is_safe_raster = lower_path.ends_with(".bmp")
+            || lower_path.ends_with(".gif")
+            || lower_path.ends_with(".tif")
+            || lower_path.ends_with(".tiff");
+        let in_fonts = lower_path.starts_with("word/fonts/")
+            || lower_path.starts_with("xl/fonts/")
+            || lower_path.starts_with("ppt/fonts/");
+        let is_safe_font = lower_path.ends_with(".ttf")
+            || lower_path.ends_with(".otf")
+            || lower_path.ends_with(".woff")
+            || lower_path.ends_with(".woff2");
+        ((in_media && is_safe_raster) || (in_fonts && is_safe_font))
+            && !Self::has_prohibited_binary_magic(bytes)
+    }
+
+    /// Enforces allowlist-only binary parts inside OOXML packages and strips prohibited binary,
+    /// script, and metafile parts (`.wmf`, `.emf`, `.bin`, `.exe`, `.ps1`, `.ole`, `.activex`)
+    /// in both OOXML and generic ZIP containers (`CSE-19`).
+    pub fn classify_disallowed_binary_part(
+        name: &str,
+        bytes: &[u8],
+        is_generic_zip: bool,
+        policy: &SanitizationPolicy,
+    ) -> Option<(&'static str, &'static str)> {
+        let lower = Self::normalize_part_key(name);
+
+        if Self::has_prohibited_part_extension(&lower) {
+            return Some((
+                if is_generic_zip {
+                    "DISALLOWED_ARCHIVE_BINARY_PART"
+                } else {
+                    "DISALLOWED_OOXML_BINARY_PART"
+                },
+                "Stripped prohibited binary, script, ActiveX/OLE, or metafile part",
+            ));
+        }
+
+        if lower.ends_with(".bin") {
+            if !is_generic_zip && Self::is_benign_printer_settings_bin(&lower, bytes) {
+                return None;
+            }
+            return Some((
+                if is_generic_zip {
+                    "DISALLOWED_ARCHIVE_BINARY_PART"
+                } else {
+                    "DISALLOWED_OOXML_BINARY_PART"
+                },
+                "Stripped non-allowlisted .bin binary part from container",
+            ));
+        }
+
+        let is_xml_or_rels =
+            lower == "[content_types].xml" || lower.ends_with(".rels") || lower.ends_with(".xml");
+        if is_xml_or_rels && !is_generic_zip {
+            return None;
+        }
+
+        // Allow policy-opted OLE2 only when explicitly enabled in generic ZIPs
+        let is_ole2_magic = bytes.len() >= 8 && bytes[..8] == crate::sanitizers::ole2::OLE2_MAGIC;
+        if Self::has_prohibited_binary_magic(bytes)
+            && !(is_generic_zip && is_ole2_magic && policy.allow_legacy_ole2)
+        {
+            return Some((
+                if is_generic_zip {
+                    "DISALLOWED_ARCHIVE_BINARY_PART"
+                } else {
+                    "DISALLOWED_OOXML_BINARY_PART"
+                },
+                "Stripped binary part carrying prohibited executable/OLE2/metafile magic bytes",
+            ));
+        }
+
+        if !is_generic_zip {
+            // Strict OOXML part allowlist: XML/rels (handled above), benign printerSettings.bin
+            // (handled above), allowlisted static media/fonts, or nested sanitizable files.
+            if !Self::is_nested_sanitizable(&lower, bytes)
+                && !Self::is_allowlisted_ooxml_static_asset(&lower, bytes)
+            {
+                return Some((
+                    "DISALLOWED_OOXML_BINARY_PART",
+                    "Stripped non-allowlisted binary part from OOXML package",
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// Strict URI allowlist validator for OOXML `<Relationship Target="...">` values (`CSE-19`).
+    /// Must be called ONLY on XML-unescaped strings (after `unescape_xml_attribute_value`).
+    /// Allows strictly `https://`, `http://`, `mailto:`, `#` fragments, and (when internal)
+    /// safe relative intra-package paths. Blocks `file:`, `smb:`, `mhtml:`, `search-ms:`,
+    /// `ms-appinstaller:`, `ms-msdt:`, `javascript:`, `vbscript:`, `data:`, UNC paths, and
+    /// obfuscated whitespace/control prefixes.
+    pub fn is_allowed_ooxml_relationship_target(
+        decoded_target: &str,
+        is_external_mode: bool,
+    ) -> bool {
+        if decoded_target.is_empty() {
+            return false;
+        }
+        // Reject any ASCII control character (including NUL, tab, CR, LF) used for scheme obfuscation
+        if decoded_target.bytes().any(|b| b <= 0x1F || b == 0x7F) {
+            return false;
+        }
+        let trimmed = decoded_target.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if trimmed.contains('\\') || trimmed.starts_with("//") {
+            return false;
+        }
+        if trimmed.starts_with('#') {
+            return true;
+        }
+
+        // Check for a URI scheme (`:` occurring before the first `/`, `?`, or `#`).
+        // Per ECMA-376 Part 2 §9.3.2, explicit URI schemes are ONLY valid when
+        // `TargetMode="External"`; omitting `TargetMode` on an external URL (e.g.
+        // `<Relationship Type=".../attachedTemplate" Target="https://evil.example/a.dotm"/>`)
+        // MUST be rejected.
+        let scheme_end = trimmed.find(':');
+        let first_delim = trimmed.find(['/', '?', '#']).unwrap_or(trimmed.len());
+        if let Some(colon_idx) = scheme_end {
+            if colon_idx < first_delim {
+                if !is_external_mode {
+                    return false;
+                }
+                let scheme = trimmed[..colon_idx].to_ascii_lowercase();
+                return match scheme.as_str() {
+                    "https" => {
+                        trimmed[colon_idx + 1..].starts_with("//") && trimmed.len() > colon_idx + 3
+                    }
+                    "http" => {
+                        trimmed[colon_idx + 1..].starts_with("//") && trimmed.len() > colon_idx + 3
+                    }
+                    "mailto" => !trimmed[colon_idx + 1..].trim().is_empty(),
+                    _ => false,
+                };
+            }
+        }
+
+        // No explicit URI scheme: only permitted for internal intra-package relative paths
+        !is_external_mode
+    }
+
+    /// Derives the safe macro-free file extension (`"xlsx" | "docx" | "pptx"`) whenever macros
+    /// or macro-enabled ContentTypes were stripped from an Office container (`CSE-19`).
+    pub fn derive_recommended_extension(
+        format: DetectedFormat,
+        file_name: &str,
+        disarm_report: &[DisarmReportItem],
+    ) -> Option<String> {
+        let stripped_macro = disarm_report.iter().any(|item| {
+            item.element_type == "MACRO_ENABLED_CONTENT_TYPE"
+                || item.element_type == "VBA_MACRO_PROJECT"
+        });
+        if !stripped_macro {
+            return None;
+        }
+        let lower_name = file_name.to_ascii_lowercase();
+        match format {
+            DetectedFormat::Xlsx => Some("xlsx".to_string()),
+            DetectedFormat::Docx => Some("docx".to_string()),
+            DetectedFormat::Pptx => Some("pptx".to_string()),
+            _ if lower_name.ends_with(".xlsm") || lower_name.ends_with(".xltm") => {
+                Some("xlsx".to_string())
+            }
+            _ if lower_name.ends_with(".docm") || lower_name.ends_with(".dotm") => {
+                Some("docx".to_string())
+            }
+            _ if lower_name.ends_with(".pptm") || lower_name.ends_with(".potm") => {
+                Some("pptx".to_string())
+            }
+            _ => None,
+        }
     }
 
     fn resolve_rel_target(rels_path: &str, target: &str) -> String {
@@ -451,7 +728,7 @@ impl OpenXmlSanitizer {
                                 let mut content_type = String::new();
                                 for attr in &validated_attrs {
                                     let k = attr.key.local_name().into_inner().to_ascii_lowercase();
-                                    let v = attr.value.as_ref().to_string();
+                                    let v = unescape_xml_attribute_value(attr)?;
                                     if k == "partname" {
                                         part_name = v;
                                     } else if k == "contenttype" {
@@ -490,8 +767,11 @@ impl OpenXmlSanitizer {
                                             clean_elem
                                                 .push_attribute((key_str.as_str(), replaced_ct));
                                         } else {
-                                            let val_str = attr.value.as_ref();
-                                            clean_elem.push_attribute((key_str.as_str(), val_str));
+                                            let val_str = unescape_xml_attribute_value(attr)?;
+                                            clean_elem.push_attribute((
+                                                key_str.as_str(),
+                                                val_str.as_str(),
+                                            ));
                                         }
                                     }
                                     report.push(DisarmReportItem::new(
@@ -647,7 +927,7 @@ impl OpenXmlSanitizer {
 
                                 for attr in &validated_attrs {
                                     let k = attr.key.local_name().into_inner().to_ascii_lowercase();
-                                    let v = attr.value.as_ref().to_string();
+                                    let v = unescape_xml_attribute_value(attr)?;
                                     if k == "id" {
                                         rel_id = v;
                                     } else if k == "target" {
@@ -663,7 +943,7 @@ impl OpenXmlSanitizer {
                                 let rel_type_lower = rel_type.to_ascii_lowercase();
                                 let target_lower = target.trim().to_ascii_lowercase();
 
-                                // 1. Drop relationships pointing to stripped macro/OLE parts
+                                // 1. Drop relationships pointing to stripped macro/OLE/disallowed binary parts
                                 let is_stripped_target = stripped_parts.contains(&resolved_target)
                                     || (policy.strip_office_macros
                                         && (rel_type_lower.contains("vbaproject")
@@ -692,24 +972,22 @@ impl OpenXmlSanitizer {
                                     continue;
                                 }
 
-                                // 2. Drop external relationships (`TargetMode="External"` case-insensitive) on
-                                //    templates, framesets, OLE, packages, subdocuments, slideMasters, externalWorkbooks,
-                                //    or dangerous URI schemes, while preserving benign external hyperlinks (`Row 115`, `EV-04`, `BUG-CDR-04`).
+                                // 2. Enforce strict URI scheme allowlist after XML entity decoding (`CSE-19`):
+                                //    Only `https://`, `http://`, `mailto:`, `#`, and (for internal rels)
+                                //    relative intra-package paths are permitted. External relationships are
+                                //    retained ONLY for allowlisted benign hyperlinks when policy allows.
                                 let is_external_mode =
                                     target_mode.trim().eq_ignore_ascii_case("external");
-                                let has_dangerous_scheme = target_lower.starts_with("ms-msdt:")
-                                    || target_lower.starts_with("javascript:")
-                                    || target_lower.starts_with("vbscript:")
-                                    || target_lower.starts_with("mhtml:")
-                                    || target_lower.starts_with("file:")
-                                    || target_lower.starts_with("data:")
-                                    || target_lower.starts_with("\\\\");
+                                let target_allowed = Self::is_allowed_ooxml_relationship_target(
+                                    &target,
+                                    is_external_mode,
+                                );
                                 let is_benign_hyperlink = rel_type_lower.ends_with("/hyperlink")
-                                    && !has_dangerous_scheme
+                                    && target_allowed
                                     && !policy.strip_external_hyperlinks;
 
                                 if policy.sanitize_office_external_relationships
-                                    && (has_dangerous_scheme
+                                    && (!target_allowed
                                         || (is_external_mode && !is_benign_hyperlink))
                                 {
                                     if !rel_id.is_empty() {
@@ -719,7 +997,7 @@ impl OpenXmlSanitizer {
                                         "EXTERNAL_RELATIONSHIP_INJECTION",
                                         rels_path.to_string(),
                                         format!(
-                                            "Removed external <Relationship> targeting '{target}'"
+                                            "Removed disallowed or external <Relationship> targeting '{target}'"
                                         ),
                                     ));
                                     if !is_empty {
@@ -791,11 +1069,197 @@ impl OpenXmlSanitizer {
         )
     }
 
+    fn contains_dangerous_field_instruction(text: &str) -> bool {
+        let upper = text.to_ascii_uppercase();
+        if upper.contains("DDEAUTO")
+            || upper.contains("INCLUDETEXT")
+            || upper.contains("INCLUDEPICTURE")
+            || upper.contains("CMD|")
+            || upper.contains("POWERSHELL")
+        {
+            return true;
+        }
+        Self::contains_word_bounded_dde(&upper)
+    }
+
+    fn contains_word_bounded_dde(upper: &str) -> bool {
+        let bytes = upper.as_bytes();
+        let mut idx = 0usize;
+        while idx + 3 <= bytes.len() {
+            if &bytes[idx..idx + 3] == b"DDE" {
+                let prev_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+                let next_ok = idx + 3 == bytes.len()
+                    || matches!(
+                        bytes[idx + 3],
+                        b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b'\\'
+                    );
+                if prev_ok && next_ok {
+                    return true;
+                }
+            }
+            idx += 1;
+        }
+        false
+    }
+
+    /// Scans OOXML content XML once to concatenate adjacent `<w:instrText>` and `<w:t>`/`<a:t>`/`<t>`/`<f>`
+    /// runs (including resolved XML character entities such as `&#68;DEAUTO`) across XML element
+    /// boundaries, returning the set of event ordinals belonging to neutralized split-run DDE or
+    /// field-code payloads (`DDEAUTO`, `DDE`, `INCLUDETEXT`, `INCLUDEPICTURE`, `CMD|`) (`CSE-19`).
+    fn detect_split_run_dde_event_ordinals(xml_bytes: &[u8]) -> Result<HashSet<usize>, CdrError> {
+        let mut reader = Reader::from_reader(xml_bytes);
+        let mut buf = Vec::new();
+        let mut flagged: HashSet<usize> = HashSet::new();
+        let mut event_ordinal: usize = 0;
+
+        let mut instr_depth: usize = 0;
+        let mut text_depth: usize = 0;
+        let mut instr_runs: Vec<(usize, String)> = Vec::new();
+        let mut text_runs: Vec<(usize, String)> = Vec::new();
+
+        let flush_runs = |runs: &mut Vec<(usize, String)>, flagged: &mut HashSet<usize>| {
+            if runs.is_empty() {
+                return;
+            }
+            let mut combined = String::new();
+            for (_, seg) in runs.iter() {
+                combined.push_str(seg);
+            }
+            if Self::contains_dangerous_field_instruction(&combined) {
+                for (ord, _) in runs.iter() {
+                    flagged.insert(*ord);
+                }
+            }
+            runs.clear();
+        };
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Eof) => break,
+                Ok(event) => {
+                    let ord = event_ordinal;
+                    event_ordinal += 1;
+
+                    match event {
+                        Event::Start(ref e) => {
+                            let local = e.name().local_name().into_inner().to_ascii_lowercase();
+                            if local == "instrtext" {
+                                instr_depth += 1;
+                            } else if matches!(local.as_str(), "t" | "f") {
+                                text_depth += 1;
+                            } else if matches!(local.as_str(), "p" | "si" | "c") {
+                                flush_runs(&mut instr_runs, &mut flagged);
+                                flush_runs(&mut text_runs, &mut flagged);
+                            }
+                        }
+                        Event::Empty(ref e) => {
+                            let local = e.name().local_name().into_inner().to_ascii_lowercase();
+                            if local == "fldchar" {
+                                // Field boundary (`begin` / `separate` / `end`) flushes accumulated instrText runs
+                                flush_runs(&mut instr_runs, &mut flagged);
+                            }
+                        }
+                        Event::End(ref e) => {
+                            let local = e.name().local_name().into_inner().to_ascii_lowercase();
+                            if local == "instrtext" {
+                                instr_depth = instr_depth.saturating_sub(1);
+                            } else if matches!(local.as_str(), "t" | "f") {
+                                text_depth = text_depth.saturating_sub(1);
+                            } else if matches!(local.as_str(), "p" | "si" | "c" | "fldchar") {
+                                flush_runs(&mut instr_runs, &mut flagged);
+                                flush_runs(&mut text_runs, &mut flagged);
+                            }
+                        }
+                        Event::Text(ref t) => {
+                            let seg = t.as_ref().to_string();
+                            if instr_depth > 0 {
+                                instr_runs.push((ord, seg));
+                            } else if text_depth > 0 {
+                                text_runs.push((ord, seg));
+                            }
+                        }
+                        Event::CData(ref c) => {
+                            let seg = c.as_ref().to_string();
+                            if instr_depth > 0 {
+                                instr_runs.push((ord, seg));
+                            } else if text_depth > 0 {
+                                text_runs.push((ord, seg));
+                            }
+                        }
+                        Event::GeneralRef(ref g) => {
+                            if let Some(resolved) =
+                                resolve_allowed_xml_general_ref(g.as_ref().as_bytes())
+                            {
+                                if instr_depth > 0 {
+                                    instr_runs.push((ord, resolved));
+                                } else if text_depth > 0 {
+                                    text_runs.push((ord, resolved));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    return Err(CdrError::ParserCorruption(format!(
+                        "Malformed OOXML content during split-run DDE scan: {e}"
+                    )));
+                }
+            }
+            buf.clear();
+        }
+
+        flush_runs(&mut instr_runs, &mut flagged);
+        flush_runs(&mut text_runs, &mut flagged);
+
+        Ok(flagged)
+    }
+
+    /// Post-CDR verification helper detecting residual split-run or attribute DDE/field codes (`CSE-19`).
+    pub fn has_residual_dde_or_field_code(xml_bytes: &[u8]) -> Result<bool, CdrError> {
+        if !Self::detect_split_run_dde_event_ordinals(xml_bytes)?.is_empty() {
+            return Ok(true);
+        }
+        let mut reader = Reader::from_reader(xml_bytes);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Eof) => break,
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                    let local = e.name().local_name().into_inner().to_ascii_lowercase();
+                    if local == "ddelink" || local == "ddeitem" || local == "olelink" {
+                        return Ok(true);
+                    }
+                    let attrs = crate::sanitizers::collect_validated_xml_attributes(e)?;
+                    for attr in attrs {
+                        let key_lower = attr.key.as_ref().to_ascii_lowercase();
+                        let val_str = unescape_xml_attribute_value(&attr)?;
+                        if key_lower.contains("ddeservice")
+                            || key_lower.contains("ddetopic")
+                            || Self::contains_dangerous_field_instruction(&val_str)
+                        {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(CdrError::ParserCorruption(format!(
+                        "Malformed OOXML content during DDE verification: {e}"
+                    )));
+                }
+            }
+            buf.clear();
+        }
+        Ok(false)
+    }
+
     /// Rewrites OOXML content XML parts to:
-    /// 1. Strip `<ddeLink>`, `ddeService`, `ddeTopic`, `DDEAUTO`/`DDE` fields, `=cmd|` formulas,
-    ///    and `<!DOCTYPE>` declarations when `policy.strip_office_dde` is true (`Row 118`).
+    /// 1. Strip `<ddeLink>`, `ddeService`, `ddeTopic`, split-run & inline `DDEAUTO`/`DDE`/
+    ///    `INCLUDETEXT`/`INCLUDEPICTURE` fields, `=cmd|` formulas, and `<!DOCTYPE>` declarations
+    ///    when `policy.strip_office_dde` is true (`Row 118`, `CSE-19`).
     /// 2. Strip dangling `r:id` / `r:embed` / `r:link` / `id` hyperlink and relationship attributes
-    ///    that reference any `<Relationship>` removed during `.rels` sanitization (`Row 115`, `SP4.1-06`).
+    ///    that reference any `<Relationship>` removed from THIS part's `.rels` (`Row 115`, `CSE-19`).
     /// 3. Fail closed (`Err(CdrError::ParserCorruption)`) on invalid UTF-8 or malformed XML.
     fn sanitize_office_xml_dde_and_dangling_rels(
         xml_bytes: &[u8],
@@ -808,25 +1272,36 @@ impl OpenXmlSanitizer {
             CdrError::ParserCorruption(format!("Invalid UTF-8 in OOXML part {xml_path}: {e}"))
         })?;
 
+        let flagged_split_ordinals = if policy.strip_office_dde {
+            Self::detect_split_run_dde_event_ordinals(xml_bytes)?
+        } else {
+            HashSet::new()
+        };
+
         let mut reader = Reader::from_reader(xml_bytes);
         let mut writer = Writer::new(Vec::with_capacity(xml_bytes.len()));
         let mut buf = Vec::new();
         let mut skip_depth = 0usize;
         let mut xml_depth = 0usize;
+        let mut event_ordinal: usize = 0;
 
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Eof) => break,
-                Ok(Event::DocType(_)) => {
-                    report.push(DisarmReportItem::new(
-                        "OOXML_DOCTYPE_DECLARATION",
-                        xml_path.to_string(),
-                        "Removed DOCTYPE/ENTITY declaration from OOXML part",
-                    ));
-                    buf.clear();
-                    continue;
-                }
                 Ok(event) => {
+                    let ord = event_ordinal;
+                    event_ordinal += 1;
+
+                    if matches!(event, Event::DocType(_)) {
+                        report.push(DisarmReportItem::new(
+                            "OOXML_DOCTYPE_DECLARATION",
+                            xml_path.to_string(),
+                            "Removed DOCTYPE/ENTITY declaration from OOXML part",
+                        ));
+                        buf.clear();
+                        continue;
+                    }
+
                     match event {
                         Event::Start(_) => {
                             xml_depth += 1;
@@ -892,11 +1367,10 @@ impl OpenXmlSanitizer {
                                 let key_lower = key_str.to_ascii_lowercase();
                                 let local_key =
                                     attr.key.local_name().into_inner().to_ascii_lowercase();
-                                let val_str = attr.value.into_owned();
-                                let val_upper = val_str.to_ascii_uppercase();
+                                let val_str = unescape_xml_attribute_value(&attr)?;
 
                                 // Strip dangling `r:id` / `r:embed` / `r:link` / `id` attributes whose
-                                // target `<Relationship>` was removed from `.rels` (`Row 115`, `SP4.1-06`).
+                                // target `<Relationship>` was removed from THIS part's `.rels` (`CSE-19`).
                                 let is_rel_ref_attr = key_lower == "r:id"
                                     || key_lower == "r:embed"
                                     || key_lower == "r:link"
@@ -915,10 +1389,7 @@ impl OpenXmlSanitizer {
                                 if policy.strip_office_dde
                                     && (key_lower.contains("ddeservice")
                                         || key_lower.contains("ddetopic")
-                                        || val_upper.contains("DDEAUTO")
-                                        || val_upper.starts_with("DDE ")
-                                        || val_upper.contains("CMD|")
-                                        || val_upper.contains("POWERSHELL"))
+                                        || Self::contains_dangerous_field_instruction(&val_str))
                                 {
                                     neutralized_attr = true;
                                     clean_elem.push_attribute((key_str.as_str(), "REM_DISARMED"));
@@ -931,7 +1402,7 @@ impl OpenXmlSanitizer {
                                 report.push(DisarmReportItem::new(
                                     "OOXML_DDE_ATTRIBUTE",
                                     xml_path.to_string(),
-                                    "Neutralized DDE/DDEAUTO instruction attribute",
+                                    "Neutralized DDE/DDEAUTO/field-code instruction attribute",
                                 ));
                             }
 
@@ -946,16 +1417,19 @@ impl OpenXmlSanitizer {
                         }
                         Event::Text(ref t) => {
                             let raw_text = t.as_ref();
-                            let upper = raw_text.to_ascii_uppercase();
+                            let is_flagged_split = flagged_split_ordinals.contains(&ord);
                             if policy.strip_office_dde
-                                && (upper.contains("DDEAUTO")
-                                    || upper.trim_start().starts_with("DDE ")
-                                    || upper.contains("CMD|"))
+                                && (is_flagged_split
+                                    || Self::contains_dangerous_field_instruction(raw_text))
                             {
                                 report.push(DisarmReportItem::new(
                                     "DDE_FORMULA_INJECTION",
                                     xml_path.to_string(),
-                                    "Neutralized inline DDE/command formula instruction",
+                                    if is_flagged_split {
+                                        "Neutralized split-run DDE/field-code instruction across XML runs"
+                                    } else {
+                                        "Neutralized inline DDE/field-code instruction"
+                                    },
                                 ));
                                 writer
                                     .write_event(Event::Text(quick_xml::events::BytesText::new(
@@ -965,6 +1439,33 @@ impl OpenXmlSanitizer {
                             } else {
                                 writer
                                     .write_event(Event::Text(t.clone().into_owned()))
+                                    .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                            }
+                        }
+                        Event::CData(ref c) => {
+                            let raw_text = c.as_ref();
+                            let is_flagged_split = flagged_split_ordinals.contains(&ord);
+                            if policy.strip_office_dde
+                                && (is_flagged_split
+                                    || Self::contains_dangerous_field_instruction(raw_text))
+                            {
+                                report.push(DisarmReportItem::new(
+                                    "DDE_FORMULA_INJECTION",
+                                    xml_path.to_string(),
+                                    if is_flagged_split {
+                                        "Neutralized split-run CDATA DDE/field-code instruction across XML runs"
+                                    } else {
+                                        "Neutralized CDATA DDE/field-code instruction"
+                                    },
+                                ));
+                                writer
+                                    .write_event(Event::Text(quick_xml::events::BytesText::new(
+                                        "REM_DISARMED",
+                                    )))
+                                    .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                            } else {
+                                writer
+                                    .write_event(Event::CData(c.clone().into_owned()))
                                     .map_err(|err| CdrError::XmlError(err.to_string()))?;
                             }
                         }
@@ -980,9 +1481,22 @@ impl OpenXmlSanitizer {
                                 buf.clear();
                                 continue;
                             }
-                            writer
-                                .write_event(event.into_owned())
-                                .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                            if policy.strip_office_dde && flagged_split_ordinals.contains(&ord) {
+                                report.push(DisarmReportItem::new(
+                                    "DDE_FORMULA_INJECTION",
+                                    xml_path.to_string(),
+                                    "Neutralized entity-encoded split-run DDE/field-code instruction",
+                                ));
+                                writer
+                                    .write_event(Event::Text(quick_xml::events::BytesText::new(
+                                        "REM_DISARMED",
+                                    )))
+                                    .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                            } else {
+                                writer
+                                    .write_event(event.into_owned())
+                                    .map_err(|err| CdrError::XmlError(err.to_string()))?;
+                            }
                         }
                         Event::End(ref e) => {
                             let tag_name = e.name().as_ref().to_string();
@@ -1023,6 +1537,8 @@ impl OpenXmlSanitizer {
             || lower_name.ends_with(".doc")
             || lower_name.ends_with(".xls")
             || lower_name.ends_with(".ppt")
+            || lower_name.ends_with(".txt")
+            || lower_name.ends_with(".csv")
             || bytes.starts_with(b"%PDF-")
             || bytes.starts_with(b"PK\x03\x04")
             || bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])

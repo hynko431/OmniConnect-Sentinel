@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
+use crate::enterprise::ledger::SharedAuditLedger;
 use crate::vfs::projfs::ProjFsProvider;
 use crate::vfs::VirtualFileSystemProvider;
 
@@ -20,6 +21,12 @@ impl WinFspProvider {
     pub fn new() -> Self {
         Self {
             inner: ProjFsProvider::new(),
+        }
+    }
+
+    pub fn with_shared_ledger(self, shared_ledger: SharedAuditLedger) -> Self {
+        Self {
+            inner: self.inner.with_shared_ledger(shared_ledger),
         }
     }
 }
@@ -42,5 +49,12 @@ impl VirtualFileSystemProvider for WinFspProvider {
 
     async fn unmount_volume(&self, virtual_mount_point: &Path) -> Result<(), String> {
         self.inner.unmount_volume(virtual_mount_point).await
+    }
+
+    fn take_withheld_threats(
+        &self,
+        virtual_mount_point: &Path,
+    ) -> Vec<crate::scanner::universal_scanner::UniversalThreat> {
+        self.inner.take_withheld_threats(virtual_mount_point)
     }
 }
