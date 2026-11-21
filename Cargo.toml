@@ -20,7 +20,7 @@ repository = "https://github.com/omniconnect/sentinel"
 
 [workspace.dependencies]
 # Async Runtime & Concurrency
-tokio = { version = "=1.53.3", features = ["full"] }
+tokio = { version = "=1.54.1", features = ["full"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
 
