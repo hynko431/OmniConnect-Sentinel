@@ -50,4 +50,11 @@ impl VirtualFileSystemProvider for WinFspProvider {
     async fn unmount_volume(&self, virtual_mount_point: &Path) -> Result<(), String> {
         self.inner.unmount_volume(virtual_mount_point).await
     }
+
+    fn take_withheld_threats(
+        &self,
+        virtual_mount_point: &Path,
+    ) -> Vec<crate::scanner::universal_scanner::UniversalThreat> {
+        self.inner.take_withheld_threats(virtual_mount_point)
+    }
 }

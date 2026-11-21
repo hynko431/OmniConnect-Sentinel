@@ -22,21 +22,257 @@ use walkdir::WalkDir;
 
 use sentinel_cdr::{SanitizationPolicy, WorkerLauncher, WorkerRequest};
 use sentinel_sys::{
-    create_restricted_dir_atomic, create_restricted_file_atomic, is_projfs_reparse_point,
-    is_reparse_point_or_symlink, normalize_file_attributes, open_untrusted_readonly_nofollow,
-    read_untrusted_to_end_bounded, set_volume_offline, set_volume_online_readonly,
-    write_mark_of_the_web, ZeroizingBytes,
+    create_readonly_staging_dir_atomic, create_readonly_staging_file_atomic,
+    create_restricted_dir_atomic, create_restricted_file_atomic,
+    create_restricted_file_handle_atomic, is_projfs_reparse_point, is_reparse_point_or_symlink,
+    normalize_file_attributes, open_untrusted_readonly_nofollow, read_untrusted_to_end_bounded,
+    set_volume_offline, set_volume_online_readonly, sign_ecdsa_p256_with_private_blob,
+    verify_binary_authenticode_signature, verify_ecdsa_p256_digest, write_mark_of_the_web,
+    ZeroizingBytes,
 };
+use serde::{Deserialize, Serialize};
+use std::io::Read;
+use subtle::ConstantTimeEq;
 
 use crate::enterprise::ledger::{
     tokenize_path_for_ledger, AuditLedger, AuditSubsystem, SharedAuditLedger,
 };
 use crate::error::{DegradationEvent, SentinelError};
+use crate::scanner::ntfs_ads_scanner::NtfsAdsScanner;
 use crate::scanner::secure_shredder::{SecureShredder, ShredMethod};
-use crate::scanner::universal_scanner::{UniversalScanner, UniversalThreat};
+use crate::scanner::tier0_yara::{StreamingYaraAccumulator, Tier0YaraScanner};
+use crate::scanner::unicode_trojan_detector::UnicodeTrojanDetector;
+use crate::scanner::universal_scanner::{
+    CarrierCategory, ThreatSeverity, UniversalScanner, UniversalThreat,
+};
 
 pub const DEFAULT_MAX_SHADOW_CACHE_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 pub const DEFAULT_MAX_SHADOW_CACHE_FILES: usize = 10_000;
+/// Maximum individual large OT firmware bundle streamed in `O(64 KiB)` chunks (8 GiB) (`CSE-27`).
+pub const DEFAULT_MAX_STREAMED_FIRMWARE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Sidecar suffix for detached ECDSA P-256 vendor firmware signatures (`<firmware>.sentinel-fw.sig.json`) (`CSE-27`).
+pub const OT_FIRMWARE_SIG_SUFFIX: &str = ".sentinel-fw.sig.json";
+/// Default firmware bundle extensions eligible for allowlisted signed streaming passthrough (`CSE-27`).
+pub const DEFAULT_OT_FIRMWARE_EXTENSIONS: &[&str] = &[
+    "bin", "fw", "img", "upd", "pkg", "hex", "srec", "tar", "gz", "zip", "exe", "msi",
+];
+
+/// Detached ECDSA P-256 vendor firmware signature manifest (`<firmware>.sentinel-fw.sig.json`)
+/// verified in `O(64 KiB)` streaming RAM against explicitly allowlisted OT vendor signing keys (`CSE-27`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VendorFirmwareSignatureManifest {
+    pub vendor_name: String,
+    pub firmware_filename: String,
+    pub firmware_size_bytes: u64,
+    pub firmware_sha256: String,
+    pub signature_scheme: String,
+    pub signer_public_key_hex: String,
+    pub signature_hex: String,
+}
+
+impl VendorFirmwareSignatureManifest {
+    /// Unambiguous length-prefixed canonical SHA-256 digest binding vendor, filename, size, hash, and key (`CSE-27`).
+    pub fn signing_digest(&self) -> [u8; 32] {
+        let payload = format!(
+            "SENTINEL-OT-FIRMWARE-SIG-V1|vendor:{}:{}|file:{}:{}|size:{}|sha256:{}:{}|scheme:{}:{}|pk:{}:{}",
+            self.vendor_name.len(),
+            self.vendor_name,
+            self.firmware_filename.len(),
+            self.firmware_filename,
+            self.firmware_size_bytes,
+            self.firmware_sha256.len(),
+            self.firmware_sha256,
+            self.signature_scheme.len(),
+            self.signature_scheme,
+            self.signer_public_key_hex.len(),
+            self.signer_public_key_hex,
+        );
+        let digest = Sha256::digest(payload.as_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+
+    /// Signs a firmware bundle digest using an OT vendor's ECDSA P-256 private key blob (`CSE-27`).
+    pub fn sign(
+        vendor_name: impl Into<String>,
+        firmware_filename: impl Into<String>,
+        firmware_size_bytes: u64,
+        firmware_sha256: impl Into<String>,
+        vendor_private_key_blob: &[u8],
+        vendor_public_key_blob: &[u8],
+    ) -> Result<Self, String> {
+        let mut manifest = Self {
+            vendor_name: vendor_name.into(),
+            firmware_filename: firmware_filename.into(),
+            firmware_size_bytes,
+            firmware_sha256: firmware_sha256.into().to_ascii_lowercase(),
+            signature_scheme: "ECDSA-P256-SHA256".to_string(),
+            signer_public_key_hex: hex::encode(vendor_public_key_blob),
+            signature_hex: String::new(),
+        };
+        let digest = manifest.signing_digest();
+        let sig_bytes = sign_ecdsa_p256_with_private_blob(vendor_private_key_blob, &digest)
+            .map_err(|e| format!("Failed signing OT vendor firmware manifest: {e}"))?;
+        manifest.signature_hex = hex::encode(sig_bytes);
+        Ok(manifest)
+    }
+
+    /// Verifies filename, byte length, SHA-256 digest, constant-time allowlisted vendor key match,
+    /// and FIPS 186-5 ECDSA P-256 signature (`CSE-27`).
+    pub fn verify_against_allowlist(
+        &self,
+        expected_filename: &str,
+        expected_size_bytes: u64,
+        expected_sha256: &str,
+        allowlisted_vendor_keys: &[Vec<u8>],
+    ) -> Result<(), String> {
+        if allowlisted_vendor_keys.is_empty() {
+            return Err("No allowlisted OT vendor signing keys configured".to_string());
+        }
+        if self.vendor_name.trim().is_empty() || self.vendor_name.chars().any(|c| c.is_control()) {
+            return Err("Invalid empty/control vendor_name in firmware signature".to_string());
+        }
+        if self.signature_scheme != "ECDSA-P256-SHA256" {
+            return Err(format!(
+                "Unsupported vendor firmware signature_scheme '{}'",
+                self.signature_scheme
+            ));
+        }
+        if self.firmware_filename != expected_filename {
+            return Err(format!(
+                "Firmware signature filename mismatch: manifest='{}', actual='{}'",
+                self.firmware_filename, expected_filename
+            ));
+        }
+        if self.firmware_size_bytes != expected_size_bytes {
+            return Err(format!(
+                "Firmware signature byte length mismatch: manifest={}, actual={}",
+                self.firmware_size_bytes, expected_size_bytes
+            ));
+        }
+        if !self.firmware_sha256.eq_ignore_ascii_case(expected_sha256) {
+            return Err(format!(
+                "Firmware signature SHA-256 mismatch: manifest='{}', actual='{}'",
+                self.firmware_sha256, expected_sha256
+            ));
+        }
+        let signer_pk = hex::decode(&self.signer_public_key_hex)
+            .map_err(|e| format!("Invalid signer_public_key_hex: {e}"))?;
+        let matched_key = allowlisted_vendor_keys
+            .iter()
+            .find(|k| k.len() == signer_pk.len() && bool::from(k.as_slice().ct_eq(&signer_pk)))
+            .ok_or_else(|| {
+                format!(
+                    "Vendor signing key for '{}' is NOT in allowlisted_vendor_p256_keys",
+                    self.vendor_name
+                )
+            })?;
+        let sig_bytes =
+            hex::decode(&self.signature_hex).map_err(|e| format!("Invalid signature_hex: {e}"))?;
+        let digest = self.signing_digest();
+        let valid = verify_ecdsa_p256_digest(matched_key, &digest, &sig_bytes)
+            .map_err(|e| format!("ECDSA P-256 vendor firmware verification error: {e}"))?;
+        if !valid {
+            return Err(format!(
+                "Invalid ECDSA P-256 vendor firmware signature for '{}'",
+                self.firmware_filename
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Policy governing `O(64 KiB)` streaming inspection & verified signed vendor PLC firmware
+/// passthrough for files exceeding `large_file_stream_threshold_bytes` (`> 512 MiB` default) (`CSE-27`).
+#[derive(Debug, Clone)]
+pub struct OtLargeFirmwarePolicy {
+    pub allowlisted_vendor_p256_keys: Vec<Vec<u8>>,
+    pub allow_authenticode_pe_passthrough: bool,
+    /// Explicit pinned SHA-256 hex digests authorized for Authenticode PE passthrough (`CSE-27`).
+    /// Prevents arbitrary OS-trusted third-party PE binaries from bypassing vendor allowlisting.
+    pub allowlisted_authenticode_sha256: Vec<String>,
+    /// Maximum per-file AND cumulative streamed OT firmware bytes per USB session (`CSE-27`).
+    pub max_streamed_firmware_bytes: u64,
+    pub allowed_extensions: Vec<String>,
+}
+
+impl Default for OtLargeFirmwarePolicy {
+    fn default() -> Self {
+        Self {
+            allowlisted_vendor_p256_keys: Vec::new(),
+            allow_authenticode_pe_passthrough: false,
+            allowlisted_authenticode_sha256: Vec::new(),
+            max_streamed_firmware_bytes: DEFAULT_MAX_STREAMED_FIRMWARE_BYTES,
+            allowed_extensions: DEFAULT_OT_FIRMWARE_EXTENSIONS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
+    }
+}
+
+impl OtLargeFirmwarePolicy {
+    fn is_extension_eligible(&self, path: &Path) -> bool {
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            return false;
+        };
+        let lower = ext.to_ascii_lowercase();
+        self.allowed_extensions
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&lower))
+    }
+}
+
+/// Single-pass `O(64 KiB)` `Read` adapter that feeds every physical byte read into
+/// `StreamingYaraAccumulator` (SHA-256 + streaming YARA + PE/ELF header inspection) while
+/// enforcing `max_bytes` so `encrypt_chunked_stream` seals the stream in ONE USB read (`CSE-27`, `Invariant I2`).
+struct SinglePassScanAndHashReader<'a, R: Read> {
+    inner: R,
+    yara_acc: StreamingYaraAccumulator<'a>,
+    bytes_read: u64,
+    max_bytes: u64,
+    max_chunk_seen: usize,
+}
+
+impl<'a, R: Read> SinglePassScanAndHashReader<'a, R> {
+    fn new(inner: R, yara_acc: StreamingYaraAccumulator<'a>, max_bytes: u64) -> Self {
+        Self {
+            inner,
+            yara_acc,
+            bytes_read: 0,
+            max_bytes,
+            max_chunk_seen: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for SinglePassScanAndHashReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.max_bytes.saturating_sub(self.bytes_read);
+        let cap = buf.len().min(chunked_cache::CHUNK_PLAINTEXT_CAPACITY);
+        let n = self.inner.read(&mut buf[..cap])?;
+        if n == 0 {
+            return Ok(0);
+        }
+        if (n as u64) > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Streamed OT firmware exceeded max_streamed_firmware_bytes ({})",
+                    self.max_bytes
+                ),
+            ));
+        }
+        self.bytes_read = self.bytes_read.saturating_add(n as u64);
+        if n > self.max_chunk_seen {
+            self.max_chunk_seen = n;
+        }
+        self.yara_acc.update(&buf[..n]);
+        Ok(n)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct VirtualFileEntry {
@@ -93,8 +329,12 @@ pub trait VirtualFileSystemProvider: Send + Sync {
 pub struct ShadowCacheManager {
     sessions: Arc<Mutex<HashMap<PathBuf, ShadowSessionState>>>,
     cache_root_override: Option<PathBuf>,
+    worker_launcher_override: Option<WorkerLauncher>,
     max_cache_bytes: u64,
     max_files: usize,
+    large_file_stream_threshold_bytes: u64,
+    ot_firmware_policy: OtLargeFirmwarePolicy,
+    yara_scanner_override: Option<Arc<Tier0YaraScanner>>,
     ledger_path: PathBuf,
     shared_ledger: Option<SharedAuditLedger>,
 }
@@ -120,8 +360,12 @@ impl ShadowCacheManager {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             cache_root_override: None,
+            worker_launcher_override: None,
             max_cache_bytes: DEFAULT_MAX_SHADOW_CACHE_BYTES,
             max_files: DEFAULT_MAX_SHADOW_CACHE_FILES,
+            large_file_stream_threshold_bytes: DEFAULT_MAX_SHADOW_CACHE_BYTES,
+            ot_firmware_policy: OtLargeFirmwarePolicy::default(),
+            yara_scanner_override: None,
             ledger_path: Self::default_ledger_path(),
             shared_ledger: None,
         }
@@ -132,11 +376,20 @@ impl ShadowCacheManager {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             cache_root_override: Some(cache_root),
+            worker_launcher_override: None,
             max_cache_bytes,
             max_files: DEFAULT_MAX_SHADOW_CACHE_FILES,
+            large_file_stream_threshold_bytes: DEFAULT_MAX_SHADOW_CACHE_BYTES,
+            ot_firmware_policy: OtLargeFirmwarePolicy::default(),
+            yara_scanner_override: None,
             ledger_path,
             shared_ledger: None,
         }
+    }
+
+    pub fn with_worker_launcher(mut self, worker_launcher: WorkerLauncher) -> Self {
+        self.worker_launcher_override = Some(worker_launcher);
+        self
     }
 
     pub fn with_max_cache_bytes(mut self, max_cache_bytes: u64) -> Self {
@@ -146,6 +399,27 @@ impl ShadowCacheManager {
 
     pub fn with_max_files(mut self, max_files: usize) -> Self {
         self.max_files = max_files;
+        self
+    }
+
+    /// Configures the byte threshold above which individual files switch from in-memory CDR
+    /// to single-pass `O(64 KiB)` streaming SHA-256 + YARA + allowlisted vendor firmware signature
+    /// verification (defaults to `512 MiB` so large OT files never abort the whole USB) (`CSE-27`).
+    pub fn with_large_file_stream_threshold(mut self, threshold_bytes: u64) -> Self {
+        self.large_file_stream_threshold_bytes = threshold_bytes;
+        self
+    }
+
+    /// Configures explicit allowlisted OT vendor signing keys and streaming firmware limits (`CSE-27`).
+    pub fn with_ot_firmware_policy(mut self, policy: OtLargeFirmwarePolicy) -> Self {
+        self.ot_firmware_policy = policy;
+        self
+    }
+
+    /// Supplies a preloaded `Tier0YaraScanner` (e.g. loaded with persisted ECDSA P-256 signed
+    /// offline YARA packs) for streaming large-file inspection (`CSE-27`).
+    pub fn with_yara_scanner(mut self, scanner: Arc<Tier0YaraScanner>) -> Self {
+        self.yara_scanner_override = Some(scanner);
         self
     }
 
@@ -589,13 +863,14 @@ impl ShadowCacheManager {
         let session_key = ZeroizingBytes::new(raw_key);
         sentinel_sys::zeroize_slice(&mut raw_key);
 
-        let worker_launcher = WorkerLauncher::new();
+        let worker_launcher = self.worker_launcher_override.clone().unwrap_or_default();
         let default_policy = SanitizationPolicy::default();
         let mut entries = HashMap::new();
         let mut withheld_threats = Vec::new();
         let mut projected_count = 0usize;
         let mut files_scanned = 0usize;
         let mut total_cached_bytes = 0u64;
+        let mut total_streamed_firmware_bytes = 0u64;
 
         for entry_res in WalkDir::new(raw_volume_path)
             .follow_links(false)
@@ -709,29 +984,354 @@ impl ShadowCacheManager {
                 return Err(msg);
             }
 
-            // Open untrusted file strictly without following symlinks/reparse points, and bounded by quota (`CSE-07`, `CSE-10`)
-            let raw_bytes = {
-                let mut untrusted_file = match open_untrusted_readonly_nofollow(path) {
-                    Ok(f) => f,
-                    Err(open_err) => {
-                        self.cleanup_cipher_dir(&shadow_cipher_dir);
-                        if is_volume_device {
-                            let _ = set_volume_offline(raw_volume_path, true);
-                        }
-                        let msg = SentinelError::WalkAccessDenied(format!(
-                            "ShadowCache non-following open failed for '{}': {}",
-                            path.display(),
-                            open_err
-                        ))
-                        .to_string();
-                        let path_token = self.tokenize_path_for_audit(path);
-                        self.append_ledger(
-                            "SHADOW_CACHE_INGEST_INCOMPLETE",
-                            &format!("reason=open_nofollow_failed path_token={path_token}"),
-                        );
-                        return Err(msg);
+            // Skip detached OT vendor firmware signature sidecars (`*.sentinel-fw.sig.json`) from
+            // standalone CDR projection when their paired firmware file exists alongside them (`CSE-27`).
+            let raw_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if let Some(paired_fw_name) = raw_name.strip_suffix(OT_FIRMWARE_SIG_SUFFIX) {
+                if !paired_fw_name.is_empty()
+                    && path
+                        .parent()
+                        .is_some_and(|p| p.join(paired_fw_name).is_file())
+                {
+                    continue;
+                }
+            }
+
+            // Open untrusted file strictly without following symlinks/reparse points (`CSE-07`, `CSE-10`, `CSE-27`)
+            let mut untrusted_file = match open_untrusted_readonly_nofollow(path) {
+                Ok(f) => f,
+                Err(open_err) => {
+                    self.cleanup_cipher_dir(&shadow_cipher_dir);
+                    if is_volume_device {
+                        let _ = set_volume_offline(raw_volume_path, true);
+                    }
+                    let msg = SentinelError::WalkAccessDenied(format!(
+                        "ShadowCache non-following open failed for '{}': {}",
+                        path.display(),
+                        open_err
+                    ))
+                    .to_string();
+                    let path_token = self.tokenize_path_for_audit(path);
+                    self.append_ledger(
+                        "SHADOW_CACHE_INGEST_INCOMPLETE",
+                        &format!("reason=open_nofollow_failed path_token={path_token}"),
+                    );
+                    return Err(msg);
+                }
+            };
+
+            let file_size_on_disk = untrusted_file.metadata().map(|m| m.len()).unwrap_or(0);
+            let file_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            // CSE-27: Large OT file streaming (`> 512 MiB` default, configurable for testing):
+            // NEVER abort the entire USB volume. Stream strictly in O(64 KiB) RAM in ONE single
+            // hardware read (`Invariant I2`) for SHA-256, streaming YARA, and allowlisted vendor
+            // firmware signature verification. Verified signed PLC firmware bundles pass through;
+            // unsigned or untrusted large opaque binaries are withheld per-file while sibling files proceed.
+            if file_size_on_disk > self.large_file_stream_threshold_bytes {
+                let path_token = self.tokenize_path_for_audit(path);
+                let mut path_threats = Vec::new();
+                if let Some(pt) = UnicodeTrojanDetector::inspect_path(path) {
+                    path_threats.push(pt);
+                }
+                for ads in NtfsAdsScanner::scan_file_streams(path) {
+                    path_threats.push(UniversalThreat {
+                        file_path: path.to_path_buf(),
+                        carrier_category: CarrierCategory::FilesystemHidden,
+                        threat_name: format!("NTFS Alternate Data Stream ({})", ads.stream_name),
+                        severity: ThreatSeverity::Critical,
+                        risk_score: 98,
+                        mitre_technique: "T1564.004 (NTFS File Attributes: ADS)".to_string(),
+                        technical_details: ads.threat_summary,
+                        overlay_offset: None,
+                        stream_name: Some(ads.stream_name),
+                        can_disarm_via_cdr: false,
+                    });
+                }
+                if !path_threats.is_empty() {
+                    withheld_threats.extend(path_threats);
+                    self.append_ledger(
+                        "SHADOW_CACHE_THREAT_WITHHELD",
+                        &format!("reason=large_file_path_or_ads_threat path_token={path_token}"),
+                    );
+                    continue;
+                }
+
+                let remaining_firmware_budget = self
+                    .ot_firmware_policy
+                    .max_streamed_firmware_bytes
+                    .saturating_sub(total_streamed_firmware_bytes);
+                if file_size_on_disk > remaining_firmware_budget {
+                    withheld_threats.push(UniversalThreat {
+                        file_path: path.to_path_buf(),
+                        carrier_category: CarrierCategory::Executable,
+                        threat_name: "OVERSIZED_OT_STREAM_REJECTED".to_string(),
+                        severity: ThreatSeverity::High,
+                        risk_score: 85,
+                        mitre_technique: "T1499 (Endpoint Denial of Service)".to_string(),
+                        technical_details: format!(
+                            "File size ({} bytes) exceeds remaining OT firmware stream budget ({} of {} bytes)",
+                            file_size_on_disk,
+                            remaining_firmware_budget,
+                            self.ot_firmware_policy.max_streamed_firmware_bytes
+                        ),
+                        overlay_offset: None,
+                        stream_name: None,
+                        can_disarm_via_cdr: false,
+                    });
+                    self.append_ledger(
+                        "OT_LARGE_FILE_UNSIGNED_REJECTED",
+                        &format!(
+                            "reason=exceeds_max_stream_limit bytes={file_size_on_disk} remaining_budget={remaining_firmware_budget} path_token={path_token}"
+                        ),
+                    );
+                    continue;
+                }
+
+                let rel_str = rel_path.to_string_lossy();
+                let entry_id_hash = hex::encode(Sha256::digest(rel_str.as_bytes()));
+                let mut file_id = [0u8; 16];
+                let hash_bytes = Sha256::digest(rel_str.as_bytes());
+                file_id.copy_from_slice(&hash_bytes[..16]);
+                let enc_path = shadow_cipher_dir.join(format!("{}.enc", &entry_id_hash[..32]));
+
+                let yara_owned;
+                let yara_ref: &Tier0YaraScanner = match &self.yara_scanner_override {
+                    Some(arc_scanner) => arc_scanner.as_ref(),
+                    None => {
+                        yara_owned = Tier0YaraScanner::new_with_persisted_offline_packs();
+                        &yara_owned
                     }
                 };
+                let yara_acc = yara_ref.begin_streaming_scan();
+                let mut tee_reader = SinglePassScanAndHashReader::new(
+                    untrusted_file,
+                    yara_acc,
+                    remaining_firmware_budget,
+                );
+
+                let streamed_bytes = match encrypt_chunked_stream(
+                    session_key.as_slice(),
+                    &file_id,
+                    &mut tee_reader,
+                    &enc_path,
+                ) {
+                    Ok(n) => n,
+                    Err(stream_err) => {
+                        let _ = fs::remove_file(&enc_path);
+                        withheld_threats.push(UniversalThreat {
+                            file_path: path.to_path_buf(),
+                            carrier_category: CarrierCategory::Executable,
+                            threat_name: "OT_LARGE_FILE_STREAM_ERROR".to_string(),
+                            severity: ThreatSeverity::High,
+                            risk_score: 85,
+                            mitre_technique: "T1027 (Streaming Inspection Failure)".to_string(),
+                            technical_details: format!(
+                                "O(64 KiB) streaming inspection failed: {stream_err}"
+                            ),
+                            overlay_offset: None,
+                            stream_name: None,
+                            can_disarm_via_cdr: false,
+                        });
+                        self.append_ledger(
+                            "OT_LARGE_FILE_UNSIGNED_REJECTED",
+                            &format!("reason=stream_error path_token={path_token}"),
+                        );
+                        continue;
+                    }
+                };
+
+                let (yara_res, source_sha256, is_pe) = tee_reader.yara_acc.finalize_with_digest();
+                if yara_res.matched {
+                    let _ = fs::remove_file(&enc_path);
+                    withheld_threats.push(UniversalThreat {
+                        file_path: path.to_path_buf(),
+                        carrier_category: CarrierCategory::Executable,
+                        threat_name: yara_res
+                            .rule_name
+                            .unwrap_or_else(|| "TIER0_YARA_SIGNATURE".to_string()),
+                        severity: ThreatSeverity::Critical,
+                        risk_score: 99,
+                        mitre_technique: "T1027 / T1204 (Malicious Large Binary Signature)"
+                            .to_string(),
+                        technical_details: yara_res
+                            .threat_details
+                            .unwrap_or_else(|| "Matched Tier-0 streaming YARA rule".to_string()),
+                        overlay_offset: None,
+                        stream_name: None,
+                        can_disarm_via_cdr: false,
+                    });
+                    self.append_ledger(
+                        "SHADOW_CACHE_THREAT_WITHHELD",
+                        &format!(
+                            "reason=large_file_yara_match path_token={path_token} sha256={source_sha256}"
+                        ),
+                    );
+                    continue;
+                }
+
+                // Verify vendor firmware signature against explicit allowlisted vendor signing keys
+                let mut verified_vendor_label: Option<String> = None;
+                let mut reject_reason =
+                    "Unsigned large opaque binary rejected (no valid allowlisted vendor firmware signature)"
+                        .to_string();
+
+                if self.ot_firmware_policy.is_extension_eligible(path) {
+                    let sig_path = PathBuf::from(format!(
+                        "{}{}",
+                        path.to_string_lossy(),
+                        OT_FIRMWARE_SIG_SUFFIX
+                    ));
+                    if sig_path.is_file() {
+                        match open_untrusted_readonly_nofollow(&sig_path)
+                            .and_then(|mut f| read_untrusted_to_end_bounded(&mut f, 64 * 1024))
+                        {
+                            Ok(sig_bytes) => {
+                                match serde_json::from_slice::<VendorFirmwareSignatureManifest>(
+                                    &sig_bytes,
+                                ) {
+                                    Ok(manifest) => match manifest.verify_against_allowlist(
+                                        &file_name,
+                                        streamed_bytes,
+                                        &source_sha256,
+                                        &self.ot_firmware_policy.allowlisted_vendor_p256_keys,
+                                    ) {
+                                        Ok(()) => {
+                                            verified_vendor_label = Some(format!(
+                                                "ECDSA-P256:{}",
+                                                manifest.vendor_name
+                                            ));
+                                        }
+                                        Err(sig_err) => {
+                                            reject_reason = sig_err;
+                                        }
+                                    },
+                                    Err(parse_err) => {
+                                        reject_reason = format!(
+                                            "Malformed vendor firmware signature manifest: {parse_err}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(io_err) => {
+                                reject_reason =
+                                    format!("Failed opening vendor signature sidecar: {io_err}");
+                            }
+                        }
+                    } else if self.ot_firmware_policy.allow_authenticode_pe_passthrough && is_pe {
+                        // Invariant I2 (Read-Once) + Vendor Pinning (`CSE-27`):
+                        // NEVER re-open untrusted USB `path` a second time, and NEVER trust arbitrary
+                        // unpinned OS-trusted signers. Require explicit pinned SHA-256 allowlist match
+                        // AND verify Authenticode strictly on a host-local restricted decrypted copy
+                        // materialized from `enc_path`, then delete the temporary copy immediately.
+                        let digest_pinned = self
+                            .ot_firmware_policy
+                            .allowlisted_authenticode_sha256
+                            .iter()
+                            .any(|allowed| {
+                                let a = allowed.trim().to_ascii_lowercase();
+                                let b = source_sha256.to_ascii_lowercase();
+                                a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+                            });
+                        if !digest_pinned {
+                            reject_reason = "Large PE Authenticode passthrough refused: SHA-256 not in pinned allowlisted_authenticode_sha256 (provide VendorFirmwareSignatureManifest or pin vendor digest)".to_string();
+                        } else {
+                            let auth_tmp_path = shadow_cipher_dir
+                                .join(format!("{}.authverify.tmp", &entry_id_hash[..32]));
+                            let decrypt_ok = create_restricted_file_handle_atomic(&auth_tmp_path)
+                                .and_then(|mut tmp_handle| {
+                                    decrypt_chunked_stream(
+                                        session_key.as_slice(),
+                                        &file_id,
+                                        &enc_path,
+                                        &mut tmp_handle,
+                                    )
+                                    .map_err(|e| std::io::Error::other(e.to_string()))
+                                });
+                            let auth_ok = decrypt_ok.is_ok()
+                                && verify_binary_authenticode_signature(&auth_tmp_path)
+                                    .unwrap_or(false);
+                            let _ = fs::remove_file(&auth_tmp_path);
+                            if auth_ok {
+                                verified_vendor_label =
+                                    Some("Authenticode-WinVerifyTrust-Pinned".to_string());
+                            } else {
+                                reject_reason =
+                                    "Large PE firmware failed host-local Authenticode WinVerifyTrust verification"
+                                        .to_string();
+                            }
+                        }
+                    }
+                } else {
+                    reject_reason = format!(
+                        "Large file '{}' extension is not in OT allowed_extensions",
+                        file_name
+                    );
+                }
+
+                if let Some(vendor_label) = verified_vendor_label {
+                    projected_count += 1;
+                    // Track streamed OT firmware separately from `total_cached_bytes` (`max_cache_bytes` = 512 MiB)
+                    // so verified > 512 MiB PLC firmware never causes small sibling CDR files to trip CacheQuotaExceeded!
+                    total_streamed_firmware_bytes =
+                        total_streamed_firmware_bytes.saturating_add(streamed_bytes);
+                    self.append_ledger(
+                        "OT_LARGE_FIRMWARE_VERIFIED_PASSTHROUGH",
+                        &format!(
+                            "path_token={path_token} bytes={streamed_bytes} sha256={source_sha256} vendor={vendor_label}"
+                        ),
+                    );
+                    entries.insert(
+                        rel_path.clone(),
+                        VirtualFileEntry {
+                            relative_path: rel_path,
+                            original_size: streamed_bytes,
+                            sanitized_size: streamed_bytes,
+                            source_sha256: source_sha256.clone(),
+                            sanitized_sha256: source_sha256,
+                            is_directory: false,
+                            is_sanitized: true,
+                            encrypted_cache_path: Some(enc_path),
+                            cached_clean_path: None,
+                        },
+                    );
+                } else {
+                    // Reject unsigned / untrusted large opaque binary WITHOUT aborting the rest of the USB volume!
+                    let _ = fs::remove_file(&enc_path);
+                    withheld_threats.push(UniversalThreat {
+                        file_path: path.to_path_buf(),
+                        carrier_category: CarrierCategory::Executable,
+                        threat_name: "UNSIGNED_LARGE_OPAQUE_BINARY".to_string(),
+                        severity: ThreatSeverity::High,
+                        risk_score: 88,
+                        mitre_technique: "T1027 / T1091 (Unverified Large Binary on Removable Media)"
+                            .to_string(),
+                        technical_details: reject_reason.clone(),
+                        overlay_offset: None,
+                        stream_name: None,
+                        can_disarm_via_cdr: false,
+                    });
+                    warn!(
+                        "ShadowCache withheld unsigned/unverified large file '{}' ({} bytes): {}",
+                        path.display(),
+                        streamed_bytes,
+                        reject_reason
+                    );
+                    self.append_ledger(
+                        "OT_LARGE_FILE_UNSIGNED_REJECTED",
+                        &format!(
+                            "path_token={path_token} bytes={streamed_bytes} sha256={source_sha256} reason={reject_reason}"
+                        ),
+                    );
+                }
+                continue;
+            }
+
+            let raw_bytes =
                 match read_untrusted_to_end_bounded(&mut untrusted_file, self.max_cache_bytes) {
                     Ok(b) => b,
                     Err(read_err) => {
@@ -756,16 +1356,10 @@ impl ShadowCacheManager {
                         );
                         return Err(msg);
                     }
-                }
-            };
+                };
 
             let original_size = raw_bytes.len() as u64;
             let source_sha256 = hex::encode(Sha256::digest(&raw_bytes));
-            let file_name = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
 
             // Run UniversalScanner on the single-read byte slice without re-opening the USB file (`Row 7, 70`)
             let threats = UniversalScanner::scan_bytes_single_read(path, &raw_bytes);
@@ -1209,6 +1803,87 @@ impl ShadowCacheManager {
         })
     }
 
+    /// Streams a cached `.enc` entry directly into `writer` in `O(64 KiB)` constant RAM while
+    /// computing and verifying its full SHA-256 digest against `sanitized_sha256` (`CSE-27`).
+    pub fn stream_projected_file_to_writer<W: std::io::Write>(
+        &self,
+        virtual_mount_point: &Path,
+        relative_path: &Path,
+        writer: &mut W,
+    ) -> Result<u64, String> {
+        struct HashingWriter<'a, W: std::io::Write> {
+            inner: &'a mut W,
+            hasher: Sha256,
+        }
+        impl<W: std::io::Write> std::io::Write for HashingWriter<'_, W> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let n = self.inner.write(buf)?;
+                self.hasher.update(&buf[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
+
+        let (key_copy, file_id, enc_path, expected_sha256) = {
+            let guard = self.sessions.lock().map_err(|e| e.to_string())?;
+            let session = guard.get(virtual_mount_point).ok_or_else(|| {
+                format!(
+                    "No active ShadowCache session for mount '{}'",
+                    virtual_mount_point.display()
+                )
+            })?;
+            let entry = session.entries.get(relative_path).ok_or_else(|| {
+                format!(
+                    "Projected file '{}' not found in shadow cache",
+                    relative_path.display()
+                )
+            })?;
+            if entry.is_directory {
+                return Err(format!(
+                    "Projected path '{}' is a directory",
+                    relative_path.display()
+                ));
+            }
+            let enc_path = entry.encrypted_cache_path.clone().ok_or_else(|| {
+                format!(
+                    "Projected file '{}' has no encrypted cache path",
+                    relative_path.display()
+                )
+            })?;
+            let rel_str = entry.relative_path.to_string_lossy();
+            let hash_bytes = Sha256::digest(rel_str.as_bytes());
+            let mut file_id = [0u8; 16];
+            file_id.copy_from_slice(&hash_bytes[..16]);
+            let mut raw_key = [0u8; 32];
+            raw_key.copy_from_slice(session.session_key.as_slice());
+            let guarded_key = ZeroizingBytes::new(raw_key);
+            sentinel_sys::zeroize_slice(&mut raw_key);
+            (
+                guarded_key,
+                file_id,
+                enc_path,
+                entry.sanitized_sha256.clone(),
+            )
+        };
+
+        let mut hw = HashingWriter {
+            inner: writer,
+            hasher: Sha256::new(),
+        };
+        let written = decrypt_chunked_stream(key_copy.as_slice(), &file_id, &enc_path, &mut hw)
+            .map_err(|e| format!("Streaming ShadowCache decrypt failed: {e}"))?;
+        let actual_sha256 = hex::encode(hw.hasher.finalize());
+        if !actual_sha256.eq_ignore_ascii_case(&expected_sha256) {
+            return Err(format!(
+                "SHADOW_CACHE_STREAM_INTEGRITY_MISMATCH: expected={}, actual={}",
+                expected_sha256, actual_sha256
+            ));
+        }
+        Ok(written)
+    }
+
     /// Ingests a single stream from `reader` **at most once** (`Invariant I2` TOCTOU rig test helper),
     /// scans the single-read copy, disarms it via the isolated `sentinel-cdr-worker` (`Invariant I3`),
     /// and stores only AES-256-GCM `.enc` ciphertext on disk (`Rows 7, 70, 146, 147, 203`).
@@ -1274,7 +1949,7 @@ impl ShadowCacheManager {
             return Err(msg);
         }
 
-        let worker_launcher = WorkerLauncher::new();
+        let worker_launcher = self.worker_launcher_override.clone().unwrap_or_default();
         let outcome = worker_launcher
             .sanitize_isolated(WorkerRequest {
                 file_name,
@@ -1357,18 +2032,27 @@ impl ShadowCacheManager {
     }
 
     /// Decrypts and verifies the `.enc` entry via `read_projected_file`, then hydrates a
-    /// read-only file with Mark-of-the-Web (`ZoneId=3`) at `virtual_mount_point/relative_path`.
+    /// read-only file with Mark-of-the-Web (`ZoneId=3`) and interactive read-only user ACL
+    /// (`STAGING_FILE_READONLY_USER_SDDL`, `CSE-18`) at `virtual_mount_point/relative_path`,
+    /// while keeping the encrypted `ShadowCache` strictly `SYSTEM`/`Administrators`-only.
     pub fn resolve_projected_file(
         &self,
         virtual_mount_point: &Path,
         relative_path: &Path,
     ) -> Result<PathBuf, String> {
         let verified_bytes = self.read_projected_file(virtual_mount_point, relative_path)?;
+        create_readonly_staging_dir_atomic(virtual_mount_point).map_err(|e| {
+            format!(
+                "Failed preparing read-only staging mount root '{}': {}",
+                virtual_mount_point.display(),
+                e
+            )
+        })?;
         let projected_path = virtual_mount_point.join(relative_path);
         if let Some(parent) = projected_path.parent() {
-            create_restricted_dir_atomic(parent).map_err(|e| {
+            create_readonly_staging_dir_atomic(parent).map_err(|e| {
                 format!(
-                    "Failed creating parent directory for projected file '{}': {}",
+                    "Failed creating read-only staging parent directory for projected file '{}': {}",
                     projected_path.display(),
                     e
                 )
@@ -1377,9 +2061,9 @@ impl ShadowCacheManager {
         if projected_path.exists() {
             let _ = normalize_file_attributes(&projected_path);
         }
-        create_restricted_file_atomic(&projected_path, &verified_bytes).map_err(|e| {
+        create_readonly_staging_file_atomic(&projected_path, &verified_bytes).map_err(|e| {
             format!(
-                "Failed creating atomic restricted hydrated file '{}': {}",
+                "Failed creating atomic read-only staging hydrated file '{}': {}",
                 projected_path.display(),
                 e
             )
@@ -1394,7 +2078,7 @@ impl ShadowCacheManager {
             )
         })?;
 
-        // Set hydrated file to read-only for interactive users (`Row 148, 151`)
+        // Set hydrated file to read-only for interactive users (`Row 148, 151, CSE-18`)
         if let Ok(meta) = fs::metadata(&projected_path) {
             let mut perms = meta.permissions();
             perms.set_readonly(true);
@@ -1413,11 +2097,19 @@ impl ShadowCacheManager {
     }
 
     /// Materializes all released files into a read-only staging folder with Mark-of-the-Web (`ZoneId=3`)
-    /// when `StagingFolderProvider` fallback is active (`Row 151`).
+    /// and interactive read-only user ACL (`STAGING_DIR_READONLY_USER_SDDL` / `STAGING_FILE_READONLY_USER_SDDL`)
+    /// when `StagingFolderProvider` fallback is active (`Row 151, CSE-18`).
     pub fn materialize_all_readonly_staging(
         &self,
         virtual_mount_point: &Path,
     ) -> Result<usize, String> {
+        create_readonly_staging_dir_atomic(virtual_mount_point).map_err(|e| {
+            format!(
+                "Failed preparing read-only staging mount root '{}': {}",
+                virtual_mount_point.display(),
+                e
+            )
+        })?;
         let rel_paths: Vec<PathBuf> = {
             let guard = self.sessions.lock().map_err(|e| e.to_string())?;
             let session = guard.get(virtual_mount_point).ok_or_else(|| {
@@ -1608,14 +2300,15 @@ impl ShadowCacheManager {
     }
 }
 
-/// Read-Only Staging Folder VFS Fallback (`POSTURE_REDUCED_NO_PROJFS`, Phase 3.2 & 5.1)
+/// Read-Only Staging Folder VFS Fallback (`POSTURE_REDUCED_NO_PROJFS` / `POSTURE_REDUCED_NO_FUSE`, Phase 3.2 & `CSE-25`)
 ///
-/// Used when Windows ProjFS is not enabled on the endpoint. Decrypts and verifies released
-/// files from the Read-Once Encrypted Shadow Cache into a read-only staging folder with
-/// Mark-of-the-Web (`ZoneId=3`) and records `DegradationEvent::PostureReducedNoProjfs`.
+/// Used when Windows ProjFS or Linux native FUSE3 is unavailable on the endpoint. Decrypts and
+/// verifies released files from the Read-Once Encrypted Shadow Cache into a read-only staging
+/// folder with Mark-of-the-Web (`ZoneId=3`) and records the explicit degradation event.
 pub struct StagingFolderProvider {
     shadow_cache: ShadowCacheManager,
     active_mount: Mutex<Option<PathBuf>>,
+    degradation_event: DegradationEvent,
 }
 
 impl Default for StagingFolderProvider {
@@ -1629,19 +2322,52 @@ impl StagingFolderProvider {
         Self {
             shadow_cache: ShadowCacheManager::new(),
             active_mount: Mutex::new(None),
+            degradation_event: DegradationEvent::PostureReducedNoProjfs,
         }
+    }
+
+    /// Creates a `StagingFolderProvider` reporting `POSTURE_REDUCED_NO_FUSE` for Linux hosts
+    /// without a native FUSE3 session (`CSE-25`).
+    pub fn new_no_fuse() -> Self {
+        Self {
+            shadow_cache: ShadowCacheManager::new(),
+            active_mount: Mutex::new(None),
+            degradation_event: DegradationEvent::PostureReducedNoFuse,
+        }
+    }
+
+    pub fn with_shadow_cache(shadow_cache: ShadowCacheManager) -> Self {
+        Self {
+            shadow_cache,
+            active_mount: Mutex::new(None),
+            degradation_event: DegradationEvent::PostureReducedNoProjfs,
+        }
+    }
+
+    pub fn with_degradation_event(mut self, event: DegradationEvent) -> Self {
+        self.degradation_event = event;
+        self
     }
 
     pub fn with_shared_ledger(mut self, shared_ledger: SharedAuditLedger) -> Self {
         self.shadow_cache = self.shadow_cache.with_shared_ledger(shared_ledger);
         self
     }
+
+    pub fn shadow_cache(&self) -> &ShadowCacheManager {
+        &self.shadow_cache
+    }
 }
 
 #[async_trait]
 impl VirtualFileSystemProvider for StagingFolderProvider {
     fn provider_name(&self) -> &'static str {
-        "Read-Only Staging Folder Fallback (POSTURE_REDUCED_NO_PROJFS)"
+        match self.degradation_event {
+            DegradationEvent::PostureReducedNoFuse => {
+                "Read-Only Staging Folder Fallback (POSTURE_REDUCED_NO_FUSE)"
+            }
+            _ => "Read-Only Staging Folder Fallback (POSTURE_REDUCED_NO_PROJFS)",
+        }
     }
 
     async fn mount_sanitized_volume(
@@ -1649,9 +2375,9 @@ impl VirtualFileSystemProvider for StagingFolderProvider {
         raw_volume_path: &Path,
         virtual_mount_point: &Path,
     ) -> Result<(), String> {
-        let event_code = DegradationEvent::PostureReducedNoProjfs.event_code();
+        let event_code = self.degradation_event.event_code();
         warn!(
-            "[{}] ProjFS unavailable; falling back to read-only staging folder at {}",
+            "[{}] Kernel VFS backend unavailable; falling back to read-only staging folder at {}",
             event_code,
             virtual_mount_point.display()
         );
@@ -1660,8 +2386,20 @@ impl VirtualFileSystemProvider for StagingFolderProvider {
             .tokenize_path_for_audit(virtual_mount_point);
         self.shadow_cache.append_ledger(
             event_code,
-            &format!("ProjFS unavailable; using StagingFolderProvider mount_token={mount_token}"),
+            &format!(
+                "Kernel VFS unavailable ({event_code}); using StagingFolderProvider mount_token={mount_token}"
+            ),
         );
+        // Create the sanitized staging root atomically with interactive read-only user ACL
+        // (`STAGING_DIR_READONLY_USER_SDDL`) BEFORE ingestion so there is zero post-creation
+        // DACL race window (`CSE-18`), while `ShadowCache` remains strictly `SY`/`BA`/`OW`-only.
+        create_readonly_staging_dir_atomic(virtual_mount_point).map_err(|e| {
+            format!(
+                "Failed creating read-only staging mount root '{}': {}",
+                virtual_mount_point.display(),
+                e
+            )
+        })?;
         self.shadow_cache
             .ingest_volume_read_once(raw_volume_path, virtual_mount_point)?;
         self.shadow_cache
@@ -1688,6 +2426,10 @@ impl VirtualFileSystemProvider for StagingFolderProvider {
             *guard = None;
         }
         self.shadow_cache.teardown_session(virtual_mount_point)
+    }
+
+    fn take_withheld_threats(&self, virtual_mount_point: &Path) -> Vec<UniversalThreat> {
+        self.shadow_cache.take_withheld_threats(virtual_mount_point)
     }
 }
 
@@ -1728,12 +2470,25 @@ pub fn resolve_best_vfs_provider_with_ledger(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        info!("Selected VFS Backend: Linux FUSE3 Userspace Mount (+ Read-Once ShadowCache)");
-        let p = fuse::FuseVfsProvider::new();
-        let p = match shared_ledger {
-            Some(sl) => p.with_shared_ledger(sl),
-            None => p,
-        };
-        Box::new(p)
+        if fuse::FuseVfsProvider::is_native_fuse_supported() {
+            info!("Selected VFS Backend: Linux FUSE3 Userspace Mount (+ Read-Once ShadowCache)");
+            let p = fuse::FuseVfsProvider::new();
+            let p = match shared_ledger {
+                Some(sl) => p.with_shared_ledger(sl),
+                None => p,
+            };
+            Box::new(p)
+        } else {
+            warn!(
+                "[{}] Native FUSE3 (vfs-fuse / /dev/fuse) unavailable; selecting Read-Only StagingFolderProvider fallback",
+                DegradationEvent::PostureReducedNoFuse.event_code()
+            );
+            let p = StagingFolderProvider::new_no_fuse();
+            let p = match shared_ledger {
+                Some(sl) => p.with_shared_ledger(sl),
+                None => p,
+            };
+            Box::new(p)
+        }
     }
 }

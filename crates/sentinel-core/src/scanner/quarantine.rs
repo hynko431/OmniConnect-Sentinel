@@ -29,6 +29,8 @@ use crate::scanner::secure_shredder::{SecureShredder, ShredMethod};
 
 pub const ENVELOPE_MAGIC_V2_FULL: &[u8; 8] = b"SNTLQV02";
 pub const ENVELOPE_VERSION: u16 = 2;
+pub const ENVELOPE_MAGIC_V3_FULL: &[u8; 8] = b"SNTLQV03";
+pub const ENVELOPE_VERSION_V3: u16 = 3;
 pub const HKDF_INFO_QUARANTINE_V2: &[u8] = b"OMNICONNECT_SENTINEL_QUARANTINE_V2";
 const SEALED_KEK_FILENAME: &str = "vault_kek.sealed";
 const ESCROW_KEK_FILENAME: &str = "vault_kek.escrow";
@@ -88,6 +90,13 @@ pub struct QuarantineEnvelopeHeader {
     pub quarantined_at_utc: String,
     #[serde(default = "default_recovery_status")]
     pub recovery_status: String,
+    /// AES-256-GCM encrypted plaintext `original_path` under the per-entry DEK (`SNTLQV03`, `CSE-16`).
+    /// Keeps raw path/username PII out of unencrypted `.quar` header JSON on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_original_path_hex: Option<String>,
+    /// Distinct 96-bit AEAD nonce used to encrypt `encrypted_original_path_hex` (`SNTLQV03`, `CSE-16`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_nonce: Option<[u8; 12]>,
 }
 
 fn default_header_magic() -> [u8; 8] {
@@ -111,7 +120,8 @@ fn default_recovery_status() -> String {
 /// - Fails closed (`VAULT_INTEGRITY_FAIL`) if `vault_kek.sealed` exists on disk and cannot be unsealed —
 ///   never silently regenerating or overwriting an existing KEK.
 /// - Derives per-file wrapping keys via `HKDF-SHA256(KEK, file_salt, "OMNICONNECT_SENTINEL_QUARANTINE_V2")`
-///   and stores a wrapped per-entry DEK (`<entry_id>.dek`) so `purge()` performs true cryptographic erasure.
+///   and stores a wrapped per-entry DEK (`<entry_id>.dek`) so `purge()` overwrites the DEK and `.quar`
+///   envelope via honest NIST SP 800-88 Rev. 2 `Clear` while the shared vault KEK/escrow remain active.
 pub struct QuarantineVault {
     vault_dir: PathBuf,
     master_kek: ZeroizingBytes<32>,
@@ -338,6 +348,17 @@ impl QuarantineVault {
         vault_dir: PathBuf,
         soc_rsa_priv_blob: &[u8],
     ) -> Result<Self, String> {
+        Self::recover_from_soc_escrow_with_shared_ledger(vault_dir, soc_rsa_priv_blob, None)
+    }
+
+    /// Recovers a Quarantine Vault via offline SOC RSA-3072+ escrow, atomically re-sealing
+    /// `vault_kek.sealed`, syncing the vault directory, and logging `VAULT_ESCROW_RECOVERED` to
+    /// `shared_ledger` when supplied (`CSE-16`).
+    pub fn recover_from_soc_escrow_with_shared_ledger(
+        vault_dir: PathBuf,
+        soc_rsa_priv_blob: &[u8],
+        shared_ledger: Option<SharedAuditLedger>,
+    ) -> Result<Self, String> {
         let escrow_path = vault_dir.join(ESCROW_KEK_FILENAME);
         let raw_escrow = fs::read(&escrow_path).map_err(|e| {
             format!(
@@ -380,6 +401,8 @@ impl QuarantineVault {
         let sealed_path = vault_dir.join(SEALED_KEK_FILENAME);
         write_protected_key_file(&sealed_path, &serialized)
             .map_err(|e| format!("Failed persisting re-sealed KEK: {e}"))?;
+        sync_directory(&vault_dir)
+            .map_err(|e| format!("Failed syncing vault directory after KEK recovery: {e}"))?;
 
         let vault = Self {
             vault_dir,
@@ -388,7 +411,7 @@ impl QuarantineVault {
             posture,
             degradation_event,
             init_error: None,
-            shared_ledger: None,
+            shared_ledger,
         };
         vault.append_ledger_event(
             "VAULT_ESCROW_RECOVERED",
@@ -436,6 +459,17 @@ impl QuarantineVault {
     pub fn recover_from_hybrid_soc_escrow_v3(
         vault_dir: PathBuf,
         priv_bundle: &HybridSocPrivateKeyBundle,
+    ) -> Result<Self, String> {
+        Self::recover_from_hybrid_soc_escrow_v3_with_shared_ledger(vault_dir, priv_bundle, None)
+    }
+
+    /// Recovers a Quarantine Vault via Hybrid Post-Quantum `OCESCROW3` (`v3`), atomically re-sealing
+    /// `vault_kek.sealed`, syncing the vault directory, and logging `VAULT_HYBRID_PQC_ESCROW_V3_RECOVERED`
+    /// to `shared_ledger` when supplied (`CSE-16`).
+    pub fn recover_from_hybrid_soc_escrow_v3_with_shared_ledger(
+        vault_dir: PathBuf,
+        priv_bundle: &HybridSocPrivateKeyBundle,
+        shared_ledger: Option<SharedAuditLedger>,
     ) -> Result<Self, String> {
         let json_path = vault_dir.join(HYBRID_ESCROW_V3_JSON_FILENAME);
         let raw_json = fs::read(&json_path).map_err(|e| {
@@ -501,6 +535,8 @@ impl QuarantineVault {
         let sealed_path = vault_dir.join(SEALED_KEK_FILENAME);
         write_protected_key_file(&sealed_path, &serialized)
             .map_err(|e| format!("Failed persisting re-sealed KEK: {e}"))?;
+        sync_directory(&vault_dir)
+            .map_err(|e| format!("Failed syncing vault directory after OCESCROW3 recovery: {e}"))?;
 
         let vault = Self {
             vault_dir,
@@ -509,7 +545,7 @@ impl QuarantineVault {
             posture,
             degradation_event,
             init_error: None,
-            shared_ledger: None,
+            shared_ledger,
         };
         vault.append_ledger_event(
             "VAULT_HYBRID_PQC_ESCROW_V3_RECOVERED",
@@ -757,60 +793,15 @@ impl QuarantineVault {
         digest[..16].to_string()
     }
 
-    /// RFC 5869 HMAC-SHA256 Extract-and-Expand Key Derivation Function (HKDF-SHA256)
-    /// for 32-byte per-file key derivation (`HKDF-SHA256(KEK, salt_32B, "OMNICONNECT_SENTINEL_QUARANTINE_V2")`).
-    fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8]) -> ZeroizingBytes<32> {
-        let actual_salt = if salt.is_empty() {
-            &[0u8; 32][..]
-        } else {
-            salt
-        };
-        let prk = Self::hmac_sha256(actual_salt, ikm);
-        let mut expand_input = Vec::with_capacity(info.len() + 1);
-        expand_input.extend_from_slice(info);
-        expand_input.push(0x01);
-        let okm = Self::hmac_sha256(prk.as_slice(), &expand_input);
-        zeroize_slice(&mut expand_input);
-        okm
-    }
-
-    fn hmac_sha256(key: &[u8], message: &[u8]) -> ZeroizingBytes<32> {
-        const BLOCK_SIZE: usize = 64;
-        let mut key_block = [0u8; BLOCK_SIZE];
-        if key.len() > BLOCK_SIZE {
-            let mut hasher = Sha256::new();
-            hasher.update(key);
-            let hashed = hasher.finalize();
-            key_block[..32].copy_from_slice(&hashed);
-        } else {
-            key_block[..key.len()].copy_from_slice(key);
-        }
-
-        let mut ipad = [0x36u8; BLOCK_SIZE];
-        let mut opad = [0x5cu8; BLOCK_SIZE];
-        for ((ip, op), &kb) in ipad.iter_mut().zip(opad.iter_mut()).zip(key_block.iter()) {
-            *ip ^= kb;
-            *op ^= kb;
-        }
-        zeroize_slice(&mut key_block);
-
-        let mut inner = Sha256::new();
-        inner.update(ipad);
-        inner.update(message);
-        let inner_hash = inner.finalize();
-        zeroize_slice(&mut ipad);
-
-        let mut outer = Sha256::new();
-        outer.update(opad);
-        outer.update(inner_hash);
-        let final_hash = outer.finalize();
-        zeroize_slice(&mut opad);
-
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&final_hash);
-        let res = ZeroizingBytes::new(out);
-        zeroize_slice(&mut out);
-        res
+    /// RFC 5869 audited `HKDF-SHA256` (`hkdf::Hkdf::<Sha256>`, `CSE-28`) for 32-byte per-file DEK
+    /// wrapping (`HKDF-SHA256(KEK, salt_32B, "OMNICONNECT_SENTINEL_QUARANTINE_V2")`).
+    fn derive_entry_dek_wrapping_key(
+        ikm: &[u8],
+        salt: &[u8],
+        info: &[u8],
+    ) -> Result<ZeroizingBytes<32>, String> {
+        sentinel_sys::hkdf_sha256_derive_32(ikm, salt, info)
+            .map_err(|e| format!("Audited HKDF-SHA256 derivation failed: {e}"))
     }
 
     fn write_wrapped_entry_dek(
@@ -819,11 +810,11 @@ impl QuarantineVault {
         file_salt: &[u8; 32],
         entry_dek: &ZeroizingBytes<32>,
     ) -> Result<PathBuf, String> {
-        let wrapping_key = Self::hkdf_sha256(
+        let wrapping_key = Self::derive_entry_dek_wrapping_key(
             self.master_kek.as_slice(),
             file_salt,
             HKDF_INFO_QUARANTINE_V2,
-        );
+        )?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(wrapping_key.as_slice()));
         let mut wrap_nonce = [0u8; 12];
         rand::rngs::OsRng.fill_bytes(&mut wrap_nonce);
@@ -871,11 +862,11 @@ impl QuarantineVault {
         let wrap_nonce = &dek_blob[..12];
         let wrapped_ct = &dek_blob[12..];
 
-        let wrapping_key = Self::hkdf_sha256(
+        let wrapping_key = Self::derive_entry_dek_wrapping_key(
             self.master_kek.as_slice(),
             file_salt,
             HKDF_INFO_QUARANTINE_V2,
-        );
+        )?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(wrapping_key.as_slice()));
         let mut raw_dek = cipher
             .decrypt(
@@ -969,6 +960,54 @@ impl QuarantineVault {
             "QUARANTINE_CREATED",
             &format!(
                 "entry_id={} path_token={} sha256={} threat={} score={}",
+                entry.entry_id, path_token, entry.original_sha256, threat_name, threat_score
+            ),
+        )?;
+
+        Ok(entry)
+    }
+
+    /// Seals an encrypted forensic evidence copy of `file_path` into the Quarantine Vault (`SNTLQV03`),
+    /// verifies the vault entry back from disk (Invariant I4), and records `QUARANTINE_CREATED`
+    /// **without** modifying or shredding the source path (`CSE-17`, read-only kiosk intake media).
+    pub fn quarantine_readonly_evidence(
+        &self,
+        file_path: &Path,
+        threat_name: &str,
+        threat_score: u8,
+    ) -> Result<QuarantineEntry, String> {
+        self.check_healthy()?;
+        sentinel_sys::ensure_not_symlink_or_reparse_point(file_path).map_err(|e| {
+            format!(
+                "Refusing read-only quarantine on symlink or reparse point '{}': {e}",
+                file_path.display()
+            )
+        })?;
+
+        let mut raw_bytes = Vec::new();
+        {
+            let mut file = sentinel_sys::open_untrusted_readonly_nofollow(file_path)
+                .map_err(|e| format!("Failed to open source file for read-only quarantine: {e}"))?;
+            file.read_to_end(&mut raw_bytes)
+                .map_err(|e| format!("Failed reading file for read-only quarantine: {e}"))?;
+        }
+
+        let entry = self.seal_bytes_into_vault(
+            &raw_bytes,
+            &file_path.to_string_lossy(),
+            threat_name,
+            threat_score,
+        );
+        zeroize_slice(&mut raw_bytes);
+        let entry = entry?;
+
+        self.verify_entry(&entry.entry_id)?;
+
+        let path_token = self.tokenize_path_for_audit(file_path)?;
+        self.append_ledger_event(
+            "QUARANTINE_CREATED",
+            &format!(
+                "entry_id={} path_token={} sha256={} threat={} score={} mode=READONLY_INTAKE",
                 entry.entry_id, path_token, entry.original_sha256, threat_name, threat_score
             ),
         )?;
@@ -1113,9 +1152,11 @@ impl QuarantineVault {
 
         let mut file_salt = [0u8; 32];
         let mut nonce = [0u8; 12];
+        let mut meta_nonce = [0u8; 12];
         let mut raw_entry_dek = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut file_salt);
         rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::rngs::OsRng.fill_bytes(&mut meta_nonce);
         rand::rngs::OsRng.fill_bytes(&mut raw_entry_dek);
 
         let entry_dek = ZeroizingBytes::new(raw_entry_dek);
@@ -1124,13 +1165,29 @@ impl QuarantineVault {
         // Persist wrapped DEK (`<entry_id>.dek`) under `HKDF-SHA256(KEK, file_salt, "OMNICONNECT_SENTINEL_QUARANTINE_V2")`
         self.write_wrapped_entry_dek(&entry_id, &file_salt, &entry_dek)?;
 
+        // `SNTLQV03` (`CSE-16`, `F-16`): keep plaintext `original_path` PII out of the unencrypted
+        // `.quar` JSON header on disk by storing only the HMAC path token in `original_path` and
+        // encrypting the real path under `entry_dek` with a distinct `meta_nonce` and domain-bound AAD.
+        let path_token = self.tokenize_path_for_audit(Path::new(original_path_str))?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(entry_dek.as_slice()));
+        let meta_aad = format!("SNTLQV03-META:{entry_id}");
+        let encrypted_path_ct = cipher
+            .encrypt(
+                Nonce::from_slice(&meta_nonce),
+                Payload {
+                    msg: original_path_str.as_bytes(),
+                    aad: meta_aad.as_bytes(),
+                },
+            )
+            .map_err(|e| format!("AES-256-GCM metadata encryption failure: {e}"))?;
+
         let header = QuarantineEnvelopeHeader {
-            magic: *ENVELOPE_MAGIC_V2_FULL,
-            version: ENVELOPE_VERSION,
+            magic: *ENVELOPE_MAGIC_V3_FULL,
+            version: ENVELOPE_VERSION_V3,
             kek_id: self.kek_id.clone(),
             file_salt,
             nonce,
-            original_path: original_path_str.to_string(),
+            original_path: path_token,
             original_size,
             sha256_plaintext: sha256_plaintext.clone(),
             threat_name: threat_name.to_string(),
@@ -1139,12 +1196,13 @@ impl QuarantineVault {
             entry_id: entry_id.clone(),
             quarantined_at_utc: quarantined_at_utc.clone(),
             recovery_status: "RECOVERABLE".to_string(),
+            encrypted_original_path_hex: Some(hex::encode(encrypted_path_ct)),
+            meta_nonce: Some(meta_nonce),
         };
 
         let header_json = serde_json::to_vec(&header)
             .map_err(|e| format!("Failed serializing quarantine header: {e}"))?;
 
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(entry_dek.as_slice()));
         let ciphertext = cipher
             .encrypt(
                 Nonce::from_slice(&nonce),
@@ -1159,7 +1217,7 @@ impl QuarantineVault {
         let vault_file_path = self.vault_dir.join(&vault_file_name);
         let tmp_file_path = self.vault_dir.join(format!("{entry_id}.quar.tmp"));
 
-        // Exact layout (`Plan v2 §1.1 #4`): `[header_len: u32 LE][header JSON][ciphertext]`
+        // Exact layout (`Plan v2 §1.1 #4`, `CSE-16`): `[header_len: u32 LE][header JSON][ciphertext]`
         {
             let mut vault_file =
                 create_restricted_file_handle_atomic(&tmp_file_path).map_err(|e| {
@@ -1193,7 +1251,7 @@ impl QuarantineVault {
         Ok(QuarantineEntry {
             entry_id,
             kek_id: self.kek_id.clone(),
-            original_path: header.original_path,
+            original_path: original_path_str.to_string(),
             original_sha256: sha256_plaintext,
             original_size_bytes: original_size,
             vault_file_path: vault_file_path.to_string_lossy().to_string(),
@@ -1201,7 +1259,7 @@ impl QuarantineVault {
             threat_score,
             quarantined_at_utc,
             quarantined_at_unix,
-            encryption_algorithm: "AES-256-GCM-HKDF-SHA256-V2".to_string(),
+            encryption_algorithm: "AES-256-GCM-HKDF-SHA256-V3".to_string(),
             nonce_hex: hex::encode(nonce),
             recovery_status: "RECOVERABLE".to_string(),
         })
@@ -1351,9 +1409,9 @@ impl QuarantineVault {
         Ok(true)
     }
 
-    /// Performs true cryptographic erasure (`Master Plan v2 §1.1 #5`, `ADR-011`) by first
-    /// overwriting and destroying the entry's wrapped DEK file (`<entry_id>.dek`) so the
-    /// ciphertext is immediately unrecoverable, and then running NIST 800-88 Clear on `<entry_id>.quar`.
+    /// Removes a quarantined entry via NIST SP 800-88 Rev. 2 `Clear` (`CSE-15`, `F-13`) by first
+    /// overwriting and unlinking `<entry_id>.dek` and then overwriting and unlinking `<entry_id>.quar`.
+    /// Does not claim `CryptographicErasePurge` while `vault_kek.sealed` / `vault_kek.escrow` stay active.
     pub fn purge(&self, entry_id: &str) -> Result<(), String> {
         self.check_healthy()?;
 
@@ -1365,20 +1423,27 @@ impl QuarantineVault {
             return Err(format!("Quarantine entry '{entry_id}' not found"));
         }
 
-        // Step 1: True Cryptographic Erasure — overwrite and destroy the wrapped per-entry DEK (`<entry_id>.dek`)
+        // Step 1: Overwrite and destroy the wrapped per-entry DEK (`<entry_id>.dek`) via NIST 800-88 Rev. 2 Clear
         let dek_path = self.vault_dir.join(format!("{entry_id}.dek"));
         if dek_path.exists() {
             self.shred_file_to_vault_ledger(&dek_path, ShredMethod::ClearMultiPass { passes: 3 })?;
         }
 
-        // Step 2: Overwrite and unlink the `.quar` ciphertext envelope and sync the directory
-        self.shred_file_to_vault_ledger(&vault_file_path, ShredMethod::CryptoErase)?;
+        // Step 2: Overwrite and unlink the `.quar` ciphertext envelope via honest NIST 800-88 Rev. 2 Clear
+        // (`CSE-15`, `F-13`): because `vault_kek.sealed` and `vault_kek.escrow` remain live on wear-leveled
+        // storage for remaining vault entries, per-entry purge MUST NOT claim `CryptographicErasePurge`.
+        self.shred_file_to_vault_ledger(
+            &vault_file_path,
+            ShredMethod::ClearMultiPass { passes: 3 },
+        )?;
         sync_directory(&self.vault_dir)
             .map_err(|e| format!("Failed syncing quarantine directory after purge: {e}"))?;
 
         self.append_ledger_event(
             "QUARANTINE_PURGED",
-            &format!("Crypto-erased DEK and shredded quarantine entry '{entry_id}'"),
+            &format!(
+                "Overwrote wrapped DEK and cleared quarantine entry '{entry_id}' (NIST SP 800-88 Rev. 2 Clear; vault KEK/escrow remain active for other entries)"
+            ),
         )?;
 
         Ok(())
@@ -1411,12 +1476,23 @@ impl QuarantineVault {
                     let entry_id = if header.entry_id.is_empty() {
                         file_stem
                     } else {
-                        header.entry_id
+                        header.entry_id.clone()
+                    };
+                    let resolved_original_path = if header.version == ENVELOPE_VERSION_V3 {
+                        self.decrypt_v3_original_path(&entry_id, &header)
+                            .unwrap_or_else(|| header.original_path.clone())
+                    } else {
+                        header.original_path
+                    };
+                    let enc_alg = if header.version == ENVELOPE_VERSION_V3 {
+                        "AES-256-GCM-HKDF-SHA256-V3"
+                    } else {
+                        "AES-256-GCM-HKDF-SHA256-V2"
                     };
                     entries.push(QuarantineEntry {
                         entry_id,
                         kek_id: header.kek_id,
-                        original_path: header.original_path,
+                        original_path: resolved_original_path,
                         original_sha256: header.sha256_plaintext,
                         original_size_bytes: header.original_size,
                         vault_file_path: path.to_string_lossy().to_string(),
@@ -1424,7 +1500,7 @@ impl QuarantineVault {
                         threat_score: header.threat_score,
                         quarantined_at_utc: header.quarantined_at_utc,
                         quarantined_at_unix: header.quarantined_at_unix,
-                        encryption_algorithm: "AES-256-GCM-HKDF-SHA256-V2".to_string(),
+                        encryption_algorithm: enc_alg.to_string(),
                         nonce_hex: hex::encode(header.nonce),
                         recovery_status: header.recovery_status,
                     });
@@ -1540,6 +1616,31 @@ impl QuarantineVault {
         Ok(migrated_ids)
     }
 
+    fn decrypt_v3_original_path(
+        &self,
+        entry_id: &str,
+        header: &QuarantineEnvelopeHeader,
+    ) -> Option<String> {
+        let ct_hex = header.encrypted_original_path_hex.as_deref()?;
+        let meta_nonce = header.meta_nonce.as_ref()?;
+        let ct_bytes = hex::decode(ct_hex).ok()?;
+        let entry_dek = self.unwrap_entry_dek(entry_id, &header.file_salt).ok()?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(entry_dek.as_slice()));
+        let meta_aad = format!("SNTLQV03-META:{entry_id}");
+        let mut pt = cipher
+            .decrypt(
+                Nonce::from_slice(meta_nonce),
+                Payload {
+                    msg: &ct_bytes,
+                    aad: meta_aad.as_bytes(),
+                },
+            )
+            .ok()?;
+        let out = String::from_utf8(pt.clone()).ok();
+        zeroize_slice(&mut pt);
+        out
+    }
+
     pub fn parse_envelope(
         bytes: &[u8],
     ) -> Result<(QuarantineEnvelopeHeader, &[u8], &[u8]), String> {
@@ -1554,7 +1655,7 @@ impl QuarantineVault {
         let header_len = u32::from_le_bytes(len_buf) as usize;
         if header_len == 0 || header_len > 1024 * 1024 || bytes.len() < 4 + header_len {
             return Err(
-                "VAULT_INTEGRITY_FAIL: Quarantine entry is not a v2 authenticated envelope (UNRECOVERABLE_LEGACY)"
+                "VAULT_INTEGRITY_FAIL: Quarantine entry is not a v2/v3 authenticated envelope (UNRECOVERABLE_LEGACY)"
                     .to_string(),
             );
         }
@@ -1565,7 +1666,11 @@ impl QuarantineVault {
                 "VAULT_INTEGRITY_FAIL: Malformed quarantine envelope header JSON (UNRECOVERABLE_LEGACY): {e}"
             )
         })?;
-        if &header.magic != ENVELOPE_MAGIC_V2_FULL || header.version != ENVELOPE_VERSION {
+        let is_valid_v2 =
+            &header.magic == ENVELOPE_MAGIC_V2_FULL && header.version == ENVELOPE_VERSION;
+        let is_valid_v3 =
+            &header.magic == ENVELOPE_MAGIC_V3_FULL && header.version == ENVELOPE_VERSION_V3;
+        if !is_valid_v2 && !is_valid_v3 {
             return Err(
                 "VAULT_INTEGRITY_FAIL: Invalid envelope magic or version (UNRECOVERABLE_LEGACY)"
                     .to_string(),

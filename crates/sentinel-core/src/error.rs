@@ -81,6 +81,7 @@ impl SentinelError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DegradationEvent {
     PostureReducedNoProjfs,
+    PostureReducedNoFuse,
     PostureReducedNoTpm,
     CacheQuotaExceeded,
     CdrWorkerFailed,
@@ -94,6 +95,7 @@ impl DegradationEvent {
     pub fn event_code(&self) -> &'static str {
         match self {
             DegradationEvent::PostureReducedNoProjfs => "POSTURE_REDUCED_NO_PROJFS",
+            DegradationEvent::PostureReducedNoFuse => "POSTURE_REDUCED_NO_FUSE",
             DegradationEvent::PostureReducedNoTpm => "POSTURE_REDUCED_NO_TPM",
             DegradationEvent::CacheQuotaExceeded => "CACHE_QUOTA_EXCEEDED",
             DegradationEvent::CdrWorkerFailed => "CDR_WORKER_FAILED",

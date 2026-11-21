@@ -15,6 +15,8 @@ pub enum ConnectionVector {
         vid: u16,
         pid: u16,
         serial: String,
+        #[serde(default)]
+        device_instance_id: Option<String>,
         interfaces: Vec<UsbInterfaceDescriptor>,
     },
     MtpMobileDevice {

@@ -111,6 +111,63 @@ pub enum ShredLedgerSink<'a> {
     DefaultUnified,
 }
 
+/// Generates a cryptographically random lowercase hexadecimal filename of equal character length
+/// to `original_name` (clamped to `1..=240`) to scrub residual NTFS `$MFT` / FAT directory entry
+/// characters (`CSE-15`, `README.md §9 #5`). Pure hex `[0-9a-f]` never matches Windows DOS device names.
+pub fn generate_equal_length_hex_scramble_name(original_name: &str) -> String {
+    let target_len = original_name.chars().count().clamp(1, 240);
+    let byte_len = target_len.div_ceil(2);
+    let mut raw = vec![0u8; byte_len];
+    rand::rngs::OsRng.fill_bytes(&mut raw);
+    let mut out = hex::encode(raw);
+    out.truncate(target_len);
+    out
+}
+
+/// Validates that a `ShredReceipt` passed both cryptographic read-back verification and hardware
+/// buffer flushing (`CSE-15`, Invariant `I6`). Returns `Err` if either gate failed.
+pub fn validate_shred_receipt_fail_closed(receipt: &ShredReceipt) -> Result<(), String> {
+    if !receipt.verification_passed || !receipt.flush_succeeded {
+        return Err(format!(
+            "SHRED_VERIFICATION_FAILED: verification_passed={}, flush_succeeded={} for '{}'",
+            receipt.verification_passed, receipt.flush_succeeded, receipt.original_path
+        ));
+    }
+    Ok(())
+}
+
+/// Streams fresh per-chunk `OsRng` CSPRNG bytes into `writer` up to `target_limit`, refreshing
+/// `chunk_buf` on every write iteration so hardware-compressing SSD controllers cannot deduplicate
+/// identical fill blocks (`CSE-15`). Stops cleanly with `Ok(written)` when the destination volume
+/// reports out-of-space (`StorageFull` / `ENOSPC` / `ERROR_DISK_FULL`), and propagates any other I/O error.
+pub fn write_non_repeating_csprng_chunks<W: Write>(
+    writer: &mut W,
+    target_limit: u64,
+    chunk_buf: &mut [u8],
+) -> Result<u64, std::io::Error> {
+    if chunk_buf.is_empty() {
+        return Ok(0);
+    }
+    let mut written: u64 = 0;
+    while written < target_limit {
+        let to_write = std::cmp::min(target_limit - written, chunk_buf.len() as u64) as usize;
+        rand::rngs::OsRng.fill_bytes(&mut chunk_buf[..to_write]);
+        match writer.write_all(&chunk_buf[..to_write]) {
+            Ok(()) => {
+                written += to_write as u64;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::StorageFull
+                    || matches!(e.raw_os_error(), Some(28) | Some(112)) =>
+            {
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(written)
+}
+
 pub struct SecureShredder;
 
 impl SecureShredder {
@@ -358,34 +415,37 @@ impl SecureShredder {
             let _ = issue_file_level_trim(&file, file_size);
         }
 
-        // Truncate cluster allocation to 0 bytes after hash verification, propagating errors (`Row 61`)
-        {
-            let trunc_file = open_write_through(&target_path).map_err(|e| {
-                format!("Failed reopening '{original_path_str}' for zero-length truncation: {e}")
-            })?;
-            trunc_file
-                .set_len(0)
-                .map_err(|e| format!("Failed truncating '{original_path_str}' to 0 bytes: {e}"))?;
-            let flushed_after_trunc = flush_hardware_buffers(&trunc_file);
-            all_flushes_ok = all_flushes_ok && flushed_after_trunc;
-        }
-
-        // MFT / Directory Entry Filename Scrambling with actual cycle tracking (`BUG-CORE-06` #4)
+        // MFT / Directory Entry Filename Scrambling BEFORE truncation & unlink (`BUG-CORE-06` #4, `CSE-15`).
+        // Uses random hex filenames of equal length to scrub residual filename characters in `$MFT` / FAT slots.
         let mut current_path = target_path.clone();
         let mut actual_scramble_cycles = 0u8;
+        let orig_file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "000000000000".to_string());
 
         if let Some(parent) = target_path.parent() {
             for cycle in 0..3u8 {
-                let random_name = format!(
-                    ".{}{}.tmp",
-                    &Uuid::new_v4().simple().to_string()[..12],
-                    cycle
-                );
-                let next_path = parent.join(random_name);
-                if fs::rename(&current_path, &next_path).is_ok() {
-                    current_path = next_path;
-                    actual_scramble_cycles += 1;
-                } else {
+                let mut renamed = false;
+                for attempt in 0..16u8 {
+                    let random_name = if attempt < 12 {
+                        generate_equal_length_hex_scramble_name(&orig_file_name)
+                    } else {
+                        // Fallback widening only if an extremely short name collided repeatedly
+                        format!("{}{}", &Uuid::new_v4().simple().to_string()[..12], cycle)
+                    };
+                    let next_path = parent.join(random_name);
+                    if next_path == current_path || fs::symlink_metadata(&next_path).is_ok() {
+                        continue;
+                    }
+                    if fs::rename(&current_path, &next_path).is_ok() {
+                        current_path = next_path;
+                        actual_scramble_cycles += 1;
+                        renamed = true;
+                        break;
+                    }
+                }
+                if !renamed {
                     warn!(
                         "MFT filename scramble rename failed on cycle {} for {}",
                         cycle, original_path_str
@@ -393,6 +453,18 @@ impl SecureShredder {
                     break;
                 }
             }
+        }
+
+        // Truncate cluster allocation to 0 bytes after hash verification and filename scrambling (`Row 61`, `CSE-15`)
+        {
+            let trunc_file = open_write_through(&current_path).map_err(|e| {
+                format!("Failed reopening '{original_path_str}' for zero-length truncation: {e}")
+            })?;
+            trunc_file
+                .set_len(0)
+                .map_err(|e| format!("Failed truncating '{original_path_str}' to 0 bytes: {e}"))?;
+            let flushed_after_trunc = flush_hardware_buffers(&trunc_file);
+            all_flushes_ok = all_flushes_ok && flushed_after_trunc;
         }
 
         // Unlink the final scrambled path
@@ -439,21 +511,38 @@ impl SecureShredder {
             verify_read_ok: verification_passed,
         };
 
+        Self::finalize_and_record_shred_receipt(sink, "SHRED_RECEIPT", receipt)
+    }
+
+    /// Persists a `ShredReceipt` to `sink` (tagging failed verification/flush as
+    /// `"SHRED_VERIFICATION_FAILED"`) and fails closed via `validate_shred_receipt_fail_closed` (`CSE-15`, `I6`).
+    pub fn finalize_and_record_shred_receipt(
+        sink: ShredLedgerSink<'_>,
+        success_event: &str,
+        receipt: ShredReceipt,
+    ) -> Result<ShredReceipt, String> {
+        let ledger_event_type = if receipt.verification_passed && receipt.flush_succeeded {
+            success_event
+        } else {
+            "SHRED_VERIFICATION_FAILED"
+        };
+
         match sink {
             ShredLedgerSink::Shared(sl) => {
-                Self::record_shred_receipt_to_shared_ledger(sl, "SHRED_RECEIPT", &receipt)?;
+                Self::record_shred_receipt_to_shared_ledger(sl, ledger_event_type, &receipt)?;
             }
             ShredLedgerSink::Path(lp) => {
-                Self::record_shred_receipt_to_ledger(lp, "SHRED_RECEIPT", &receipt)?;
+                Self::record_shred_receipt_to_ledger(lp, ledger_event_type, &receipt)?;
             }
             ShredLedgerSink::DefaultUnified => {
                 Self::record_shred_receipt_to_ledger(
                     &default_shred_ledger_path(),
-                    "SHRED_RECEIPT",
+                    ledger_event_type,
                     &receipt,
                 )?;
             }
         }
+        validate_shred_receipt_fail_closed(&receipt)?;
         Ok(receipt)
     }
 
@@ -694,31 +783,17 @@ impl SecureShredder {
             verify_read_ok: verification_passed,
         };
 
-        match sink {
-            ShredLedgerSink::Shared(sl) => {
-                Self::record_shred_receipt_to_shared_ledger(sl, "SHRED_ADS_RECEIPT", &receipt)?;
-            }
-            ShredLedgerSink::Path(lp) => {
-                Self::record_shred_receipt_to_ledger(lp, "SHRED_ADS_RECEIPT", &receipt)?;
-            }
-            ShredLedgerSink::DefaultUnified => {
-                Self::record_shred_receipt_to_ledger(
-                    &default_shred_ledger_path(),
-                    "SHRED_ADS_RECEIPT",
-                    &receipt,
-                )?;
-            }
-        }
-        Ok(receipt)
+        Self::finalize_and_record_shred_receipt(sink, "SHRED_ADS_RECEIPT", receipt)
     }
 
     pub fn shred_ntfs_stream(host_path: &Path, stream_name: &str) -> Result<ShredReceipt, String> {
         Self::shred_ntfs_stream_with_shared_ledger(host_path, stream_name, None)
     }
 
-    /// Best-effort unallocated free-space fill (`--fill-free-space`, Master Plan v2 §1.2).
-    /// Note: On flash media, wear-leveling controllers remap blocks, so this does not reach
-    /// controller spare blocks (Honest Limit L2).
+    /// Best-effort unallocated free-space fill (`--fill-free-space`, Master Plan v2 §1.2, `CSE-15`).
+    /// Generates fresh per-chunk `OsRng` CSPRNG data on every write iteration to defeat SSD controller
+    /// block deduplication/compression. Note: On flash media, wear-leveling controllers remap blocks,
+    /// so this does not reach controller spare blocks (Honest Limit L2).
     pub fn fill_free_space(target_dir: &Path, max_fill_bytes: u64) -> Result<u64, String> {
         ensure_not_symlink_or_reparse_point(target_dir).map_err(|e| {
             format!(
@@ -731,7 +806,6 @@ impl SecureShredder {
             ".sentinel_freespace_{}.balloon",
             Uuid::new_v4().simple()
         ));
-        let mut written: u64 = 0;
         let target_limit = if max_fill_bytes == 0 {
             u64::MAX
         } else {
@@ -744,20 +818,20 @@ impl SecureShredder {
             .map_err(|e| format!("Failed creating free-space balloon file: {e}"))?;
 
         let mut aligned_chunk = Box::new(AlignedSectorBuffer::new());
-        rand::rngs::OsRng.fill_bytes(&mut aligned_chunk.data);
-        while written < target_limit {
-            let to_write =
-                std::cmp::min(target_limit - written, aligned_chunk.data.len() as u64) as usize;
-            if file.write_all(&aligned_chunk.data[..to_write]).is_err() {
-                break;
-            }
-            written += to_write as u64;
-        }
-        let _ = flush_hardware_buffers(&file);
+        let write_res =
+            write_non_repeating_csprng_chunks(&mut file, target_limit, &mut aligned_chunk.data);
+        let flush_ok = flush_hardware_buffers(&file);
         drop(file);
-        fs::remove_file(to_verbatim_path(&balloon_path))
-            .or_else(|_| fs::remove_file(&balloon_path))
-            .map_err(|e| format!("Failed removing free-space balloon file: {e}"))?;
+        let remove_res = fs::remove_file(to_verbatim_path(&balloon_path))
+            .or_else(|_| fs::remove_file(&balloon_path));
+        let written = write_res.map_err(|e| format!("Free-space fill write failed: {e}"))?;
+        remove_res.map_err(|e| format!("Failed removing free-space balloon file: {e}"))?;
+        if !flush_ok {
+            return Err(
+                "SHRED_VERIFICATION_FAILED: Hardware buffer flush failed after free-space fill"
+                    .to_string(),
+            );
+        }
         Ok(written)
     }
 }
