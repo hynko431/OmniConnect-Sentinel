@@ -1917,7 +1917,7 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "hex",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "rand 0.8.8",
  "rustls",
  "rustls-pki-types",
