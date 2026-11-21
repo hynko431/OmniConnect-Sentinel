@@ -43,7 +43,7 @@ hkdf = "0.12"
 hmac = "0.12"
 subtle = "2.6"
 rsa = { version = "0.10", default-features = false, features = ["std"] }
-ml-kem = "0.2"
+ml-kem = "0.3"
 
 # Observability & Tracing
 tracing = "0.1"
