@@ -37,7 +37,7 @@ uuid = { version = "1.8", features = ["v4", "serde"] }
 sha2 = "0.10"
 sha3 = "0.10"
 aes-gcm = "0.10"
-rand = "0.8"
+rand = "0.10"
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "arithmetic", "pkcs8"] }
 hkdf = "0.12"
 hmac = "0.12"
