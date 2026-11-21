@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -15,6 +16,7 @@ use crate::vfs::{ShadowCacheManager, VirtualFileSystemProvider};
 struct ShadowCacheProjFsBackend {
     shadow_cache: Arc<ShadowCacheManager>,
     mount_root: PathBuf,
+    hydrated_paths: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl ProjFsVirtualizerBackend for ShadowCacheProjFsBackend {
@@ -30,8 +32,16 @@ impl ProjFsVirtualizerBackend for ShadowCacheProjFsBackend {
         byte_offset: u64,
         length: usize,
     ) -> Result<Vec<u8>, String> {
-        self.shadow_cache
-            .read_projected_range(&self.mount_root, relative_path, byte_offset, length)
+        let bytes = self.shadow_cache.read_projected_range(
+            &self.mount_root,
+            relative_path,
+            byte_offset,
+            length,
+        )?;
+        if let Ok(mut guard) = self.hydrated_paths.lock() {
+            guard.insert(relative_path.to_path_buf());
+        }
+        Ok(bytes)
     }
 }
 
@@ -46,6 +56,7 @@ pub struct ProjFsProvider {
     shadow_cache: Arc<ShadowCacheManager>,
     active_root: Arc<Mutex<Option<PathBuf>>>,
     projfs_handle: Arc<Mutex<Option<ProjFsInstanceHandle>>>,
+    hydrated_paths: Arc<Mutex<HashSet<PathBuf>>>,
     degraded_no_projfs: Arc<Mutex<bool>>,
 }
 
@@ -61,6 +72,7 @@ impl ProjFsProvider {
             shadow_cache: Arc::new(ShadowCacheManager::new()),
             active_root: Arc::new(Mutex::new(None)),
             projfs_handle: Arc::new(Mutex::new(None)),
+            hydrated_paths: Arc::new(Mutex::new(HashSet::new())),
             degraded_no_projfs: Arc::new(Mutex::new(false)),
         }
     }
@@ -70,6 +82,7 @@ impl ProjFsProvider {
             shadow_cache: Arc::new(shadow_cache),
             active_root: Arc::new(Mutex::new(None)),
             projfs_handle: Arc::new(Mutex::new(None)),
+            hydrated_paths: Arc::new(Mutex::new(HashSet::new())),
             degraded_no_projfs: Arc::new(Mutex::new(false)),
         }
     }
@@ -79,6 +92,7 @@ impl ProjFsProvider {
             shadow_cache: Arc::new(ShadowCacheManager::new().with_shared_ledger(shared_ledger)),
             active_root: self.active_root,
             projfs_handle: self.projfs_handle,
+            hydrated_paths: self.hydrated_paths,
             degraded_no_projfs: self.degraded_no_projfs,
         }
     }
@@ -126,9 +140,13 @@ impl VirtualFileSystemProvider for ProjFsProvider {
             .await
             .map_err(|e| format!("ProjFS ingestion join error: {e}"))??;
 
+        if let Ok(mut hydrated) = self.hydrated_paths.lock() {
+            hydrated.clear();
+        }
         let backend = Box::new(ShadowCacheProjFsBackend {
             shadow_cache: Arc::clone(&self.shadow_cache),
             mount_root: virtual_mount_point.to_path_buf(),
+            hydrated_paths: Arc::clone(&self.hydrated_paths),
         });
         match prj_start_virtualizing_root(virtual_mount_point, backend) {
             Ok(handle) => {
@@ -190,6 +208,35 @@ impl VirtualFileSystemProvider for ProjFsProvider {
             "ProjFS stopping virtualization and crypto-erasing session cache: {}",
             virtual_mount_point.display()
         );
+        // While native ProjFS (`PrjStartVirtualizing`) is still active, overwrite & unlink any
+        // hydrated plaintext placeholders on disk BEFORE calling `PrjStopVirtualizing` (once
+        // stopped, `prjflt.sys` rejects `GENERIC_WRITE` on hydrated placeholders with os error 369).
+        let is_native_active = self
+            .projfs_handle
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+        let hydrated_list: Vec<PathBuf> = self
+            .hydrated_paths
+            .lock()
+            .map(|mut g| g.drain().collect())
+            .unwrap_or_default();
+        if is_native_active && !hydrated_list.is_empty() {
+            let cache = Arc::clone(&self.shadow_cache);
+            let root_buf = virtual_mount_point.to_path_buf();
+            let _ = tokio::task::spawn_blocking(move || {
+                for rel in hydrated_list {
+                    let full_path = root_buf.join(&rel);
+                    if let Err(e) = cache.shred_hydrated_projfs_file(&full_path) {
+                        warn!(
+                            "Pre-stop ProjFS hydrated file shred encountered error on '{}': {e}",
+                            full_path.display()
+                        );
+                    }
+                }
+            })
+            .await;
+        }
         // Drop ProjFsInstanceHandle (`PrjStopVirtualizing`) before tearing down session cache (`Row 149`)
         if let Ok(mut h_guard) = self.projfs_handle.lock() {
             *h_guard = None;
@@ -246,6 +293,7 @@ mod tests {
         let backend = ShadowCacheProjFsBackend {
             shadow_cache: Arc::clone(&mgr),
             mount_root: mount_root.clone(),
+            hydrated_paths: Arc::new(Mutex::new(HashSet::new())),
         };
 
         // 1. Lists synthesized parent dirs (`docs`, `docs/sub`) + files with valid SHA-256

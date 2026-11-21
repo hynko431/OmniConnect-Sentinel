@@ -661,12 +661,24 @@ impl ShadowCacheManager {
         )
     }
 
+    pub(crate) fn shred_hydrated_projfs_file(&self, path: &Path) -> Result<(), String> {
+        let _ = normalize_file_attributes(path);
+        let method = ShredMethod::ClearMultiPass { passes: 3 };
+        if let Some(ref sl) = self.shared_ledger {
+            SecureShredder::shred_file_with_shared_ledger(path, method, Some(sl))?;
+        } else {
+            SecureShredder::shred_file_with_ledger(path, method, &self.ledger_path)?;
+        }
+        Ok(())
+    }
+
     fn cleanup_dir_with_method(
         dir: &Path,
         method: ShredMethod,
         ledger_path: Option<&Path>,
         shared_ledger: Option<&SharedAuditLedger>,
     ) -> Result<(), String> {
+        let dir_is_projfs_root = is_projfs_reparse_point(dir);
         match fs::symlink_metadata(dir) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => {
@@ -675,7 +687,7 @@ impl ShadowCacheManager {
                     dir.display()
                 ))
             }
-            Ok(meta) if is_reparse_point_or_symlink(&meta) && !is_projfs_reparse_point(dir) => {
+            Ok(meta) if is_reparse_point_or_symlink(&meta) && !dir_is_projfs_root => {
                 return fs::remove_file(dir)
                     .or_else(|_| fs::remove_dir(dir))
                     .map_err(|e| {
@@ -703,6 +715,28 @@ impl ShadowCacheManager {
             };
 
             let p = entry.path();
+            // Check ProjFS reparse points directly via `FindFirstFileW` (`is_projfs_reparse_point`),
+            // since `prjflt.sys` can strip `FILE_ATTRIBUTE_REPARSE_POINT` from `symlink_metadata`.
+            if is_projfs_reparse_point(p) {
+                let _ = normalize_file_attributes(p);
+                let rm_res = if entry.file_type().is_dir() {
+                    fs::remove_dir(p)
+                } else {
+                    fs::remove_file(p)
+                };
+                if let Err(e) = rm_res {
+                    warn!(
+                        "ShadowCache failed removing ProjFS placeholder '{}': {e}",
+                        p.display()
+                    );
+                    shred_errors.push(format!(
+                        "Failed removing ProjFS placeholder '{}': {e}",
+                        p.display()
+                    ));
+                }
+                continue;
+            }
+
             let is_link_or_reparse = entry.path_is_symlink()
                 || match fs::symlink_metadata(p) {
                     Ok(m) => is_reparse_point_or_symlink(&m),
@@ -717,24 +751,7 @@ impl ShadowCacheManager {
                 };
 
             if is_link_or_reparse {
-                if is_projfs_reparse_point(p) {
-                    let _ = normalize_file_attributes(p);
-                    let rm_res = if entry.file_type().is_dir() {
-                        fs::remove_dir(p)
-                    } else {
-                        fs::remove_file(p)
-                    };
-                    if let Err(e) = rm_res {
-                        warn!(
-                            "ShadowCache failed removing ProjFS placeholder '{}': {e}",
-                            p.display()
-                        );
-                        shred_errors.push(format!(
-                            "Failed removing ProjFS placeholder '{}': {e}",
-                            p.display()
-                        ));
-                    }
-                } else if let Err(e) = fs::remove_file(p).or_else(|_| fs::remove_dir(p)) {
+                if let Err(e) = fs::remove_file(p).or_else(|_| fs::remove_dir(p)) {
                     warn!(
                         "ShadowCache failed unlinking symlink/reparse '{}': {e}",
                         p.display()
@@ -757,8 +774,26 @@ impl ShadowCacheManager {
                     SecureShredder::shred_file(p, method)
                 };
                 if let Err(e) = res {
-                    warn!("ShadowCache SecureShredder error on '{}': {e}", p.display());
-                    shred_errors.push(format!("{}: {e}", p.display()));
+                    // After `PrjStopVirtualizing`, unhydrated ProjFS placeholders inside a
+                    // ProjFS virtualization root reject `GENERIC_WRITE` with os error 369/372
+                    // (`ERROR_FILE_SYSTEM_VIRTUALIZATION_UNAVAILABLE` / `PROVIDER_UNKNOWN`).
+                    // Hydrated files are already 3-pass shredded prior to `PrjStopVirtualizing`;
+                    // unlink residual stopped placeholders cleanly.
+                    let is_stopped_projfs_placeholder = dir_is_projfs_root
+                        && (e.contains("os error 369") || e.contains("os error 372"));
+                    if is_stopped_projfs_placeholder {
+                        let _ = normalize_file_attributes(p);
+                        if let Err(rm_err) = fs::remove_file(p) {
+                            warn!(
+                                "ShadowCache failed removing stopped ProjFS placeholder '{}': {rm_err}",
+                                p.display()
+                            );
+                            shred_errors.push(format!("{}: {rm_err}", p.display()));
+                        }
+                    } else {
+                        warn!("ShadowCache SecureShredder error on '{}': {e}", p.display());
+                        shred_errors.push(format!("{}: {e}", p.display()));
+                    }
                 }
             } else if entry.file_type().is_dir() {
                 let _ = normalize_file_attributes(p);

@@ -2160,6 +2160,9 @@ pub fn enumerate_ntfs_ads(path: &Path) -> Vec<(String, u64)> {
 /// Windows Projected File System (`ProjFS`) NTFS reparse tag (`0x9000_001C`).
 pub const IO_REPARSE_TAG_PROJFS: u32 = 0x9000_001C;
 
+/// Windows Projected File System (`ProjFS`) tombstone NTFS reparse tag (`0xA000_0022`).
+pub const IO_REPARSE_TAG_PROJFS_TOMBSTONE: u32 = 0xA000_0022;
+
 /// Checks if a `Metadata` object represents a symlink or a Windows NTFS reparse point / junction (`FILE_ATTRIBUTE_REPARSE_POINT`).
 pub fn is_reparse_point_or_symlink(meta: &Metadata) -> bool {
     #[cfg(windows)]
@@ -2176,7 +2179,8 @@ pub fn is_reparse_point_or_symlink(meta: &Metadata) -> bool {
 }
 
 /// Returns `true` strictly when `path` is a Windows NTFS reparse point tagged with
-/// `IO_REPARSE_TAG_PROJFS` (`0x9000_001C`) rather than a symlink or NTFS junction.
+/// `IO_REPARSE_TAG_PROJFS` (`0x9000_001C`) or `IO_REPARSE_TAG_PROJFS_TOMBSTONE` (`0xA000_0022`)
+/// rather than a symlink or NTFS junction.
 pub fn is_projfs_reparse_point(path: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -2200,7 +2204,8 @@ pub fn is_projfs_reparse_point(path: &Path) -> bool {
             let _ = FindClose(h);
         }
         (find_data.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-            && find_data.dw_reserved0 == IO_REPARSE_TAG_PROJFS
+            && (find_data.dw_reserved0 == IO_REPARSE_TAG_PROJFS
+                || find_data.dw_reserved0 == IO_REPARSE_TAG_PROJFS_TOMBSTONE)
     }
     #[cfg(not(windows))]
     {
