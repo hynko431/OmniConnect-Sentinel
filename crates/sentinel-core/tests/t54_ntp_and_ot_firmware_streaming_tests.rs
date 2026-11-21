@@ -185,10 +185,35 @@ fn build_verified_worker_launcher_for_t54() -> sentinel_cdr::WorkerLauncher {
     } else {
         "sentinel-cdr-worker"
     };
-    let worker_exe = workspace_root
-        .join("target")
-        .join("debug")
-        .join(worker_name);
+    let current_exe = std::env::current_exe().expect("current_exe");
+    let profile_dir = current_exe
+        .ancestors()
+        .skip(1)
+        .find(|a| {
+            matches!(
+                a.file_name().and_then(|n| n.to_str()),
+                Some("debug" | "release")
+            )
+        })
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| workspace_root.join("target").join("debug"));
+    let worker_exe = profile_dir.join(worker_name);
+    if !worker_exe.is_file() {
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(workspace_root).args([
+            "build",
+            "-p",
+            "sentinel-cdr",
+            "--bin",
+            "sentinel-cdr-worker",
+            "--offline",
+        ]);
+        if profile_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
+            cmd.arg("--release");
+        }
+        let status = cmd.status().expect("build sentinel-cdr-worker for t54");
+        assert!(status.success(), "building sentinel-cdr-worker failed");
+    }
     let default_launcher = sentinel_cdr::WorkerLauncher::new().with_worker_bin(worker_exe.clone());
     match default_launcher.sanitize_isolated(sentinel_cdr::WorkerRequest {
         file_name: "probe.txt".to_string(),

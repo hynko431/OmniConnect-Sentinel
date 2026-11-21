@@ -115,25 +115,15 @@ impl TestP256Key {
             generate_raw_ecdsa_p256_keypair().expect("generate P-256 keypair");
         let mut sec1_pub = [0u8; 65];
         let mut scalar_d = [0u8; 32];
-        #[cfg(windows)]
-        {
-            assert_eq!(pub_blob.len(), 72, "BCRYPT_ECCPUBLIC_BLOB must be 72 bytes");
-            assert_eq!(
-                priv_blob.len(),
-                104,
-                "BCRYPT_ECCPRIVATE_BLOB must be 104 bytes"
-            );
-            sec1_pub[0] = 0x04;
-            sec1_pub[1..65].copy_from_slice(&pub_blob[8..72]);
-            scalar_d.copy_from_slice(&priv_blob[72..104]);
-        }
-        #[cfg(not(windows))]
-        {
-            assert_eq!(pub_blob.len(), 65);
-            assert_eq!(priv_blob.len(), 32);
-            sec1_pub.copy_from_slice(&pub_blob);
-            scalar_d.copy_from_slice(&priv_blob);
-        }
+        assert_eq!(pub_blob.len(), 72, "BCRYPT_ECCPUBLIC_BLOB must be 72 bytes");
+        assert_eq!(
+            priv_blob.len(),
+            104,
+            "BCRYPT_ECCPRIVATE_BLOB must be 104 bytes"
+        );
+        sec1_pub[0] = 0x04;
+        sec1_pub[1..65].copy_from_slice(&pub_blob[8..72]);
+        scalar_d.copy_from_slice(&priv_blob[72..104]);
         Self {
             priv_blob,
             sec1_pub,

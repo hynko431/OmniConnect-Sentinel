@@ -907,7 +907,17 @@ fn stage_worker_for_core_tests() {
         let Some(deps_dir) = cur_exe.parent() else {
             return;
         };
-        let Some(target_profile_dir) = deps_dir.parent() else {
+        let Some(target_profile_dir) = cur_exe
+            .ancestors()
+            .skip(1)
+            .find(|a| {
+                matches!(
+                    a.file_name().and_then(|n| n.to_str()),
+                    Some("debug" | "release")
+                )
+            })
+            .or_else(|| deps_dir.parent())
+        else {
             return;
         };
 

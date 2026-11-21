@@ -31,7 +31,10 @@ jobs:
 
       - name: Install qpdf output oracle and Linux build prerequisites
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y qpdf libfuse3-dev pkg-config protobuf-compiler
+        run: |
+          sudo apt-get update && sudo apt-get install -y qpdf libfuse3-dev pkg-config protobuf-compiler
+          # Ubuntu 24.04 AppArmor restricts unprivileged userns by default; allow real CLONE_NEWUSER|CLONE_NEWNET|CLONE_NEWIPC verification in CI
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -64,7 +67,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Execute full test pyramid (unit, property, invariant I1-I5, output oracles, chaos)
-        run: cargo test --workspace --locked -- --nocapture
+        run: |
+          cargo build --workspace --bins --locked
+          cargo test --workspace --locked -- --nocapture
 
   supply-chain-and-sbom:
     name: Linux Supply-Chain Gate (cargo-deny, cargo-audit, cargo-machete, Trivy, CycloneDX SBOM, Auditable ELF .dep-v0, SLSA)

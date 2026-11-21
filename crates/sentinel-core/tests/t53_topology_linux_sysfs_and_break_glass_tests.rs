@@ -24,6 +24,23 @@ use sentinel_sys::{
     SCOPED_STORAGE_DENY_DEVICE_IDS, WPD_DEVICE_SETUP_CLASS_GUID,
 };
 
+fn resolve_cargo_profile_dir_for_t53() -> PathBuf {
+    let current_exe = std::env::current_exe().expect("current_exe");
+    if let Some(profile) = current_exe.ancestors().skip(1).find(|a| {
+        matches!(
+            a.file_name().and_then(|n| n.to_str()),
+            Some("debug" | "release")
+        )
+    }) {
+        return profile.to_path_buf();
+    }
+    current_exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("profile dir")
+        .to_path_buf()
+}
+
 fn build_verified_worker_launcher_for_t53() -> WorkerLauncher {
     let exe_name = if cfg!(windows) {
         "sentinel-cdr-worker.exe"
@@ -32,13 +49,34 @@ fn build_verified_worker_launcher_for_t53() -> WorkerLauncher {
     };
     let current_exe = std::env::current_exe().expect("current_exe");
     let deps_dir = current_exe.parent().expect("deps dir");
-    let profile_dir = deps_dir.parent().unwrap_or(deps_dir);
+    let profile_dir = resolve_cargo_profile_dir_for_t53();
     let mut worker_bin = profile_dir.join(exe_name);
     if !worker_bin.is_file() {
         let alt = deps_dir.join(exe_name);
         if alt.is_file() {
             worker_bin = alt;
         }
+    }
+    if !worker_bin.is_file() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(workspace_root).args([
+            "build",
+            "-p",
+            "sentinel-cdr",
+            "--bin",
+            "sentinel-cdr-worker",
+            "--offline",
+        ]);
+        if profile_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
+            cmd.arg("--release");
+        }
+        let status = cmd.status().expect("build sentinel-cdr-worker for t53");
+        assert!(status.success(), "building sentinel-cdr-worker failed");
+        worker_bin = profile_dir.join(exe_name);
     }
     let default_launcher = WorkerLauncher::new().with_worker_bin(worker_bin.clone());
     match default_launcher.sanitize_isolated(WorkerRequest {
@@ -755,11 +793,29 @@ fn t53_cse26_break_glass_token_cli_replay_expiry_intune_dynamic_reg_scm_and_sess
         .parent()
         .and_then(|p| p.parent())
         .expect("workspace root");
-    let cli_exe = if cfg!(windows) {
-        workspace_root.join("target/debug/sentinel.exe")
+    let profile_dir = resolve_cargo_profile_dir_for_t53();
+    let cli_bin_name = if cfg!(windows) {
+        "sentinel.exe"
     } else {
-        workspace_root.join("target/debug/sentinel")
+        "sentinel"
     };
+    let cli_exe = profile_dir.join(cli_bin_name);
+    if !cli_exe.is_file() {
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(workspace_root).args([
+            "build",
+            "-p",
+            "sentinel-cli",
+            "--bin",
+            "sentinel",
+            "--offline",
+        ]);
+        if profile_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
+            cmd.arg("--release");
+        }
+        let status = cmd.status().expect("build sentinel CLI for CSE-26 test");
+        assert!(status.success(), "building sentinel CLI binary failed");
+    }
     assert!(
         cli_exe.exists(),
         "sentinel CLI binary must be built at {} before running CSE-26 break-glass CLI test",

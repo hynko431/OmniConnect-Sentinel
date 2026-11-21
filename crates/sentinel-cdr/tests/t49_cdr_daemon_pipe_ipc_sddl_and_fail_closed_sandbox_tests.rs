@@ -273,9 +273,27 @@ fn t49_cdr_daemon_pipe_ipc_sddl_no_ac_and_fail_closed_sandbox() {
         .spawn()
         .expect("spawn sentinel-cdr-daemon default IPC mode");
 
-    // Wait briefly for daemon to bind IPC endpoint and verify it remains alive waiting for IPC peers
-    // (proving it is NOT a dead stdin EOF reader anymore!).
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    // Wait until the daemon confirms its IPC listener is bound (up to 5s to tolerate CI AV scanning)
+    // and verify it remains alive waiting for IPC peers (not a dead stdin EOF reader).
+    let daemon_stderr = daemon_child.stderr.take().expect("daemon stderr");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(daemon_stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.contains("CDR IPC daemon listening on") {
+                let _ = ready_tx.send(line);
+                break;
+            }
+        }
+    });
+    let ready_line = ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("sentinel-cdr-daemon must bind local IPC listener within 5s");
+    assert!(
+        ready_line.contains(&daemon_ipc_endpoint),
+        "Daemon listening log must report bound endpoint: {ready_line}"
+    );
     assert!(
         daemon_child.try_wait().expect("try_wait").is_none(),
         "sentinel-cdr-daemon without --stdio MUST stay alive listening on local IPC even when stdin is closed/null"

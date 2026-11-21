@@ -11,6 +11,7 @@
 #   bash tests/ci_shred_verify_oracle.sh --bin target/release/sentinel
 
 set -euo pipefail
+export PATH="$PATH:/usr/sbin:/sbin"
 
 SENTINEL_BIN="target/release/sentinel"
 while [[ $# -gt 0 ]]; do

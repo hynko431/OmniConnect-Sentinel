@@ -40,7 +40,16 @@ fn locate_or_build_cdr_worker_binary() -> PathBuf {
     };
     let current_exe = std::env::current_exe().expect("current_exe");
     let deps_dir = current_exe.parent().expect("deps dir");
-    let profile_dir = deps_dir.parent().unwrap_or(deps_dir);
+    let profile_dir = current_exe
+        .ancestors()
+        .skip(1)
+        .find(|a| {
+            matches!(
+                a.file_name().and_then(|n| n.to_str()),
+                Some("debug" | "release")
+            )
+        })
+        .unwrap_or_else(|| deps_dir.parent().unwrap_or(deps_dir));
     for candidate in [deps_dir.join(exe_name), profile_dir.join(exe_name)] {
         if candidate.is_file() {
             return candidate;

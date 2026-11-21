@@ -31,10 +31,26 @@ fn probe_cli_policy_verify_genuine_and_adversarial_tamper() {
 
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
-    let exe_path = workspace_root
-        .join("target")
-        .join("debug")
-        .join("sentinel.exe");
+    let cli_name = if cfg!(windows) {
+        "sentinel.exe"
+    } else {
+        "sentinel"
+    };
+    let profile_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.ancestors()
+                .skip(1)
+                .find(|a| {
+                    matches!(
+                        a.file_name().and_then(|n| n.to_str()),
+                        Some("debug" | "release")
+                    )
+                })
+                .map(std::path::Path::to_path_buf)
+        })
+        .unwrap_or_else(|| workspace_root.join("target").join("debug"));
+    let exe_path = profile_dir.join(cli_name);
 
     if !exe_path.exists() {
         eprintln!(
@@ -392,10 +408,26 @@ fn probe_adversarial_cli_vault_dir_strict_isolation() {
 
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
-    let exe_path = workspace_root
-        .join("target")
-        .join("debug")
-        .join("sentinel.exe");
+    let cli_name = if cfg!(windows) {
+        "sentinel.exe"
+    } else {
+        "sentinel"
+    };
+    let profile_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.ancestors()
+                .skip(1)
+                .find(|a| {
+                    matches!(
+                        a.file_name().and_then(|n| n.to_str()),
+                        Some("debug" | "release")
+                    )
+                })
+                .map(std::path::Path::to_path_buf)
+        })
+        .unwrap_or_else(|| workspace_root.join("target").join("debug"));
+    let exe_path = profile_dir.join(cli_name);
 
     if !exe_path.exists() {
         // Run verification via IntunePolicyManager directly with custom vault_dir
