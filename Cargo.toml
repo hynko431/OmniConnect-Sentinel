@@ -60,7 +60,7 @@ windows-sys = { version = "0.61", features = [
 # TLS & Networking
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = { version = "1.10", features = ["std"] }
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 url = "2.5"
 
 # Internal workspace crates
