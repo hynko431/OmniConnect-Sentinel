@@ -145,7 +145,7 @@ jobs:
           command: check advisories licenses bans sources
 
       - name: Install prebuilt supply-chain security tools (cargo-audit, cargo-machete, cargo-cyclonedx, cargo-auditable)
-        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: cargo-audit,cargo-machete,cargo-cyclonedx,cargo-auditable
 
@@ -226,7 +226,7 @@ jobs:
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Install cargo-auditable
-        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: cargo-auditable
 
